@@ -138,3 +138,57 @@ Pausing work on `solver_v5.py` for now. Current observations:
 Recent adjustments in `solver_v5.py` (kept but not actively iterating):
 - For distant clusters (PDO/PGA/PRB), always pass through M9.
 - For distant routes that pass through M9, avoid pre-M9 stops (force them to post-M9).
+
+## Session Checkpoint (2026-02-05)
+
+This section is the new resume point for next sessions.
+
+### Readiness Assessment (today)
+- `solver.py` (v4) is currently the best base to improve.
+- `solver_v5.py` is still behind and should not be the main path right now.
+
+### Objective Results (today)
+- `python3 validar_casos.py --solver v4 --details` -> **3/3 OK**
+  - `caso02_solver`: OK
+  - `caso_01_solver`: OK
+  - `caso_01_v5`: OK
+- `python3 validar_casos.py --solver v5 --details` -> **1/3 OK**
+  - failed mainly on distance degradation in approved cases
+- `python3 comparar_solvers.py --details` on current `solver_input.xlsx`:
+  - v4: 45.2 NM, 6/6 platforms complete, 0 capacity violations
+  - v5: 58.1 NM, 6/6 platforms complete, 0 capacity violations
+  - v4 route quality currently better on distance/service mix
+
+### Conclusion
+- We are close with `solver.py` for known patterns/cases.
+- We are not done for full operational robustness yet.
+- Fastest improvement path is adding real approved cases and tuning v4 against them.
+
+### New Improvement Strategy (agreed)
+Continue feeding real cases + approved operator solutions.
+
+Expected impact:
+1. Faster convergence to real-world behavior.
+2. Less guesswork in scoring/constraints.
+3. Safer evolution via regression protection.
+
+### Start-Here Next Time
+For each new real case:
+1. Save input sheet and approved output text.
+2. Register case:
+   - `python3 registrar_caso.py --name <case_name> --input <input.xlsx> --solution <solucao.txt>`
+3. Validate current solver:
+   - `python3 validar_casos.py --solver v4 --details`
+4. If failing or weak quality:
+   - inspect route deltas with `python3 comparar_solvers.py --details`
+   - tune `solver.py` scoring/rules
+   - rerun validation until all approved cases pass
+5. Keep `solver_v5.py` secondary unless explicitly resumed.
+
+### Priority Backlog
+1. Expand `casos_aprovados` coverage (more diverse real operations).
+2. Add explicit checks for:
+   - priority platforms delivered earlier
+   - anti-backtracking behavior
+   - cluster consistency
+3. Make scoring weights easier to tune (configurable input).
