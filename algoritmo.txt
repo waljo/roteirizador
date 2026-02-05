@@ -1,0 +1,489 @@
+================================================================================
+PSEUDOCODIGO - SOLVER v5 - DISTRIBUICAO DE PAX EM DUAS RODADAS
+================================================================================
+
+
+FUNCAO PRINCIPAL: resolver_distribuicao
+=======================================
+
+ENTRADA:
+  - config: configuracao (troca_turma, rendidos_m9)
+  - barcos: lista de barcos disponiveis (nome, hora_saida, capacidade)
+  - demandas: lista de (plataforma, qtd_tmib, qtd_m9, prioridade)
+  - distancias: matriz de distancias entre plataformas
+
+SAIDA:
+  - rotas: lista de (barco, string_rota)
+  - avisos: lista de problemas encontrados
+
+
+--------------------------------------------------------------------------------
+FASE 0: PREPARACAO
+--------------------------------------------------------------------------------
+
+FUNCAO preparar_dados(demandas):
+
+    demanda_m9_para_m9 <- 0  // pax TMIB que ficam em M9
+    demanda_proximas <- []
+    demanda_distantes <- []
+
+    PARA CADA d EM demandas:
+        SE d.plataforma == "M9":
+            demanda_m9_para_m9 <- d.tmib
+        SENAO SE eh_plataforma_distante(d.plataforma):
+            ADICIONAR d EM demanda_distantes
+        SENAO:
+            ADICIONAR d EM demanda_proximas
+
+    RETORNAR (demanda_m9_para_m9, demanda_proximas, demanda_distantes)
+
+
+FUNCAO eh_plataforma_distante(plataforma):
+    distantes <- ["PDO-01", "PDO-02", "PDO-03",
+                  "PGA-01", "PGA-02", "PGA-03", "PGA-04",
+                  "PGA-05", "PGA-06", "PGA-07", "PGA-08",
+                  "PRB-01"]
+    RETORNAR plataforma EM distantes
+
+
+--------------------------------------------------------------------------------
+FASE 1: ALOCAR ROTAS DISTANTES
+--------------------------------------------------------------------------------
+
+FUNCAO alocar_rotas_distantes(demanda_distantes, barcos, distancias):
+
+    rotas_distantes <- []
+    barcos_usados <- []
+
+    // Agrupar demanda distante por cluster
+    clusters <- agrupar_por_cluster(demanda_distantes)
+
+    PARA CADA cluster EM clusters:
+        SE cluster.total_pax == 0:
+            CONTINUAR
+
+        // Selecionar barco (preferir quem sai mais tarde para dar tempo aos outros)
+        barco <- selecionar_barco_disponivel(barcos, barcos_usados, ordem="ultimo")
+
+        SE barco == NULO:
+            ADICIONAR AVISO "Sem barco para cluster distante"
+            CONTINUAR
+
+        // Verificar se precisa parar em M9 (tem demanda M9 para esse cluster?)
+        tem_demanda_m9 <- ALGUM(d.m9 > 0 PARA d EM cluster.demandas)
+
+        // Calcular capacidade extra disponivel para paradas no caminho
+        capacidade_usada <- SOMA(d.tmib PARA d EM cluster.demandas)
+        capacidade_extra <- barco.capacidade - capacidade_usada
+
+        rota <- CRIAR_ROTA(
+            barco: barco,
+            destinos: cluster.demandas,
+            passa_por_m9: tem_demanda_m9,
+            capacidade_extra: capacidade_extra  // para paradas no caminho
+        )
+
+        ADICIONAR rota EM rotas_distantes
+        ADICIONAR barco EM barcos_usados
+
+    RETORNAR (rotas_distantes, barcos_usados)
+
+
+--------------------------------------------------------------------------------
+FASE 1.5: BALANCEAR CAPACIDADE (RESOLVER GARGALOS)
+--------------------------------------------------------------------------------
+
+FUNCAO balancear_capacidade(demanda_proximas, rotas_distantes, barcos_livres):
+
+    // Calcular capacidade total disponivel para proximas
+    capacidade_total <- SOMA(b.capacidade PARA b EM barcos_livres)
+    demanda_total_tmib <- SOMA(d.tmib PARA d EM demanda_proximas)
+
+    SE demanda_total_tmib <= capacidade_total:
+        RETORNAR demanda_proximas  // Sem gargalo
+
+    // Temos gargalo! Precisamos usar capacidade extra das rotas distantes
+    excedente <- demanda_total_tmib - capacidade_total
+
+    // Ordenar plataformas proximas por custo de desvio (menor primeiro)
+    candidatas <- ORDENAR(demanda_proximas, POR: custo_desvio_para_m9)
+
+    PARA CADA rota EM rotas_distantes:
+        SE rota.capacidade_extra <= 0:
+            CONTINUAR
+
+        PARA CADA d EM candidatas:
+            SE d.tmib == 0:
+                CONTINUAR
+
+            desvio <- calcular_desvio(d.plataforma)
+            SE desvio > 3.0:  // Limite de desvio aceitavel
+                CONTINUAR
+
+            // Quantos pax podemos mover para esta rota?
+            pax_mover <- MINIMO(d.tmib, rota.capacidade_extra, excedente)
+
+            SE pax_mover > 0:
+                // Adicionar parada no caminho
+                ADICIONAR_PARADA_PRE_M9(rota, d.plataforma, pax_mover)
+                d.tmib <- d.tmib - pax_mover
+                rota.capacidade_extra <- rota.capacidade_extra - pax_mover
+                excedente <- excedente - pax_mover
+
+            SE excedente <= 0:
+                SAIR DO LOOP
+
+        SE excedente <= 0:
+            SAIR DO LOOP
+
+    SE excedente > 0:
+        ADICIONAR AVISO "Capacidade insuficiente: {excedente} pax sem alocacao"
+
+    RETORNAR demanda_proximas  // Atualizada com reducoes
+
+
+FUNCAO calcular_desvio(plataforma):
+    // Desvio = (TMIB -> plat -> M9) - (TMIB -> M9)
+    direto <- distancia("TMIB", "M9")
+    via_plat <- distancia("TMIB", plataforma) + distancia(plataforma, "M9")
+    RETORNAR via_plat - direto
+
+
+--------------------------------------------------------------------------------
+FASE 2: ALOCAR RODADA 1 (TMIB -> PROXIMAS)
+--------------------------------------------------------------------------------
+
+FUNCAO alocar_rodada1(demanda_proximas, barcos_livres, distancias):
+
+    alocacoes_r1 <- {}  // barco -> lista de (plataforma, qtd_pax)
+
+    // Formar pacotes respeitando pares obrigatorios
+    pacotes <- formar_pacotes(demanda_proximas)
+
+    // Ordenar pacotes por tamanho (maior primeiro) para bin-packing
+    pacotes <- ORDENAR(pacotes, POR: -total_pax)
+
+    // Ordenar barcos por hora de saida (primeiro a sair = primeiro a alocar)
+    barcos_livres <- ORDENAR(barcos_livres, POR: hora_saida)
+
+    PARA CADA barco EM barcos_livres:
+        alocacoes_r1[barco] <- []
+        capacidade_restante <- barco.capacidade
+
+        PARA CADA pacote EM pacotes:
+            SE pacote.alocado:
+                CONTINUAR
+
+            SE pacote.total_pax <= capacidade_restante:
+                // Verificar compatibilidade de cluster
+                SE eh_compativel_cluster(alocacoes_r1[barco], pacote):
+                    ADICIONAR pacote.demandas EM alocacoes_r1[barco]
+                    capacidade_restante <- capacidade_restante - pacote.total_pax
+                    pacote.alocado <- VERDADEIRO
+
+    // Verificar pacotes nao alocados
+    PARA CADA pacote EM pacotes:
+        SE NAO pacote.alocado:
+            ADICIONAR AVISO "Pacote nao alocado: {pacote}"
+
+    RETORNAR alocacoes_r1
+
+
+FUNCAO formar_pacotes(demandas):
+
+    pacotes <- []
+    usados <- CONJUNTO_VAZIO
+
+    // Pares obrigatorios primeiro
+    pares <- [("PCM-02", "PCM-03"), ("PCM-06", "PCB-01")]
+
+    PARA CADA (p1, p2) EM pares:
+        d1 <- BUSCAR(demandas, plataforma=p1)
+        d2 <- BUSCAR(demandas, plataforma=p2)
+
+        SE d1 E d2 E d1.tmib > 0 E d2.tmib > 0:
+            ADICIONAR PACOTE([d1, d2]) EM pacotes
+            ADICIONAR p1, p2 EM usados
+
+    // Demandas individuais
+    PARA CADA d EM demandas:
+        SE d.plataforma NAO EM usados E d.tmib > 0:
+            ADICIONAR PACOTE([d]) EM pacotes
+
+    RETORNAR pacotes
+
+
+--------------------------------------------------------------------------------
+FASE 2.5: SIMULAR RODADA 1 E CALCULAR CHEGADA EM M9
+--------------------------------------------------------------------------------
+
+FUNCAO simular_rodada1(alocacoes_r1, distancias):
+
+    rotas_r1 <- {}
+    tempos_chegada_m9 <- {}
+
+    PARA CADA barco, destinos EM alocacoes_r1:
+        SE destinos VAZIO:
+            CONTINUAR
+
+        // Ordenar destinos por TSP (vizinho mais proximo)
+        ordem <- ordenar_por_tsp(destinos, origem="TMIB", distancias)
+
+        // Construir rota e calcular tempos
+        rota_str <- "TMIB +{total_pax}"
+        tempo_atual <- barco.hora_saida_minutos
+        posicao_atual <- "TMIB"
+
+        PARA CADA (plataforma, qtd) EM ordem:
+            dist <- distancia(posicao_atual, plataforma)
+            tempo_viagem <- TETO(dist / barco.velocidade * 60)
+            tempo_operacao <- qtd * 1  // 1 min por pax
+
+            tempo_atual <- tempo_atual + tempo_viagem + tempo_operacao
+            posicao_atual <- plataforma
+
+            rota_str <- rota_str + " / {plataforma} -{qtd}"
+
+        // Tempo para chegar em M9 apos ultima parada
+        dist_para_m9 <- distancia(posicao_atual, "M9")
+        tempo_chegada_m9[barco] <- tempo_atual + TETO(dist_para_m9 / barco.velocidade * 60)
+
+        rotas_r1[barco] <- rota_str
+
+    RETORNAR (rotas_r1, tempos_chegada_m9)
+
+
+FUNCAO ordenar_por_tsp(destinos, origem, distancias):
+    // Algoritmo do vizinho mais proximo
+
+    ordem <- []
+    restantes <- COPIAR(destinos)
+    atual <- origem
+
+    ENQUANTO restantes NAO VAZIO:
+        mais_proximo <- ENCONTRAR_MINIMO(restantes, POR: distancia(atual, d.plataforma))
+        ADICIONAR mais_proximo EM ordem
+        REMOVER mais_proximo DE restantes
+        atual <- mais_proximo.plataforma
+
+    RETORNAR ordem
+
+
+--------------------------------------------------------------------------------
+FASE 3: ALOCAR RODADA 2 (M9 -> PROXIMAS)
+--------------------------------------------------------------------------------
+
+FUNCAO alocar_rodada2(demanda_m9, tempos_chegada_m9, distancias):
+
+    // Filtrar apenas demanda M9 de plataformas proximas
+    demanda_m9_proximas <- FILTRAR(demanda_m9, ONDE: NAO eh_plataforma_distante)
+
+    SE demanda_m9_proximas VAZIO:
+        RETORNAR {}
+
+    alocacoes_r2 <- {}
+
+    // Ordenar barcos por tempo de chegada em M9 (primeiro a chegar = prioridade)
+    barcos_ordenados <- ORDENAR(tempos_chegada_m9.chaves(), POR: tempos_chegada_m9[barco])
+
+    // Ordenar demanda por prioridade (1 = mais prioritario)
+    demanda_ordenada <- ORDENAR(demanda_m9_proximas, POR: prioridade)
+
+    PARA CADA barco EM barcos_ordenados:
+        alocacoes_r2[barco] <- []
+        capacidade_restante <- barco.capacidade
+
+        PARA CADA d EM demanda_ordenada:
+            SE d.m9 == 0:
+                CONTINUAR
+
+            SE d.m9 <= capacidade_restante:
+                SE eh_compativel_cluster(alocacoes_r2[barco], d):
+                    ADICIONAR (d.plataforma, d.m9) EM alocacoes_r2[barco]
+                    capacidade_restante <- capacidade_restante - d.m9
+                    d.m9 <- 0  // Marcar como alocado
+
+    // Verificar demanda M9 nao alocada
+    PARA CADA d EM demanda_m9_proximas:
+        SE d.m9 > 0:
+            ADICIONAR AVISO "Demanda M9 nao alocada: {d.plataforma} = {d.m9}"
+
+    RETORNAR alocacoes_r2
+
+
+--------------------------------------------------------------------------------
+FASE 4: GERAR ROTAS FINAIS
+--------------------------------------------------------------------------------
+
+FUNCAO gerar_rotas_finais(rotas_r1, alocacoes_r2, rotas_distantes, distancias):
+
+    rotas_finais <- []
+
+    // Rotas de duas rodadas (proximas)
+    PARA CADA barco, rota_r1 EM rotas_r1:
+        rota_str <- rota_r1
+
+        SE barco EM alocacoes_r2 E alocacoes_r2[barco] NAO VAZIO:
+            // Adicionar parada em M9 e rodada 2
+            destinos_r2 <- alocacoes_r2[barco]
+            total_m9 <- SOMA(qtd PARA (plat, qtd) EM destinos_r2)
+
+            rota_str <- rota_str + " / M9 +{total_m9}"
+
+            // Ordenar destinos R2 por TSP a partir de M9
+            ordem_r2 <- ordenar_por_tsp(destinos_r2, origem="M9", distancias)
+
+            PARA CADA (plataforma, qtd) EM ordem_r2:
+                rota_str <- rota_str + " / {plataforma} (-{qtd})"
+
+        ADICIONAR (barco, rota_str) EM rotas_finais
+
+    // Rotas distantes (ja completas)
+    PARA CADA rota EM rotas_distantes:
+        rota_str <- construir_string_rota_distante(rota)
+        ADICIONAR (rota.barco, rota_str) EM rotas_finais
+
+    // Ordenar por hora de saida
+    rotas_finais <- ORDENAR(rotas_finais, POR: barco.hora_saida)
+
+    RETORNAR rotas_finais
+
+
+FUNCAO construir_string_rota_distante(rota):
+
+    partes <- ["TMIB +{rota.total_pax}"]
+
+    // Paradas pre-M9 (se houver)
+    PARA CADA (plat, qtd) EM rota.paradas_pre_m9:
+        partes <- partes + ["{plat} -{qtd}"]
+
+    // M9 (se passa por M9)
+    SE rota.passa_por_m9:
+        m9_str <- "M9"
+        SE rota.tmib_para_m9 > 0:
+            m9_str <- m9_str + " -{rota.tmib_para_m9}"
+        SE rota.m9_pickup > 0:
+            m9_str <- m9_str + " +{rota.m9_pickup}"
+        partes <- partes + [m9_str]
+
+    // Destinos finais
+    PARA CADA (plat, tmib, m9) EM rota.destinos:
+        dest_str <- plat
+        SE tmib > 0:
+            dest_str <- dest_str + " -{tmib}"
+        SE m9 > 0:
+            dest_str <- dest_str + " (-{m9})"
+        partes <- partes + [dest_str]
+
+    RETORNAR JUNTAR(partes, " / ")
+
+
+--------------------------------------------------------------------------------
+FUNCAO PRINCIPAL
+--------------------------------------------------------------------------------
+
+FUNCAO resolver_distribuicao(config, barcos, demandas, distancias):
+
+    avisos <- []
+
+    // FASE 0: Preparar dados
+    (demanda_m9_para_m9, demanda_proximas, demanda_distantes) <- preparar_dados(demandas)
+
+    barcos_disponiveis <- FILTRAR(barcos, ONDE: disponivel == VERDADEIRO)
+    barcos_disponiveis <- ORDENAR(barcos_disponiveis, POR: hora_saida)
+
+    // FASE 1: Alocar rotas distantes
+    (rotas_distantes, barcos_usados) <- alocar_rotas_distantes(
+        demanda_distantes, barcos_disponiveis, distancias
+    )
+
+    barcos_livres <- FILTRAR(barcos_disponiveis, ONDE: barco NAO EM barcos_usados)
+
+    // FASE 1.5: Balancear capacidade
+    demanda_proximas <- balancear_capacidade(
+        demanda_proximas, rotas_distantes, barcos_livres
+    )
+
+    // FASE 2: Alocar rodada 1
+    alocacoes_r1 <- alocar_rodada1(demanda_proximas, barcos_livres, distancias)
+
+    // FASE 2.5: Simular rodada 1
+    (rotas_r1, tempos_chegada_m9) <- simular_rodada1(alocacoes_r1, distancias)
+
+    // FASE 3: Alocar rodada 2
+    alocacoes_r2 <- alocar_rodada2(demanda_proximas, tempos_chegada_m9, distancias)
+
+    // FASE 4: Gerar rotas finais
+    rotas_finais <- gerar_rotas_finais(
+        rotas_r1, alocacoes_r2, rotas_distantes, distancias
+    )
+
+    // Validacoes
+    avisos <- avisos + validar_resultado(rotas_finais, demandas)
+
+    RETORNAR (rotas_finais, avisos)
+
+
+--------------------------------------------------------------------------------
+FUNCOES AUXILIARES
+--------------------------------------------------------------------------------
+
+FUNCAO eh_compativel_cluster(destinos_atuais, novo_destino):
+    // Verifica se o novo destino e compativel com os clusters ja na rota
+
+    SE destinos_atuais VAZIO:
+        RETORNAR VERDADEIRO
+
+    cluster_novo <- obter_cluster(novo_destino.plataforma)
+
+    PARA CADA d EM destinos_atuais:
+        cluster_atual <- obter_cluster(d.plataforma)
+        SE NAO clusters_compativeis(cluster_atual, cluster_novo):
+            RETORNAR FALSO
+
+    RETORNAR VERDADEIRO
+
+
+FUNCAO clusters_compativeis(c1, c2):
+    // Clusters que podem ser combinados
+
+    SE c1 == c2:
+        RETORNAR VERDADEIRO
+
+    compativeis <- [
+        ("M6_AREA", "B_CLUSTER"),
+        ("M2M3", "M1M7"),
+        ("M2M3", "M9_NEAR"),
+        ("B_CLUSTER", "M9_NEAR")
+    ]
+
+    RETORNAR (c1, c2) EM compativeis OU (c2, c1) EM compativeis
+
+
+FUNCAO validar_resultado(rotas, demandas):
+    avisos <- []
+
+    // Verificar demanda atendida
+    PARA CADA d EM demandas:
+        entregue_tmib <- calcular_entregue(rotas, d.plataforma, tipo="tmib")
+        entregue_m9 <- calcular_entregue(rotas, d.plataforma, tipo="m9")
+
+        SE entregue_tmib < d.tmib:
+            ADICIONAR "Faltam {d.tmib - entregue_tmib} pax TMIB para {d.plataforma}"
+
+        SE entregue_m9 < d.m9:
+            ADICIONAR "Faltam {d.m9 - entregue_m9} pax M9 para {d.plataforma}"
+
+    // Verificar capacidade
+    PARA CADA (barco, rota) EM rotas:
+        max_carga <- calcular_carga_maxima(rota)
+        SE max_carga > barco.capacidade:
+            ADICIONAR "Barco {barco.nome} excede capacidade: {max_carga} > {barco.capacidade}"
+
+    // Verificar pax sozinho
+    PARA CADA (barco, rota) EM rotas:
+        PARA CADA parada EM extrair_paradas(rota):
+            SE parada.pax_desembarcados == 1:
+                ADICIONAR "Pax sozinho em {parada.plataforma} (barco {barco.nome})"
+
+    RETORNAR avisos

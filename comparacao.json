@@ -1,0 +1,149 @@
+{
+  "v4": {
+    "summary": {
+      "tmib_served": 71,
+      "m9_served": 7,
+      "boats_used": 3
+    },
+    "warnings": [
+      "\nDistancia total (rotas livres): 43.4 NM"
+    ],
+    "metrics": {
+      "boats_used": 3,
+      "total_tmib": 71,
+      "total_m9": 7,
+      "total_distance": 43.4251,
+      "boat_routes": {
+        "SURFER 1931": "TMIB +24/M2 -15/M7 -9",
+        "SURFER 1870": "TMIB +24/M9 -6 +6/M4 -5 (-4)/PDO1 -13 (-2)",
+        "SURFER 1930": "TMIB +23/M9 -1 +1/M6 -2/B4 -4 (-1)/B1 -3/M5 -3/M3 -10"
+      },
+      "boat_max_load": {
+        "SURFER 1931": 24,
+        "SURFER 1870": 24,
+        "SURFER 1930": 23
+      },
+      "boat_capacity": {
+        "SURFER 1931": 24,
+        "SURFER 1870": 24,
+        "SURFER 1930": 24
+      },
+      "deliveries": {
+        "PCM-02": {
+          "tmib": 15,
+          "m9": 0
+        },
+        "PCM-07": {
+          "tmib": 9,
+          "m9": 0
+        },
+        "PCM-09": {
+          "tmib": 7,
+          "m9": 0
+        },
+        "PCM-04": {
+          "tmib": 5,
+          "m9": 4
+        },
+        "PDO-01": {
+          "tmib": 13,
+          "m9": 2
+        },
+        "PCM-06": {
+          "tmib": 2,
+          "m9": 0
+        },
+        "PCB-04": {
+          "tmib": 4,
+          "m9": 1
+        },
+        "PCB-01": {
+          "tmib": 3,
+          "m9": 0
+        },
+        "PCM-05": {
+          "tmib": 3,
+          "m9": 0
+        },
+        "PCM-03": {
+          "tmib": 10,
+          "m9": 0
+        }
+      },
+      "missing": {},
+      "excess": {},
+      "m9_tmib_missing": 0,
+      "m9_tmib_excess": 0
+    }
+  },
+  "v5": {
+    "warnings": [],
+    "metrics": {
+      "boats_used": 3,
+      "total_tmib": 70,
+      "total_m9": 7,
+      "total_distance": 51.87559999999999,
+      "boat_routes": {
+        "SURFER 1931": "TMIB +24/M3 -8/M2 -15/M9 -1 +5/M4 (-4)/B4 (-1)",
+        "SURFER 1870": "TMIB +24/B4 -4/B1 -3/M5 -3/M7 -9/M9 -5",
+        "SURFER 1930": "TMIB +24/M6 -2/M4 -5/M3 -2/M9 +2/PDO1 -13 (-2)"
+      },
+      "boat_max_load": {
+        "SURFER 1931": 24,
+        "SURFER 1870": 24,
+        "SURFER 1930": 24
+      },
+      "boat_capacity": {
+        "SURFER 1931": 24,
+        "SURFER 1870": 24,
+        "SURFER 1930": 24
+      },
+      "deliveries": {
+        "PCM-03": {
+          "tmib": 10,
+          "m9": 0
+        },
+        "PCM-02": {
+          "tmib": 15,
+          "m9": 0
+        },
+        "PCM-09": {
+          "tmib": 6,
+          "m9": 0
+        },
+        "PCM-04": {
+          "tmib": 5,
+          "m9": 4
+        },
+        "PCB-04": {
+          "tmib": 4,
+          "m9": 1
+        },
+        "PCB-01": {
+          "tmib": 3,
+          "m9": 0
+        },
+        "PCM-05": {
+          "tmib": 3,
+          "m9": 0
+        },
+        "PCM-07": {
+          "tmib": 9,
+          "m9": 0
+        },
+        "PCM-06": {
+          "tmib": 2,
+          "m9": 0
+        },
+        "PDO-01": {
+          "tmib": 13,
+          "m9": 2
+        }
+      },
+      "missing": {},
+      "excess": {},
+      "m9_tmib_missing": 1,
+      "m9_tmib_excess": 0
+    }
+  }
+}

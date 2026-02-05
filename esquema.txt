@@ -1,0 +1,221 @@
+================================================================================
+SOLVER v5 - DISTRIBUICAO DE PAX EM DUAS RODADAS
+================================================================================
+
+CONCEITO CENTRAL
+----------------
+Separar o problema em duas rodadas independentes, simplificando drasticamente
+o algoritmo e eliminando a complexidade de gerenciar dois pools de passageiros
+simultaneamente.
+
+- Rodada 1: Distribuir todos os pax com origem TMIB
+- Rodada 2: Distribuir todos os pax com origem M9
+
+Cada rodada e um problema classico de roteamento (bin-packing + TSP).
+
+
+================================================================================
+CLASSIFICACAO DE PLATAFORMAS
+================================================================================
+
+PROXIMAS (Campos Caioba + Camurim)
+----------------------------------
+Distancia de M9 < 4 NM. Barcos podem fazer duas rodadas.
+
+  Caioba:   B1, B2, B3, B4
+  Camurim:  M1, M2, M3, M4, M5, M6, M7, M8, M9, M10, M11
+
+DISTANTES
+---------
+Distancia de M9 > 6 NM. Barco nao volta apos chegar.
+
+  PDO:  PDO1, PDO2, PDO3
+  PGA:  PGA1, PGA2, PGA3, PGA4, PGA5, PGA6, PGA7, PGA8
+  PRB:  PRB1
+
+
+================================================================================
+MODELO DE OPERACAO
+================================================================================
+
+PLATAFORMAS PROXIMAS - Modelo Duas Rodadas
+------------------------------------------
+
+  RODADA 1:
+  TMIB -----> Plataformas (entrega pax TMIB)
+       \
+        `---> Barco termina e vai para M9
+
+  RODADA 2:
+  M9 -------> Plataformas (entrega pax M9)
+
+  Vantagens:
+  - Capacidade total disponivel na R1 (24 pax, sem reservar espaco pra M9)
+  - Algoritmo simples: mesmo problema duas vezes, so muda a origem
+  - Prioridades faceis: quem chega primeiro em M9 pega plataformas prioritarias
+
+
+PLATAFORMAS DISTANTES - Modelo Rota Unica
+-----------------------------------------
+
+  TMIB ---> M9 (pega pax M9 do destino) ---> Plataformas distantes
+
+  Barco NAO VOLTA apos chegar no destino final.
+
+  Se houver demanda M9 para plataforma distante:
+    TMIB +N / M9 -X +Y / PDO1 -A (-B)
+
+  Se NAO houver demanda M9:
+    TMIB +N / PDO1 -N  (rota direta, sem parar em M9)
+
+
+================================================================================
+PARADAS NO CAMINHO (RESOLUCAO DE GARGALOS)
+================================================================================
+
+Quando a demanda TMIB para plataformas proximas excede a capacidade dos barcos
+disponiveis, os barcos com destino distante podem fazer PARADAS NO CAMINHO
+para ajudar.
+
+CRITERIO: Desvio < 3 NM
+
+  Desvio = (TMIB -> plat -> M9) - (TMIB -> M9)
+
+  | Plataforma | Desvio  | Viavel? |
+  |------------|---------|---------|
+  | M6         | 0.58 NM | SIM     |
+  | M3         | 1.53 NM | SIM     |
+  | M2         | 2.49 NM | SIM     |
+  | M7         | 3.34 NM | LIMITE  |
+
+EXEMPLO:
+  Demanda: M2=14, M3=12 (total 26, excede 24)
+
+  Solucao:
+    1930 (rota distante): TMIB +23 / M2 -2 / M9 / PDO1 -21
+    1870 (rota proxima):  TMIB +24 / M3 -12 / M2 -12
+
+  Os 2 pax excedentes de M2 vao na 1930 que passa "perto" no caminho.
+
+
+================================================================================
+CLUSTERS GEOGRAFICOS E PARES OBRIGATORIOS
+================================================================================
+
+CLUSTERS (plataformas que devem ficar juntas quando possivel)
+-------------------------------------------------------------
+  M2+M3:     1.04 NM entre si
+  M6+B1:     1.48 NM entre si
+  B1-B4:     0.41-1.48 NM entre si
+  PDO+PGA:   Cluster distante, rota dedicada
+  PRB:       Isolado (20 NM de TMIB)
+
+PARES OBRIGATORIOS
+------------------
+  (M2, M3) - Sempre juntos se ambos tem demanda
+  (M6, B1) - Sempre juntos se ambos tem demanda
+
+EXCECAO: Se demanda do par > 24 pax, PRECISA dividir entre barcos.
+
+
+================================================================================
+ALOCACAO DA RODADA 2 (M9)
+================================================================================
+
+ORDEM DE CHEGADA EM M9
+----------------------
+Barcos que terminam a Rodada 1 primeiro chegam em M9 primeiro.
+Esses barcos tem PRIORIDADE para pegar pax das plataformas prioritarias.
+
+CALCULO DO TEMPO DE CHEGADA EM M9:
+  tempo_chegada_M9 = hora_saida_TMIB + tempo_R1 + tempo_deslocamento_ate_M9
+
+ALOCACAO:
+  1. Ordenar barcos por tempo_chegada_M9 (menor primeiro)
+  2. Ordenar demanda M9 por prioridade (1=alta, 99=baixa)
+  3. Para cada barco (em ordem de chegada):
+     - Alocar demanda M9 de maior prioridade que couber
+     - Respeitar clusters geograficos
+     - Capacidade maxima: 24 pax
+
+
+================================================================================
+AQUA HELIX (TRATAMENTO ESPECIAL)
+================================================================================
+
+RESTRICOES:
+  - So opera em plataformas com gangway: M9, M6, B1, M7, M5, M3, PGA3
+  - Penalidade de 25 min por parada (aproximacao via gangway)
+  - Capacidade: 100 pax
+
+USO RECOMENDADO:
+  - Rotas de alta capacidade (muitos pax para poucas plataformas)
+  - Preferencialmente rota direta (sem M9) quando possivel
+  - Em troca de turma: recolher rendidos de M9
+
+
+================================================================================
+TROCA DE TURMA (CASO ESPECIAL)
+================================================================================
+
+Em dias de troca de turma, alem de distribuir pax, os barcos precisam
+RECOLHER rendidos de M9 de volta ao TMIB.
+
+OPERACAO:
+  1. Primeiro barco (Surfer): leva pessoal de cozinha/hotelaria para M9
+     - Rota dedicada: TMIB -> M9 -> TMIB (com rendidos)
+
+  2. Demais barcos: distribuicao normal (R1 + R2)
+     - Apos R2, barcos voltam a M9 para pegar rendidos
+
+  3. Aqua Helix (se disponivel): sai por ultimo
+     - Evita que outros barcos esperem operacao demorada (~25 min)
+     - Recolhe rendidos restantes
+
+CAPACIDADE PARA RENDIDOS:
+  - Total de rendidos informado na configuracao (rendidos_m9)
+  - Distribuir entre barcos que voltam
+
+
+================================================================================
+VALIDACOES FINAIS
+================================================================================
+
+1. DEMANDA ATENDIDA
+   - Toda demanda TMIB alocada
+   - Toda demanda M9 alocada
+   - Nenhum pax "esquecido"
+
+2. CAPACIDADE RESPEITADA
+   - Nenhum barco com mais de 24 pax (ou 100 para Aqua)
+   - Em qualquer ponto da rota
+
+3. REGRA DO PAX SOZINHO
+   - Minimo 2 pax por desembarque
+   - Se plataforma tem apenas 1 pax, tentar combinar com outra
+
+4. GANGWAY (Aqua Helix)
+   - Aqua so visita plataformas com gangway
+
+5. CLUSTERS RESPEITADOS
+   - Pares obrigatorios juntos (quando possivel)
+   - Nao misturar clusters distantes (PDO com B, por exemplo)
+
+
+================================================================================
+SAIDA DO ALGORITMO
+================================================================================
+
+Para cada barco, gerar string de rota no formato:
+
+  NOME_BARCO  HH:MM  TMIB +N / PLAT1 -X / PLAT2 -Y / M9 +Z / PLAT3 (-W) ...
+
+Notacao:
+  +N     Embarca N pax
+  -N     Desembarca N pax (origem TMIB)
+  (-N)   Desembarca N pax (origem M9)
+  /      Separador de paradas
+
+EXEMPLO COMPLETO:
+  1905  06:30  TMIB +24 / M6 -10 / B1 -8 / B4 -6 / M9 +5 / M6 (-2) / B1 (-3)
+               |_______ Rodada 1 _________|     |_______ Rodada 2 _________|
