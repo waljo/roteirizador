@@ -1,0 +1,47 @@
+============================================================
+        ROTEIRIZADOR - PROGRAMACAO DE PAX
+      Sistema de Distribuicao Logistica Maritima
+============================================================
+
+COMO USAR:
+----------
+1. Abra o arquivo "viagens_input.xlsx" no Excel
+2. Preencha as viagens seguindo as instrucoes na primeira linha
+3. Salve e feche o arquivo
+4. De duplo clique em "EXECUTAR.bat"
+5. O arquivo "programacao_pax.xlsx" sera gerado automaticamente
+
+
+ARQUIVOS DA PASTA:
+------------------
+* EXECUTAR.bat         -> Execute para gerar a programacao
+* viagens_input.xlsx   -> Preencha aqui as viagens do dia
+* programacao_pax.xlsx -> Resultado gerado (programacao final)
+* LEIA-ME.txt          -> Este arquivo de instrucoes
+
+
+SINTAXE DA ROTA:
+----------------
++x      = Embarque no TMIB (ex: +22)
+-x      = Desembarque de pax do TMIB (ex: -5)
++x      = Embarque em M9 (ex: +4)
+(-x)    = Desembarque de pax de M9 (ex: (-4))
+{D:+x}  = Embarque em outra plataforma com destino D (ex: {B1:+1})
+{O:-x}  = Desembarque de pax com origem O (ex: {M6:-1})
+
+Exemplo de rota:
+TMIB +22/M10 -5/M9 -7 +4/M6 -4 {B1:+1}/B2 -4 (-4)/B1 -2 {M6:-1}
+
+
+PLATAFORMAS DISPONIVEIS:
+------------------------
+TMIB, M1-M11, B1-B4, PGA1-PGA8, PDO1-PDO3, PRB1
+
+
+PROBLEMAS?
+----------
+* Verifique se o arquivo viagens_input.xlsx esta fechado antes de executar
+* Verifique se a sintaxe da rota esta correta
+* Nao mova ou renomeie a pasta "python"
+
+============================================================
