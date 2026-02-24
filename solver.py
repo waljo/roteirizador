@@ -36,6 +36,10 @@ BACKTRACK_PENALTY_NM = 10.0  # penalidade por voltar em direção ao início (ev
 PRIORITY1_PRECEDENCE_PENALTY_NM = 250.0  # penalidade alta para colocar prioridade 1 depois de nao-prioridade
 PRIORITY1_PRE_M9_MAX_DETOUR_NM = 1.5  # promove prioridade 1 para pre-M9 apenas com desvio pequeno
 PRIORITY_MIX_FIT_PENALTY_NM = 120.0  # penaliza separar P2/P3 de barco com P1 quando caberia junto
+CLUSTER_SWITCH_PENALTY_NM = 8.0  # penaliza mudanca de cluster na mesma perna
+INCOMPATIBLE_CLUSTER_SWITCH_PENALTY_NM = 24.0  # salto entre clusters incompativeis
+CROSS_CLUSTER_JUMP_PENALTY_PER_NM = 4.0  # penalidade por NM de salto entre clusters
+CROSS_CLUSTER_JUMP_FREE_NM = 1.5  # folga sem penalidade para transicoes pequenas
 
 # Clusters geográficos baseados em proximidade real
 GEO_CLUSTERS = {
@@ -466,6 +470,36 @@ def calc_comfort_pax_minutes(route: Route, distances: Dict) -> float:
             current = dest
 
     return total
+
+
+def calc_cluster_cohesion_penalty(route: Route, distances: Dict) -> float:
+    """
+    Penaliza rotas com baixa coesao geografica.
+    Objetivo: privilegiar blocos de plataformas proximas no mesmo barco.
+    """
+    def segment_penalty(stops: List[Tuple[str, int, int]]) -> float:
+        penalty = 0.0
+        prev_cluster = None
+        prev_plat = None
+
+        for plat_norm, _, _ in stops:
+            cluster = get_geo_cluster(plat_norm)
+            if prev_cluster is not None and cluster != prev_cluster:
+                if are_clusters_compatible(prev_cluster, cluster):
+                    penalty += CLUSTER_SWITCH_PENALTY_NM
+                else:
+                    penalty += INCOMPATIBLE_CLUSTER_SWITCH_PENALTY_NM
+
+                jump_nm = get_dist(distances, prev_plat, plat_norm)
+                excess_nm = max(0.0, jump_nm - CROSS_CLUSTER_JUMP_FREE_NM)
+                penalty += excess_nm * CROSS_CLUSTER_JUMP_PENALTY_PER_NM
+
+            prev_cluster = cluster
+            prev_plat = plat_norm
+
+        return penalty
+
+    return segment_penalty(route.pre_m9_stops) + segment_penalty(route.stops)
 
 
 def order_stops_with_priority(stops: List[Tuple[str, int, int]],
@@ -1130,6 +1164,7 @@ def form_demand_packages(demands: List[Demand], boats: List[Boat]) -> List[List[
     packages = []
     used = set()
     max_capacity = max((b.max_capacity for b in boats), default=0)
+    n_boats = len(boats)
 
     for p1, p2 in MANDATORY_PAIRS:
         d1 = next((d for d in demands if d.platform_norm == p1 and d.total() > 0), None)
@@ -1141,9 +1176,41 @@ def form_demand_packages(demands: List[Demand], boats: List[Boat]) -> List[List[
                 used.add(p1)
                 used.add(p2)
 
+    # Opcional: em cenarios apertados (<=2 barcos), permitir split de UMA
+    # demanda TMIB-only grande para destravar melhor agrupamento geografico.
+    split_candidate = None
+    if n_boats <= 2:
+        unsplitted = [
+            d for d in demands
+            if d.platform_norm not in used and d.m9 == 0 and d.tmib >= 12
+        ]
+        if unsplitted:
+            # Preferir plataformas do entorno de M9/M2-M3 para melhorar
+            # combinacoes de bloco com clusters proximos.
+            def split_rank(d: Demand):
+                c = get_geo_cluster(d.platform_norm)
+                pref = 0 if c in ("M2M3", "M9_NEAR") else 1
+                return (pref, -d.tmib)
+
+            split_candidate = min(unsplitted, key=split_rank)
+
     for d in demands:
-        if d.platform_norm not in used and d.total() > 0:
-            packages.append([d])
+        if d.platform_norm in used or d.total() <= 0:
+            continue
+
+        if split_candidate and d.platform_norm == split_candidate.platform_norm:
+            first_chunk = 4
+            second_chunk = d.tmib - first_chunk
+            if second_chunk > 0:
+                packages.append([
+                    Demand(d.platform, d.platform_norm, tmib=first_chunk, m9=0, priority=d.priority)
+                ])
+                packages.append([
+                    Demand(d.platform, d.platform_norm, tmib=second_chunk, m9=0, priority=d.priority)
+                ])
+                continue
+
+        packages.append([d])
 
     return packages
 
@@ -1151,14 +1218,26 @@ def form_demand_packages(demands: List[Demand], boats: List[Boat]) -> List[List[
 def evaluate_boat_route(boat_demands: List[Demand], boat: Boat,
                         distances: Dict, m9_tmib_avail: int,
                         gangway_platforms: Set[str],
-                        m9_priority: int = 99) -> Tuple[Optional[Route], float, int, float, float, float]:
+                        m9_priority: int = 99) -> Tuple[Optional[Route], float, int, float, float, float, float]:
     """
     Constrói e avalia rota para um barco com demandas específicas.
     Retorna (route, distance, m9_tmib_used).
     distance = inf indica atribuição inválida.
     """
     if not boat_demands:
-        return None, 0.0, 0, 0.0, 0.0, 0.0
+        return None, 0.0, 0, 0.0, 0.0, 0.0, 0.0
+
+    # Consolidar eventuais splits da mesma plataforma no mesmo barco.
+    merged: Dict[str, Demand] = {}
+    for d in boat_demands:
+        if d.platform_norm not in merged:
+            merged[d.platform_norm] = d.copy()
+        else:
+            md = merged[d.platform_norm]
+            md.tmib += d.tmib
+            md.m9 += d.m9
+            md.priority = min(md.priority, d.priority)
+    boat_demands = list(merged.values())
 
     is_aqua = is_aqua_helix(boat.name)
     cap = boat.max_capacity
@@ -1167,22 +1246,27 @@ def evaluate_boat_route(boat_demands: List[Demand], boat: Boat,
     # Verificar restrição de gangway para Aqua
     if is_aqua:
         if any(d.platform_norm not in gangway_platforms for d in boat_demands):
-            return None, float('inf'), 0, 0.0, 0.0, 0.0
+            return None, float('inf'), 0, 0.0, 0.0, 0.0, 0.0
 
     total_m9_pickup = sum(d.m9 for d in boat_demands)
     total_tmib_deliver = sum(d.tmib for d in boat_demands)
     needs_m9 = total_m9_pickup > 0
 
-    # Calcular TMIB→M9 delivery (preencher espaço livre pré-M9)
+    # Calcular TMIB→M9 delivery (preencher espaço livre pré-M9).
+    # Regra: permitir parada em M9 mesmo sem embarque M9->plataforma,
+    # para não deixar TMIB->M9 pendente quando há capacidade disponível.
     space = cap - total_tmib_deliver
     tmib_to_m9 = 0
-    if needs_m9 and space > 0 and m9_tmib_avail > 0:
+    if space > 0 and m9_tmib_avail > 0:
         tmib_to_m9 = min(space, m9_tmib_avail)
+        needs_m9 = True
 
     pre_load = total_tmib_deliver + tmib_to_m9
-    post_load = total_tmib_deliver + total_m9_pickup
-    if max(pre_load, post_load) > cap:
-        return None, float('inf'), 0, 0.0, 0.0, 0.0
+    # A carga inicial (pre-M9) nunca pode exceder a capacidade.
+    # A carga pos-M9 e validada por split_pre_m9_stops, que move
+    # desembarques TMIB para antes de M9 quando necessario.
+    if pre_load > cap:
+        return None, float('inf'), 0, 0.0, 0.0, 0.0, 0.0
 
     stops = [(d.platform_norm, d.tmib, d.m9) for d in boat_demands]
 
@@ -1192,7 +1276,7 @@ def evaluate_boat_route(boat_demands: List[Demand], boat: Boat,
     if needs_m9:
         split = split_pre_m9_stops(stops, total_m9_pickup, distances, cap)
         if split is None:
-            return None, float('inf'), 0, 0.0, 0.0, 0.0
+            return None, float('inf'), 0, 0.0, 0.0, 0.0, 0.0
         pre_m9_stops, post_m9_stops = split
         pre_m9_stops, post_m9_stops = promote_priority1_pre_m9(
             pre_m9_stops, post_m9_stops, distances, priority_map
@@ -1210,7 +1294,7 @@ def evaluate_boat_route(boat_demands: List[Demand], boat: Boat,
         pre_m9_stops=pre_m9_stops,
         m9_pickup=total_m9_pickup,
         tmib_to_m9=tmib_to_m9,
-        uses_m9_hub=needs_m9,
+        uses_m9_hub=(total_m9_pickup > 0 or tmib_to_m9 > 0),
         priority_map=priority_map,
         m9_priority=m9_priority,
     )
@@ -1218,8 +1302,9 @@ def evaluate_boat_route(boat_demands: List[Demand], boat: Boat,
     priority_penalty = calc_priority_time_penalty(route, distances, priority_map, m9_priority)
     comfort_cost = calc_comfort_pax_minutes(route, distances)
     pax_arrival_score = calc_weighted_arrival_score(route, distances)
+    cluster_penalty = calc_cluster_cohesion_penalty(route, distances)
 
-    return route, route.total_distance, tmib_to_m9, priority_penalty, comfort_cost, pax_arrival_score
+    return route, route.total_distance, tmib_to_m9, priority_penalty, comfort_cost, pax_arrival_score, cluster_penalty
 
 
 def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
@@ -1249,12 +1334,12 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
                 return True
         return False
 
-    def run_optimizer(enforce_all: bool, enforce_distant: bool):
+    def run_optimizer(enforce_all: bool, enforce_distant: bool, require_zero_m9: bool):
         best_routes = None
-        best_dist = float('inf')
+        best_score = float('inf')
         best_m9_remaining = m9_tmib_demand
         top_n = 5
-        top_scores = []  # list of tuples (score, dist, penalty, priority, comfort, pax_arrival, assignment)
+        top_scores = []  # list of tuples (remaining_m9, score, dist, penalty, priority, comfort, pax_arrival, cluster, assignment)
 
         for assignment in iter_product(range(n_boats), repeat=n_pkgs):
             # Agrupar pacotes por barco
@@ -1272,6 +1357,7 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
             total_priority_penalty = 0.0
             total_comfort_cost = 0.0
             total_pax_arrival_score = 0.0
+            total_cluster_penalty = 0.0
             remaining_m9 = m9_tmib_demand
             valid = True
 
@@ -1280,7 +1366,7 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
                 if not demands_for_boat:
                     continue
 
-                route, dist, m9_used, priority_penalty, comfort_cost, pax_arrival_score = evaluate_boat_route(
+                route, dist, m9_used, priority_penalty, comfort_cost, pax_arrival_score, cluster_penalty = evaluate_boat_route(
                     demands_for_boat, boats[boat_idx], distances,
                     remaining_m9, gangway_platforms, m9_priority
                 )
@@ -1296,11 +1382,15 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
                     total_priority_penalty += priority_penalty
                     total_comfort_cost += comfort_cost
                     total_pax_arrival_score += pax_arrival_score
+                    total_cluster_penalty += cluster_penalty
                     remaining_m9 -= m9_used
 
             if valid:
+                if require_zero_m9 and remaining_m9 > 0:
+                    continue
+
                 # Penalizar distribuicao de pax M9 em varios barcos
-                m9_routes = sum(1 for r in routes if r.m9_pickup > 0)
+                m9_routes = sum(1 for r in routes if r.m9_pickup > 0 or r.tmib_to_m9 > 0)
                 penalty = max(0, m9_routes - 1) * M9_CONSOLIDATION_PENALTY_NM
 
                 if enforce_distant:
@@ -1344,6 +1434,8 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
                         if can_fit_with_some_p1:
                             priority_mix_penalty += PRIORITY_MIX_FIT_PENALTY_NM
 
+                cluster_weight = 1.0 if n_boats <= 2 else 0.0
+
                 scored_dist = (
                     total_dist
                     + penalty
@@ -1351,45 +1443,77 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
                     + (total_priority_penalty * PRIORITY_TIME_WEIGHT)
                     + (total_comfort_cost * COMFORT_PAX_MIN_WEIGHT)
                     + (total_pax_arrival_score * PAX_ARRIVAL_WEIGHT)
+                    + (total_cluster_penalty * cluster_weight)
                 )
 
                 # Guardar top combinacoes
                 top_scores.append((
+                    remaining_m9,
                     scored_dist,
                     total_dist,
                     penalty,
                     total_priority_penalty,
                     total_comfort_cost,
                     total_pax_arrival_score,
+                    total_cluster_penalty,
                     assignment,
                 ))
-                top_scores.sort(key=lambda x: x[0])
+                top_scores.sort(key=lambda x: (x[0], x[1]))
                 if len(top_scores) > top_n:
                     top_scores = top_scores[:top_n]
             else:
                 scored_dist = float('inf')
 
-            if valid and scored_dist < best_dist:
-                best_dist = scored_dist
-                best_routes = routes
-                best_m9_remaining = remaining_m9
+            # Objetivo lexicografico:
+            # 1) minimizar demanda TMIB->M9 nao atendida
+            # 2) entre empates, minimizar score total
+            if valid:
+                better_on_m9 = remaining_m9 < best_m9_remaining
+                tie_on_m9_better_score = remaining_m9 == best_m9_remaining and scored_dist < best_score
+                if better_on_m9 or tie_on_m9_better_score:
+                    best_score = scored_dist
+                    best_routes = routes
+                    best_m9_remaining = remaining_m9
 
         return best_routes, best_m9_remaining, top_scores
 
     enforce_all = n_pkgs >= n_boats
     enforce_distant = max_distant_boats is not None and max_distant_boats > 0
-    best_routes, best_m9_remaining, top_scores = run_optimizer(enforce_all, enforce_distant)
-    if enforce_all and not best_routes:
-        print("  AVISO: nao foi possivel usar todos os barcos; relaxando a restricao.")
-        best_routes, best_m9_remaining, top_scores = run_optimizer(False, enforce_distant)
 
-    if enforce_distant and not best_routes:
-        print("  AVISO: nao foi possivel limitar barcos distantes; relaxando a restricao.")
-        best_routes, best_m9_remaining, top_scores = run_optimizer(enforce_all, False)
+    def run_with_relaxations(require_zero_m9: bool):
+        local_best_routes, local_best_m9_remaining, local_top_scores = run_optimizer(
+            enforce_all, enforce_distant, require_zero_m9
+        )
+        if enforce_all and not local_best_routes:
+            if require_zero_m9:
+                print("  AVISO: sem solucao com m9_restante=0 usando todos os barcos; relaxando a restricao.")
+            else:
+                print("  AVISO: nao foi possivel usar todos os barcos; relaxando a restricao.")
+            local_best_routes, local_best_m9_remaining, local_top_scores = run_optimizer(
+                False, enforce_distant, require_zero_m9
+            )
+
+        if enforce_distant and not local_best_routes:
+            if require_zero_m9:
+                print("  AVISO: sem solucao com m9_restante=0 limitando barcos distantes; relaxando a restricao.")
+            else:
+                print("  AVISO: nao foi possivel limitar barcos distantes; relaxando a restricao.")
+            local_best_routes, local_best_m9_remaining, local_top_scores = run_optimizer(
+                enforce_all, False, require_zero_m9
+            )
+
+        return local_best_routes, local_best_m9_remaining, local_top_scores
+
+    # Regra hard: se existir solucao com m9_restante=0, ela e obrigatoria.
+    strict_routes, strict_m9_remaining, strict_top_scores = run_with_relaxations(require_zero_m9=True)
+    if strict_routes:
+        best_routes, best_m9_remaining, top_scores = strict_routes, strict_m9_remaining, strict_top_scores
+    else:
+        best_routes, best_m9_remaining, top_scores = run_with_relaxations(require_zero_m9=False)
 
     if top_scores:
-        print("  Top combinacoes (score | dist | penalty | priority | comfort | pax_arrival):")
-        for i, (score, dist, penalty, prio, comfort, pax_arrival, assignment) in enumerate(top_scores, 1):
+        print("  Top combinacoes (m9_restante | score | dist | penalty | priority | comfort | pax_arrival | cluster):")
+        for i, (m9_restante, score, dist, penalty, prio, comfort, pax_arrival, cluster, assignment) in enumerate(top_scores, 1):
             boat_pkgs = {b: [] for b in range(n_boats)}
             for pkg_idx, boat_idx in enumerate(assignment):
                 boat_pkgs[boat_idx].append(pkg_idx + 1)
@@ -1399,7 +1523,10 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
                 pkgs = ",".join(str(p) for p in boat_pkgs[b_idx]) if boat_pkgs[b_idx] else "-"
                 parts.append(f"{boat_name}:{pkgs}")
             assign_str = " | ".join(parts)
-            print(f"    {i}. {score:.2f} | {dist:.2f} | {penalty:.2f} | {prio:.2f} | {comfort:.2f} | {pax_arrival:.2f}")
+            print(
+                f"    {i}. {m9_restante} | {score:.2f} | {dist:.2f} | {penalty:.2f} | "
+                f"{prio:.2f} | {comfort:.2f} | {pax_arrival:.2f} | {cluster:.2f}"
+            )
             print(f"       {assign_str}")
 
     return best_routes or [], best_m9_remaining

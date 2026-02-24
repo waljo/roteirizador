@@ -1,0 +1,24 @@
+{
+  "name": "caso_2026_02_22",
+  "created_at": "2026-02-22T11:03:12",
+  "input": "input.xlsx",
+  "solution": "solucao.txt",
+  "shift_end": "15:30",
+  "metrics": {
+    "boats_used": 4,
+    "total_tmib": 71,
+    "total_m9": 4,
+    "total_distance_nm": 59.745,
+    "service_minutes_complete": 3993,
+    "service_minutes_partial": 3993,
+    "platforms_complete": 9,
+    "platforms_total": 9,
+    "missing": {}
+  },
+  "thresholds": {
+    "distance_pct": 0.05,
+    "distance_nm": 0.5,
+    "service_complete_pct": 0.95,
+    "allow_missing": false
+  }
+}
