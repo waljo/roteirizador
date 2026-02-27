@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Valida casos aprovados contra o solver atual.
 
 Uso:
   python validar_casos.py
-  python validar_casos.py --solver v5 --details
+  python validar_casos.py --details
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import solver as v4
-import solver_v5 as v5
 
 
 DEFAULT_CASES_DIR = "casos_aprovados"
@@ -132,13 +131,13 @@ def _simulate_route_times(
 def _build_demand_map(demands) -> Dict[str, Dict[str, int]]:
     demand_map: Dict[str, Dict[str, int]] = {}
     for d in demands:
-        if v5.short_plat(d.plataforma_norm) == "M9":
+        if v4.short_plat(d.platform_norm) == "M9":
             continue
         tmib = int(d.tmib)
         m9 = int(d.m9)
         if tmib == 0 and m9 == 0:
             continue
-        demand_map[d.plataforma_norm] = {"tmib": tmib, "m9": m9}
+        demand_map[d.platform_norm] = {"tmib": tmib, "m9": m9}
     return demand_map
 
 
@@ -186,7 +185,7 @@ def _compute_metrics(
     boats_used = 0
 
     for boat_name, departure, route_str in routes:
-        speed = v5.get_speed(speeds, boat_name)
+        speed = v4.get_speed(speeds, boat_name)
         boat = BoatInfo(name=boat_name, departure=departure, speed=speed)
         boats_used += 1
 
@@ -264,19 +263,6 @@ def _load_case(case_dir: str) -> Dict:
     return meta
 
 
-def _solver_routes_v5(input_path: str) -> List[Tuple[str, str, str]]:
-    distances = v5.load_distances(v5.DIST_FILE)
-    speeds = v5.load_speeds(v5.SPEED_FILE)
-    config, boats, demands = v5.read_solver_input(input_path)
-    for boat in boats:
-        boat.velocidade = v5.get_speed(speeds, boat.nome)
-    results, _ = v5.resolver_distribuicao(config, boats, demands, distances)
-    routes = []
-    for boat, route_str in results:
-        routes.append((boat.nome, boat.hora_saida, route_str))
-    return routes
-
-
 def _solver_routes_v4(input_path: str) -> List[Tuple[str, str, str]]:
     distances = v4.load_distances(v4.DIST_FILE)
     speeds = v4.load_speeds(v4.SPEED_FILE)
@@ -322,7 +308,6 @@ def _compare_metrics(base: Dict, now: Dict, thresholds: Dict) -> Tuple[bool, Lis
 def main():
     parser = argparse.ArgumentParser(description="Validar casos aprovados")
     parser.add_argument("--cases-dir", default=DEFAULT_CASES_DIR, help="Diretorio de casos")
-    parser.add_argument("--solver", choices=["v4", "v5"], default="v5", help="Solver a testar")
     parser.add_argument("--shift-end", default=DEFAULT_SHIFT_END, help="Fim do turno (HH:MM)")
     parser.add_argument("--details", action="store_true", help="Mostrar detalhes por caso")
     args = parser.parse_args()
@@ -345,9 +330,9 @@ def main():
         input_path = os.path.join(case_dir, meta.get("input", "input.xlsx"))
         sol_path = os.path.join(case_dir, meta.get("solution", "solucao.txt"))
 
-        distances = v5.load_distances(v5.DIST_FILE)
-        speeds = v5.load_speeds(v5.SPEED_FILE)
-        _, _, demands = v5.read_solver_input(input_path)
+        distances = v4.load_distances(v4.DIST_FILE)
+        speeds = v4.load_speeds(v4.SPEED_FILE)
+        _, _, demands = v4.read_solver_input(input_path)
         demand_map = _build_demand_map(demands)
 
         base_metrics = meta.get("metrics")
@@ -355,10 +340,7 @@ def main():
             base_routes = _parse_solution_file(sol_path)
             base_metrics = _compute_metrics(base_routes, demand_map, distances, speeds, shift_end_minutes)
 
-        if args.solver == "v5":
-            new_routes = _solver_routes_v5(input_path)
-        else:
-            new_routes = _solver_routes_v4(input_path)
+        new_routes = _solver_routes_v4(input_path)
 
         now_metrics = _compute_metrics(new_routes, demand_map, distances, speeds, shift_end_minutes)
 
@@ -385,3 +367,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
