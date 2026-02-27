@@ -1,10 +1,10 @@
-# solver.py
+﻿# solver.py
 """
-Solver de Distribuição Automática de PAX v4
-- Pares obrigatórios (M2+M3, M6+B1) mantidos como unidade atômica
-- Otimização combinatória: testa todas as atribuições pacote→barco
+Solver de DistribuiÃ§Ã£o AutomÃ¡tica de PAX v4
+- Pares obrigatÃ³rios (M2+M3, M6+B1) mantidos como unidade atÃ´mica
+- OtimizaÃ§Ã£o combinatÃ³ria: testa todas as atribuiÃ§Ãµes pacoteâ†’barco
 - AQUA Helix priorizada para rotas diretas de alta capacidade
-- Clustering geográfico e nearest-neighbor para ordenação de paradas
+- Clustering geogrÃ¡fico e nearest-neighbor para ordenaÃ§Ã£o de paradas
 """
 
 import json
@@ -33,6 +33,7 @@ PRIORITY_TIME_WEIGHT = 0.05  # peso (NM-equivalente por minuto) para antecipar p
 COMFORT_PAX_MIN_WEIGHT = 0.02  # peso (NM-equivalente por pax-minuto) para conforto
 PAX_ARRIVAL_WEIGHT = 0.1  # peso forte (NM-equivalente por pax-minuto) para priorizar grandes entregas cedo
 BACKTRACK_PENALTY_NM = 10.0  # penalidade por voltar em direção ao início (evitar "ir longe e voltar")
+SPLIT_PLATFORM_PENALTY_NM = 2.0  # evita dividir a mesma plataforma antes/depois de M9 sem necessidade
 PRIORITY1_PRECEDENCE_PENALTY_NM = 250.0  # penalidade alta para colocar prioridade 1 depois de nao-prioridade
 PRIORITY1_PRE_M9_MAX_DETOUR_NM = 1.5  # promove prioridade 1 para pre-M9 apenas com desvio pequeno
 PRIORITY_MIX_FIT_PENALTY_NM = 120.0  # penaliza separar P2/P3 de barco com P1 quando caberia junto
@@ -41,19 +42,19 @@ INCOMPATIBLE_CLUSTER_SWITCH_PENALTY_NM = 24.0  # salto entre clusters incompativ
 CROSS_CLUSTER_JUMP_PENALTY_PER_NM = 4.0  # penalidade por NM de salto entre clusters
 CROSS_CLUSTER_JUMP_FREE_NM = 1.5  # folga sem penalidade para transicoes pequenas
 
-# Clusters geográficos baseados em proximidade real
+# Clusters geogrÃ¡ficos baseados em proximidade real
 GEO_CLUSTERS = {
-    "M6_AREA": ["PCM-06", "PCM-08"],  # M6/M8 muito próximos (0.42 NM)
-    "B_CLUSTER": ["PCB-01", "PCB-02", "PCB-03", "PCB-04"],  # B1-B4 próximos
-    "M2M3": ["PCM-02", "PCM-03"],  # M2/M3 próximos (1.04 NM)
-    "M9_NEAR": ["PCM-04", "PCM-05", "PCM-09", "PCM-10", "PCM-11"],  # Próximos de M9
-    "M1M7": ["PCM-01", "PCM-07"],  # M1/M7 próximos
+    "M6_AREA": ["PCM-06", "PCM-08"],  # M6/M8 muito prÃ³ximos (0.42 NM)
+    "B_CLUSTER": ["PCB-01", "PCB-02", "PCB-03", "PCB-04"],  # B1-B4 prÃ³ximos
+    "M2M3": ["PCM-02", "PCM-03"],  # M2/M3 prÃ³ximos (1.04 NM)
+    "M9_NEAR": ["PCM-04", "PCM-05", "PCM-09", "PCM-10", "PCM-11"],  # PrÃ³ximos de M9
+    "M1M7": ["PCM-01", "PCM-07"],  # M1/M7 prÃ³ximos
     "PDO": ["PDO-01", "PDO-02", "PDO-03"],  # PDO cluster
     "PGA": ["PGA-01", "PGA-02", "PGA-03", "PGA-04", "PGA-05", "PGA-07", "PGA-08"],
     "PRB": ["PRB-01"],  # Isolado
 }
 
-# Pares obrigatórios: quando ambos têm demanda, devem ir no mesmo barco
+# Pares obrigatÃ³rios: quando ambos tÃªm demanda, devem ir no mesmo barco
 MANDATORY_PAIRS = [
     ("PCM-02", "PCM-03"),  # M2+M3: 1.04 NM apart
     ("PCM-06", "PCB-01"),  # M6+B1: 1.48 NM apart
@@ -68,7 +69,7 @@ DIRECT_COMPATIBLE = {
     "PCB-04": ["PCM-06", "PCB-01", "PCB-02", "PCB-03", "PCM-08"],
     "PCM-02": ["PCM-03", "PCM-10"],  # M2 com M3
     "PCM-03": ["PCM-02", "PCM-10"],
-    "PDO-01": ["PDO-02", "PDO-03", "PGA-03", "PGA-04"],  # PDO com PGA próximos
+    "PDO-01": ["PDO-02", "PDO-03", "PGA-03", "PGA-04"],  # PDO com PGA prÃ³ximos
     "PDO-02": ["PDO-01", "PDO-03", "PGA-03", "PGA-08"],
     "PDO-03": ["PDO-01", "PDO-02", "PGA-03", "PGA-08"],
 }
@@ -170,8 +171,8 @@ class Config:
 class Route:
     """Representa uma rota completa de um barco."""
     boat: Boat
-    stops: List[Tuple[str, int, int]]  # Paradas pós-M9: [(platform_norm, tmib_drop, m9_drop), ...]
-    pre_m9_stops: List[Tuple[str, int, int]] = field(default_factory=list)  # Paradas pré-M9 (TMIB-only)
+    stops: List[Tuple[str, int, int]]  # Paradas pÃ³s-M9: [(platform_norm, tmib_drop, m9_drop), ...]
+    pre_m9_stops: List[Tuple[str, int, int]] = field(default_factory=list)  # Paradas prÃ©-M9 (TMIB-only)
     m9_pickup: int = 0  # pax M9 embarcados em M9
     tmib_to_m9: int = 0  # pax TMIB desembarcados em M9
     uses_m9_hub: bool = False
@@ -290,12 +291,12 @@ def travel_time_minutes(distance_nm: float, speed_kn: float) -> int:
 
 
 def calc_route_distance(route: Route, distances: Dict) -> float:
-    """Calcula distância total da rota."""
+    """Calcula distÃ¢ncia total da rota."""
     total = 0.0
     current = "TMIB"
 
     if route.uses_m9_hub:
-        # Paradas pré-M9
+        # Paradas prÃ©-M9
         for stop in route.pre_m9_stops:
             total += get_dist(distances, current, stop[0])
             current = stop[0]
@@ -312,7 +313,7 @@ def calc_route_distance(route: Route, distances: Dict) -> float:
 
 
 def calc_arrival_times(route: Route, distances: Dict) -> List[Tuple[str, int]]:
-    """Calcula horário de chegada em cada plataforma."""
+    """Calcula horÃ¡rio de chegada em cada plataforma."""
     arrivals = []
     current_time = route.boat.departure_minutes()
     current_pos = "TMIB"
@@ -333,7 +334,7 @@ def calc_arrival_times(route: Route, distances: Dict) -> List[Tuple[str, int]]:
         current_time += travel_time_minutes(dist, route.boat.speed)
         if is_aqua:
             current_time += AQUA_APPROACH_TIME
-        # Operação em M9
+        # OperaÃ§Ã£o em M9
         current_time += (route.tmib_to_m9 + route.m9_pickup) * MINUTES_PER_PAX
         arrivals.append((m9, current_time))
         current_pos = m9
@@ -344,7 +345,7 @@ def calc_arrival_times(route: Route, distances: Dict) -> List[Tuple[str, int]]:
         if is_aqua:
             current_time += AQUA_APPROACH_TIME
         arrivals.append((stop[0], current_time))
-        # Operação
+        # OperaÃ§Ã£o
         current_time += (stop[1] + stop[2]) * MINUTES_PER_PAX
         current_pos = stop[0]
 
@@ -361,14 +362,14 @@ def calc_weighted_arrival_score(route: Route, distances: Dict) -> float:
 
     for i, (plat, arrival_min) in enumerate(arrivals):
         if plat == norm_plat("M9"):
-            continue  # M9 é hub, não destino final
+            continue  # M9 Ã© hub, nÃ£o destino final
 
         # Encontrar quantidade de pax nesta parada
         all_stops = route.pre_m9_stops + route.stops
         for stop in all_stops:
             if stop[0] == plat:
                 pax = stop[1] + stop[2]
-                # Score: tempo * pax (entregar mais pax cedo é melhor)
+                # Score: tempo * pax (entregar mais pax cedo Ã© melhor)
                 score += arrival_min * pax
                 break
 
@@ -379,8 +380,8 @@ def calc_priority_time_penalty(route: Route, distances: Dict,
                                priority_map: Dict[str, int],
                                m9_priority: int = 99) -> float:
     """
-    Penaliza chegada tardia em plataformas prioritárias.
-    Usa o menor horário de chegada por plataforma.
+    Penaliza chegada tardia em plataformas prioritÃ¡rias.
+    Usa o menor horÃ¡rio de chegada por plataforma.
     """
     arrivals = calc_arrival_times(route, distances)
     min_arrival: Dict[str, int] = {}
@@ -417,7 +418,7 @@ def calc_priority_time_penalty(route: Route, distances: Dict,
 def calc_comfort_pax_minutes(route: Route, distances: Dict) -> float:
     """
     Calcula pax-minuto a bordo (menor = melhor).
-    Considera tempos de deslocamento, aproximação (Aqua) e operação.
+    Considera tempos de deslocamento, aproximaÃ§Ã£o (Aqua) e operaÃ§Ã£o.
     """
     tmib_onboard = route.total_tmib()
     m9_onboard = 0
@@ -508,15 +509,15 @@ def order_stops_with_priority(stops: List[Tuple[str, int, int]],
                               boat: Boat,
                               priority_map: Dict[str, int]) -> List[Tuple[str, int, int]]:
     """
-    Ordena paradas considerando distância, prioridades e pax entregues cedo.
-    Para conjuntos pequenos, testa todas as permutações; caso contrário, usa heurística gulosa.
+    Ordena paradas considerando distÃ¢ncia, prioridades e pax entregues cedo.
+    Para conjuntos pequenos, testa todas as permutaÃ§Ãµes; caso contrÃ¡rio, usa heurÃ­stica gulosa.
     """
     if len(stops) <= 1:
         return list(stops)
 
     has_priority = any(priority_map.get(s[0], 99) <= 3 for s in stops)
     if not has_priority:
-        # fallback para distância pura
+        # fallback para distÃ¢ncia pura
         stop_demands = [Demand(short_plat(s[0]), s[0], s[1], s[2]) for s in stops]
         ordered = optimal_order_from(stop_demands, distances, start)
         return [(d.platform_norm, d.tmib, d.m9) for d in ordered]
@@ -590,7 +591,7 @@ def order_stops_with_priority(stops: List[Tuple[str, int, int]],
         best = min(permutations(stops), key=score)
         return list(best)
 
-    # Heurística gulosa para conjuntos grandes
+    # HeurÃ­stica gulosa para conjuntos grandes
     remaining = list(stops)
     ordered = []
     current = start
@@ -718,7 +719,7 @@ def read_solver_input(path: str):
 # ======== Routing algorithms ========
 
 def nn_order_from(platforms: List[Demand], distances: Dict, start: str) -> List[Demand]:
-    """Ordena plataformas por vizinho mais próximo a partir de start."""
+    """Ordena plataformas por vizinho mais prÃ³ximo a partir de start."""
     if len(platforms) <= 1:
         return list(platforms)
 
@@ -737,8 +738,8 @@ def nn_order_from(platforms: List[Demand], distances: Dict, start: str) -> List[
 
 def optimal_order_from(platforms: List[Demand], distances: Dict, start: str) -> List[Demand]:
     """
-    Para conjuntos pequenos (≤6 paradas), testa TODAS as permutações e
-    retorna a de menor distância total. Para conjuntos maiores, usa NN.
+    Para conjuntos pequenos (â‰¤6 paradas), testa TODAS as permutaÃ§Ãµes e
+    retorna a de menor distÃ¢ncia total. Para conjuntos maiores, usa NN.
     """
     from itertools import permutations
 
@@ -764,13 +765,59 @@ def optimal_order_from(platforms: List[Demand], distances: Dict, start: str) -> 
     return best_order
 
 
+def _order_stops_for_split(stops: List[Tuple[str, int, int]],
+                           distances: Dict,
+                           start: str,
+                           boat: Optional[Boat] = None,
+                           priority_map: Optional[Dict[str, int]] = None) -> List[Tuple[str, int, int]]:
+    if len(stops) <= 1:
+        return list(stops)
+
+    if boat is not None and priority_map is not None:
+        return order_stops_with_priority(stops, distances, start, boat, priority_map)
+
+    stop_demands = [Demand(short_plat(s[0]), s[0], s[1], s[2]) for s in stops]
+    ordered = optimal_order_from(stop_demands, distances, start)
+    return [(d.platform_norm, d.tmib, d.m9) for d in ordered]
+
+
+def _estimate_split_cost(pre_m9: List[Tuple[str, int, int]],
+                         post_m9: List[Tuple[str, int, int]],
+                         distances: Dict,
+                         boat: Optional[Boat] = None,
+                         priority_map: Optional[Dict[str, int]] = None) -> float:
+    total = 0.0
+    current = "TMIB"
+    m9 = norm_plat("M9")
+
+    ordered_pre = _order_stops_for_split(pre_m9, distances, "TMIB", boat, priority_map)
+    ordered_post = _order_stops_for_split(post_m9, distances, m9, boat, priority_map)
+
+    for stop in ordered_pre:
+        total += get_dist(distances, current, stop[0])
+        current = stop[0]
+
+    total += get_dist(distances, current, m9)
+    current = m9
+
+    for stop in ordered_post:
+        total += get_dist(distances, current, stop[0])
+        current = stop[0]
+
+    split_platforms = {s[0] for s in ordered_pre} & {s[0] for s in ordered_post}
+    total += len(split_platforms) * SPLIT_PLATFORM_PENALTY_NM
+    return total
+
+
 def split_pre_m9_stops(stops: List[Tuple[str, int, int]],
                        m9_pickup: int,
                        distances: Dict,
-                       cap: int) -> Optional[Tuple[List[Tuple[str, int, int]], List[Tuple[str, int, int]]]]:
+                       cap: int,
+                       boat: Optional[Boat] = None,
+                       priority_map: Optional[Dict[str, int]] = None) -> Optional[Tuple[List[Tuple[str, int, int]], List[Tuple[str, int, int]]]]:
     """
     Decide quais paradas TMIB-only devem ocorrer ANTES de M9 para respeitar capacidade.
-    Retorna (pre_m9_stops, post_m9_stops). Se inviável, retorna None.
+    Entre as divisões viáveis, escolhe a de menor custo de rota.
     """
     total_tmib = sum(s[1] for s in stops)
     post_load = total_tmib + m9_pickup
@@ -782,35 +829,43 @@ def split_pre_m9_stops(stops: List[Tuple[str, int, int]],
     if sum(s[1] for s in candidates) < needed:
         return None
 
-    m9 = norm_plat("M9")
-    def detour_cost(stop):
-        plat = stop[0]
-        return get_dist(distances, "TMIB", plat) + get_dist(distances, plat, m9) - get_dist(distances, "TMIB", m9)
+    best_choice = None
 
-    # Escolher paradas com menor desvio para ante-M9
-    candidates_sorted = sorted(
-        candidates,
-        key=lambda s: (1 if s[2] > 0 else 0, detour_cost(s), -s[1])
-    )
-    moved = 0
-    pre_m9 = []
+    for mask in range(1, 1 << len(candidates)):
+        moved = 0
+        moved_platforms = set()
+        pre_m9 = []
 
-    post_m9 = [list(s) for s in stops]
-    for s in candidates_sorted:
-        if moved >= needed:
-            break
-        # mover toda a parte TMIB desta parada para antes de M9
-        pre_m9.append((s[0], s[1], 0))
-        moved += s[1]
-        # zerar TMIB no pós-M9
-        for p in post_m9:
-            if p[0] == s[0]:
-                p[1] = 0
-                break
+        for idx, stop in enumerate(candidates):
+            if mask & (1 << idx):
+                moved += stop[1]
+                moved_platforms.add(stop[0])
+                pre_m9.append((stop[0], stop[1], 0))
 
-    post_m9 = [(p[0], p[1], p[2]) for p in post_m9 if p[1] > 0 or p[2] > 0]
-    return pre_m9, post_m9
+        if moved < needed:
+            continue
 
+        post_m9 = []
+        for stop in stops:
+            tmib_drop = 0 if stop[0] in moved_platforms else stop[1]
+            if tmib_drop > 0 or stop[2] > 0:
+                post_m9.append((stop[0], tmib_drop, stop[2]))
+
+        split_platform_count = len({s[0] for s in pre_m9} & {s[0] for s in post_m9})
+        score = (
+            _estimate_split_cost(pre_m9, post_m9, distances, boat, priority_map),
+            split_platform_count,
+            moved - needed,
+            len(pre_m9),
+        )
+
+        if best_choice is None or score < best_choice[0]:
+            best_choice = (score, pre_m9, post_m9)
+
+    if best_choice is None:
+        return None
+
+    return best_choice[1], best_choice[2]
 
 def promote_priority1_pre_m9(pre_m9_stops: List[Tuple[str, int, int]],
                              post_m9_stops: List[Tuple[str, int, int]],
@@ -848,8 +903,8 @@ def promote_priority1_pre_m9(pre_m9_stops: List[Tuple[str, int, int]],
 
 def rebuild_pre_m9(route: Route, distances: Dict) -> bool:
     """
-    Recalcula a divisão pré/pós-M9 para uma rota existente.
-    Retorna True se a rota permanece viável.
+    Recalcula a divisÃ£o prÃ©/pÃ³s-M9 para uma rota existente.
+    Retorna True se a rota permanece viÃ¡vel.
     """
     if not route.uses_m9_hub:
         route.pre_m9_stops = []
@@ -863,7 +918,7 @@ def rebuild_pre_m9(route: Route, distances: Dict) -> bool:
     if pre_load > route.boat.max_capacity:
         return False
 
-    split = split_pre_m9_stops(all_stops, total_m9, distances, route.boat.max_capacity)
+    split = split_pre_m9_stops(all_stops, total_m9, distances, route.boat.max_capacity, route.boat, route.priority_map)
     if split is None:
         return False
 
@@ -876,15 +931,15 @@ def rebuild_pre_m9(route: Route, distances: Dict) -> bool:
 
 
 def find_compatible_platforms(platform_norm: str, demands: List[Demand]) -> List[Demand]:
-    """Encontra plataformas compatíveis para rota direta."""
+    """Encontra plataformas compatÃ­veis para rota direta."""
     compatible = DIRECT_COMPATIBLE.get(platform_norm, [])
     return [d for d in demands if d.platform_norm in compatible]
 
 
 def build_direct_route(boat: Boat, demands: List[Demand], distances: Dict) -> Optional[Route]:
     """
-    Constrói rota direta TMIB→plataformas (sem parar em M9).
-    Só funciona para plataformas sem demanda M9.
+    ConstrÃ³i rota direta TMIBâ†’plataformas (sem parar em M9).
+    SÃ³ funciona para plataformas sem demanda M9.
     """
     # Filtrar apenas demandas TMIB-only
     tmib_only = [d for d in demands if d.tmib > 0 and d.m9 == 0]
@@ -893,7 +948,7 @@ def build_direct_route(boat: Boat, demands: List[Demand], distances: Dict) -> Op
 
     cap = boat.max_capacity
 
-    # Tentar construir rota começando pela plataforma mais próxima de TMIB
+    # Tentar construir rota comeÃ§ando pela plataforma mais prÃ³xima de TMIB
     tmib_only.sort(key=lambda d: get_dist(distances, "TMIB", d.platform_norm))
 
     best_route = None
@@ -912,11 +967,11 @@ def build_direct_route(boat: Boat, demands: List[Demand], distances: Dict) -> Op
             total_pax = start_demand.tmib
             used.add(start_demand.platform_norm)
 
-            # Encontrar plataformas compatíveis
+            # Encontrar plataformas compatÃ­veis
             current = start_demand.platform_norm
             compatible = find_compatible_platforms(current, tmib_only)
 
-            # Ordenar por distância
+            # Ordenar por distÃ¢ncia
             compatible = [d for d in compatible if d.platform_norm not in used]
             compatible.sort(key=lambda d: get_dist(distances, current, d.platform_norm))
 
@@ -951,7 +1006,7 @@ def build_m9_hub_route(boat: Boat, demands: List[Demand], m9_tmib_demand: int,
                        distances: Dict, gangway_platforms: Set[str],
                        target_cluster: str = None) -> Optional[Route]:
     """
-    Constrói rota via M9 hub.
+    ConstrÃ³i rota via M9 hub.
     Se target_cluster especificado, prioriza plataformas desse cluster.
     """
     cap = boat.max_capacity
@@ -978,7 +1033,7 @@ def build_m9_hub_route(boat: Boat, demands: List[Demand], m9_tmib_demand: int,
     tmib_only_platforms = [d for d in servable if d.tmib > 0 and d.m9 == 0]
     priority_map = {d.platform_norm: d.priority for d in servable}
 
-    # Ordenar por quantidade de M9 (maior primeiro), depois por distância
+    # Ordenar por quantidade de M9 (maior primeiro), depois por distÃ¢ncia
     m9_demand_platforms.sort(key=lambda d: (-d.m9, get_dist(distances, m9_norm, d.platform_norm)))
 
     stops = []
@@ -991,11 +1046,11 @@ def build_m9_hub_route(boat: Boat, demands: List[Demand], m9_tmib_demand: int,
     for d in m9_demand_platforms:
         d_cluster = get_geo_cluster(d.platform_norm)
 
-        # Se já temos stops, verificar compatibilidade de cluster
+        # Se jÃ¡ temos stops, verificar compatibilidade de cluster
         if stops and current_cluster:
-            # Não misturar clusters distantes
+            # NÃ£o misturar clusters distantes
             if d_cluster != current_cluster:
-                # Exceção: clusters próximos podem ser misturados
+                # ExceÃ§Ã£o: clusters prÃ³ximos podem ser misturados
                 if not are_clusters_compatible(current_cluster, d_cluster):
                     continue
 
@@ -1007,7 +1062,7 @@ def build_m9_hub_route(boat: Boat, demands: List[Demand], m9_tmib_demand: int,
             total_m9_pickup += d.m9
             current_cluster = d_cluster
 
-    # Preencher com TMIB para M9 se houver espaço (não afeta carga pós-M9)
+    # Preencher com TMIB para M9 se houver espaÃ§o (nÃ£o afeta carga pÃ³s-M9)
     space_for_m9 = cap - total_tmib
     if space_for_m9 > 0 and m9_tmib_demand > 0:
         tmib_to_m9 = min(space_for_m9, m9_tmib_demand)
@@ -1016,7 +1071,7 @@ def build_m9_hub_route(boat: Boat, demands: List[Demand], m9_tmib_demand: int,
     for d in tmib_only_platforms:
         d_cluster = get_geo_cluster(d.platform_norm)
 
-        # Só adicionar se for do mesmo cluster ou cluster compatível
+        # SÃ³ adicionar se for do mesmo cluster ou cluster compatÃ­vel
         if current_cluster and d_cluster != current_cluster:
             if not are_clusters_compatible(current_cluster, d_cluster):
                 continue
@@ -1028,8 +1083,8 @@ def build_m9_hub_route(boat: Boat, demands: List[Demand], m9_tmib_demand: int,
     if not stops and tmib_to_m9 == 0:
         return None
 
-    # Dividir paradas pré/post-M9 para respeitar capacidade pós-M9
-    split = split_pre_m9_stops(stops, total_m9_pickup, distances, cap)
+    # Dividir paradas prÃ©/post-M9 para respeitar capacidade pÃ³s-M9
+    split = split_pre_m9_stops(stops, total_m9_pickup, distances, cap, boat, priority_map)
     if split is None:
         return None
     pre_m9_stops, post_m9_stops = split
@@ -1063,12 +1118,12 @@ def are_clusters_compatible(cluster1: str, cluster2: str) -> bool:
     if cluster1 == cluster2:
         return True
 
-    # Clusters que podem ser combinados (geograficamente próximos)
+    # Clusters que podem ser combinados (geograficamente prÃ³ximos)
     compatible_pairs = [
-        ("M6_AREA", "B_CLUSTER"),  # M6/M8 com B1-B4 (muito próximos)
+        ("M6_AREA", "B_CLUSTER"),  # M6/M8 com B1-B4 (muito prÃ³ximos)
         ("M6_AREA", "M1M7"),  # M6 com M7
         ("M9_NEAR", "M2M3"),  # M2/M3 perto de M9
-        ("M2M3", "M1M7"),  # M2/M3 com M1/M7 (razoavelmente próximos)
+        ("M2M3", "M1M7"),  # M2/M3 com M1/M7 (razoavelmente prÃ³ximos)
         ("M2M3", "M6_AREA"),  # M2/M3 com M6 (via M9)
         ("M2M3", "B_CLUSTER"),  # M2/M3 com B cluster (todos perto de M9)
         ("B_CLUSTER", "M1M7"),  # B cluster com M1/M7
@@ -1082,7 +1137,7 @@ def are_clusters_compatible(cluster1: str, cluster2: str) -> bool:
 
 
 def is_distant_cluster(cluster: str) -> bool:
-    """Verifica se é um cluster distante (>10 NM de TMIB em média)."""
+    """Verifica se Ã© um cluster distante (>10 NM de TMIB em mÃ©dia)."""
     return cluster in ["PDO", "PGA", "PRB"]
 
 
@@ -1090,7 +1145,7 @@ def build_cluster_route(boat: Boat, cluster_demands: List[Demand],
                         m9_tmib_demand: int, distances: Dict,
                         needs_m9_stop: bool) -> Optional[Route]:
     """
-    Constrói rota otimizada para um cluster específico.
+    ConstrÃ³i rota otimizada para um cluster especÃ­fico.
     """
     cap = boat.max_capacity
 
@@ -1132,7 +1187,7 @@ def build_cluster_route(boat: Boat, cluster_demands: List[Demand],
     pre_m9_stops = []
     post_m9_stops = stops
     if needs_m9_stop:
-        split = split_pre_m9_stops(stops, total_m9, distances, cap)
+        split = split_pre_m9_stops(stops, total_m9, distances, cap, boat, priority_map)
         if split is None:
             return None
         pre_m9_stops, post_m9_stops = split
@@ -1158,8 +1213,8 @@ def build_cluster_route(boat: Boat, cluster_demands: List[Demand],
 
 def form_demand_packages(demands: List[Demand], boats: List[Boat]) -> List[List[Demand]]:
     """
-    Agrupa demandas em pacotes baseados em pares obrigatórios.
-    Quando ambas as plataformas de um par têm demanda, são agrupadas como unidade atômica.
+    Agrupa demandas em pacotes baseados em pares obrigatÃ³rios.
+    Quando ambas as plataformas de um par tÃªm demanda, sÃ£o agrupadas como unidade atÃ´mica.
     """
     packages = []
     used = set()
@@ -1170,7 +1225,7 @@ def form_demand_packages(demands: List[Demand], boats: List[Boat]) -> List[List[
         d1 = next((d for d in demands if d.platform_norm == p1 and d.total() > 0), None)
         d2 = next((d for d in demands if d.platform_norm == p2 and d.total() > 0), None)
         if d1 and d2:
-            # Só manter o par se couber em algum barco (pre-load)
+            # SÃ³ manter o par se couber em algum barco (pre-load)
             if d1.tmib + d2.tmib <= max_capacity:
                 packages.append([d1, d2])
                 used.add(p1)
@@ -1220,9 +1275,9 @@ def evaluate_boat_route(boat_demands: List[Demand], boat: Boat,
                         gangway_platforms: Set[str],
                         m9_priority: int = 99) -> Tuple[Optional[Route], float, int, float, float, float, float]:
     """
-    Constrói e avalia rota para um barco com demandas específicas.
+    ConstrÃ³i e avalia rota para um barco com demandas especÃ­ficas.
     Retorna (route, distance, m9_tmib_used).
-    distance = inf indica atribuição inválida.
+    distance = inf indica atribuiÃ§Ã£o invÃ¡lida.
     """
     if not boat_demands:
         return None, 0.0, 0, 0.0, 0.0, 0.0, 0.0
@@ -1243,7 +1298,7 @@ def evaluate_boat_route(boat_demands: List[Demand], boat: Boat,
     cap = boat.max_capacity
     m9_norm = norm_plat("M9")
 
-    # Verificar restrição de gangway para Aqua
+    # Verificar restriÃ§Ã£o de gangway para Aqua
     if is_aqua:
         if any(d.platform_norm not in gangway_platforms for d in boat_demands):
             return None, float('inf'), 0, 0.0, 0.0, 0.0, 0.0
@@ -1252,9 +1307,9 @@ def evaluate_boat_route(boat_demands: List[Demand], boat: Boat,
     total_tmib_deliver = sum(d.tmib for d in boat_demands)
     needs_m9 = total_m9_pickup > 0
 
-    # Calcular TMIB→M9 delivery (preencher espaço livre pré-M9).
+    # Calcular TMIBâ†’M9 delivery (preencher espaÃ§o livre prÃ©-M9).
     # Regra: permitir parada em M9 mesmo sem embarque M9->plataforma,
-    # para não deixar TMIB->M9 pendente quando há capacidade disponível.
+    # para nÃ£o deixar TMIB->M9 pendente quando hÃ¡ capacidade disponÃ­vel.
     space = cap - total_tmib_deliver
     tmib_to_m9 = 0
     if space > 0 and m9_tmib_avail > 0:
@@ -1274,7 +1329,7 @@ def evaluate_boat_route(boat_demands: List[Demand], boat: Boat,
     pre_m9_stops = []
     post_m9_stops = stops
     if needs_m9:
-        split = split_pre_m9_stops(stops, total_m9_pickup, distances, cap)
+        split = split_pre_m9_stops(stops, total_m9_pickup, distances, cap, boat, priority_map)
         if split is None:
             return None, float('inf'), 0, 0.0, 0.0, 0.0, 0.0
         pre_m9_stops, post_m9_stops = split
@@ -1314,11 +1369,11 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
                               distant_boats_already: int = 0,
                               max_distant_boats: int = 1) -> Tuple[List[Route], int]:
     """
-    Otimização combinatória: tenta todas as atribuições válidas de pacotes
-    a barcos e retorna a de menor distância total.
+    OtimizaÃ§Ã£o combinatÃ³ria: tenta todas as atribuiÃ§Ãµes vÃ¡lidas de pacotes
+    a barcos e retorna a de menor distÃ¢ncia total.
     Aplica penalidade se os embarques M9 ficarem espalhados em varios barcos.
 
-    Escala: com 5 pacotes e 3 barcos = 243 combinações (muito rápido).
+    Escala: com 5 pacotes e 3 barcos = 243 combinaÃ§Ãµes (muito rÃ¡pido).
     """
     from itertools import product as iter_product
 
@@ -1536,8 +1591,8 @@ def build_aqua_direct_route(boat: Boat, demands: List[Demand],
                              distances: Dict,
                              gangway_platforms: Set[str]) -> Optional[Route]:
     """
-    Constrói rota direta para Aqua Helix (sem parada M9).
-    Só leva pax TMIB para plataformas com gangway.
+    ConstrÃ³i rota direta para Aqua Helix (sem parada M9).
+    SÃ³ leva pax TMIB para plataformas com gangway.
     A demanda M9 dessas plataformas fica para surfers via hub.
     """
     gangway_tmib = [d for d in demands
@@ -1556,13 +1611,13 @@ def build_aqua_direct_route(boat: Boat, demands: List[Demand],
 
     for d in gangway_tmib:
         if total + d.tmib <= cap:
-            stops.append((d.platform_norm, d.tmib, 0))  # Só TMIB, sem M9
+            stops.append((d.platform_norm, d.tmib, 0))  # SÃ³ TMIB, sem M9
             total += d.tmib
 
-    if not stops or total < 10:  # Mínimo para justificar uso do Aqua
+    if not stops or total < 10:  # MÃ­nimo para justificar uso do Aqua
         return None
 
-    # Ordenação com prioridade a partir de TMIB
+    # OrdenaÃ§Ã£o com prioridade a partir de TMIB
     if len(stops) > 1:
         stops = order_stops_with_priority(stops, distances, "TMIB", boat, priority_map)
 
@@ -1584,7 +1639,7 @@ def solve(config: Config, boats: List[Boat], demands: List[Demand],
           distances: Dict, gangway_platforms: Set[str]):
     warnings = []
 
-    # ── Phase 1: Separar demanda M9 e processar rotas fixas ──
+    # â”€â”€ Phase 1: Separar demanda M9 e processar rotas fixas â”€â”€
     m9_tmib_demand = 0
     m9_tmib_priority = 99
     platform_demands = []
@@ -1634,9 +1689,9 @@ def solve(config: Config, boats: List[Boat], demands: List[Demand],
     remaining_demands = list(platform_demands)
     remaining_m9_tmib = m9_tmib_demand
 
-    # ── Phase 2: AQUA direct routes (prioridade) ──
-    # Aqua Helix é melhor para rotas diretas de alta capacidade (sem M9 hub).
-    # Só leva TMIB pax; M9 demand fica para surfers.
+    # â”€â”€ Phase 2: AQUA direct routes (prioridade) â”€â”€
+    # Aqua Helix Ã© melhor para rotas diretas de alta capacidade (sem M9 hub).
+    # SÃ³ leva TMIB pax; M9 demand fica para surfers.
     for aqua in aquas[:]:
         route = build_aqua_direct_route(aqua, remaining_demands, distances,
                                          gangway_platforms)
@@ -1654,7 +1709,7 @@ def solve(config: Config, boats: List[Boat], demands: List[Demand],
 
             print(f"  AQUA {aqua.name}: rota direta ({route.total_pax()} pax)")
 
-    # ── Phase 3: Distant cluster dedication (PDO/PGA/PRB) ──
+    # â”€â”€ Phase 3: Distant cluster dedication (PDO/PGA/PRB) â”€â”€
     if ENABLE_DISTANT_CLUSTER_DEDICATION:
         distant_demands = [d for d in remaining_demands
                            if get_geo_cluster(d.platform_norm) in ["PDO", "PGA", "PRB"]]
@@ -1701,9 +1756,9 @@ def solve(config: Config, boats: List[Boat], demands: List[Demand],
         if route_obj_has_distant(route):
             distant_boats_already += 1
 
-    # ── Phase 4: Combinatorial optimization ──
-    # Agrupa demandas em pacotes (pares obrigatórios + individuais)
-    # e testa todas as atribuições possíveis para minimizar distância total.
+    # â”€â”€ Phase 4: Combinatorial optimization â”€â”€
+    # Agrupa demandas em pacotes (pares obrigatÃ³rios + individuais)
+    # e testa todas as atribuiÃ§Ãµes possÃ­veis para minimizar distÃ¢ncia total.
     remaining_boats = surfers + aquas
     remaining_demands = [d for d in remaining_demands if d.total() > 0]
 
@@ -1737,8 +1792,8 @@ def solve(config: Config, boats: List[Boat], demands: List[Demand],
             elif route.boat in aquas:
                 aquas.remove(route.boat)
 
-    # ── Phase 5: Fit remaining ──
-    # Encaixar demandas restantes em rotas existentes com espaço
+    # â”€â”€ Phase 5: Fit remaining â”€â”€
+    # Encaixar demandas restantes em rotas existentes com espaÃ§o
     remaining_demands = [d for d in remaining_demands if d.total() > 0]
     if remaining_demands:
         route_space = [(r, r.boat.max_capacity - r.max_load()) for r in assigned_routes]
@@ -1783,7 +1838,7 @@ def solve(config: Config, boats: List[Boat], demands: List[Demand],
                     space = route.boat.max_capacity - route.max_load()
                     remaining_demands.remove(d)
 
-    # ── Phase 6: Reordenar stops por NN e construir strings ──
+    # â”€â”€ Phase 6: Reordenar stops por NN e construir strings â”€â”€
     for route in assigned_routes:
         if route.uses_m9_hub and len(route.pre_m9_stops) > 1:
             route.pre_m9_stops = order_stops_with_priority(
@@ -1809,7 +1864,7 @@ def solve(config: Config, boats: List[Boat], demands: List[Demand],
         route_str = build_route_string(route)
         results.append((route.boat, route_str))
 
-    # ── Phase 7: Verificações ──
+    # â”€â”€ Phase 7: VerificaÃ§Ãµes â”€â”€
     remaining_demands = [d for d in remaining_demands if d.total() > 0]
     if remaining_demands:
         warnings.append("\nDEMANDA NAO ATENDIDA:")
@@ -1841,7 +1896,7 @@ def solve(config: Config, boats: List[Boat], demands: List[Demand],
 
 
 def build_route_string(route: Route) -> str:
-    """Constrói string de rota no formato padrão."""
+    """ConstrÃ³i string de rota no formato padrÃ£o."""
     parts = []
 
     # TMIB
@@ -1851,7 +1906,7 @@ def build_route_string(route: Route) -> str:
     else:
         parts.append("TMIB")
 
-    # Paradas pré-M9
+    # Paradas prÃ©-M9
     if route.uses_m9_hub and route.pre_m9_stops:
         for stop in route.pre_m9_stops:
             plat_name = short_plat(stop[0])
@@ -1875,7 +1930,7 @@ def build_route_string(route: Route) -> str:
             m9_part += " " + " ".join(m9_ops)
         parts.append(m9_part)
 
-    # Plataformas pós-M9
+    # Plataformas pÃ³s-M9
     for stop in route.stops:
         plat_name = short_plat(stop[0])
         ops = []
@@ -1895,7 +1950,7 @@ def build_route_string(route: Route) -> str:
 # ======== Output ========
 
 def write_output(results, warnings, summary, config, path):
-    # Ordenar por horário de saída
+    # Ordenar por horÃ¡rio de saÃ­da
     results.sort(key=lambda x: x[0].departure_minutes())
 
     lines = []
@@ -1990,3 +2045,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

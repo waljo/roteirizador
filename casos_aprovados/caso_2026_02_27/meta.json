@@ -1,6 +1,6 @@
 {
   "name": "caso_2026_02_27",
-  "created_at": "2026-02-27T05:08:08",
+  "created_at": "2026-02-27T14:28:15",
   "input": "input.xlsx",
   "solution": "solucao.txt",
   "shift_end": "15:30",
@@ -8,9 +8,9 @@
     "boats_used": 3,
     "total_tmib": 70,
     "total_m9": 13,
-    "total_distance_nm": 34.908,
-    "service_minutes_complete": 3150,
-    "service_minutes_partial": 3150,
+    "total_distance_nm": 34.209,
+    "service_minutes_complete": 3146,
+    "service_minutes_partial": 3146,
     "platforms_complete": 7,
     "platforms_total": 7,
     "missing": {}
