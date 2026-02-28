@@ -1391,7 +1391,8 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
 
     def run_optimizer(enforce_all: bool, enforce_distant: bool, require_zero_m9: bool):
         best_routes = None
-        best_score = float('inf')
+        best_distance = float('inf')
+        best_secondary_score = float('inf')
         best_m9_remaining = m9_tmib_demand
         top_n = 5
         top_scores = []  # list of tuples (remaining_m9, score, dist, penalty, priority, comfort, pax_arrival, cluster, assignment)
@@ -1491,14 +1492,18 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
 
                 cluster_weight = 1.0 if n_boats <= 2 else 0.0
 
-                scored_dist = (
-                    total_dist
-                    + penalty
+                secondary_score = (
+                    penalty
                     + priority_mix_penalty
                     + (total_priority_penalty * PRIORITY_TIME_WEIGHT)
                     + (total_comfort_cost * COMFORT_PAX_MIN_WEIGHT)
                     + (total_pax_arrival_score * PAX_ARRIVAL_WEIGHT)
                     + (total_cluster_penalty * cluster_weight)
+                )
+
+                scored_dist = (
+                    total_dist
+                    + secondary_score
                 )
 
                 # Guardar top combinacoes
@@ -1521,12 +1526,21 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
 
             # Objetivo lexicografico:
             # 1) minimizar demanda TMIB->M9 nao atendida
-            # 2) entre empates, minimizar score total
+            # 2) entre empates, minimizar distancia total
+            # 3) entre empates de distancia, minimizar penalidades secundarias
             if valid:
                 better_on_m9 = remaining_m9 < best_m9_remaining
-                tie_on_m9_better_score = remaining_m9 == best_m9_remaining and scored_dist < best_score
-                if better_on_m9 or tie_on_m9_better_score:
-                    best_score = scored_dist
+                tie_on_m9_better_distance = (
+                    remaining_m9 == best_m9_remaining and total_dist < best_distance
+                )
+                tie_on_m9_same_distance_better_secondary = (
+                    remaining_m9 == best_m9_remaining
+                    and math.isclose(total_dist, best_distance, rel_tol=0.0, abs_tol=1e-9)
+                    and secondary_score < best_secondary_score
+                )
+                if better_on_m9 or tie_on_m9_better_distance or tie_on_m9_same_distance_better_secondary:
+                    best_distance = total_dist
+                    best_secondary_score = secondary_score
                     best_routes = routes
                     best_m9_remaining = remaining_m9
 

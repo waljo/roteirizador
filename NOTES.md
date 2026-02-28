@@ -2,6 +2,17 @@
 
 This is a full context snapshot so we can resume without losing anything.
 
+## Exact Reconstruction Snapshot (2026-02-28)
+
+- The exact reconstruction spec is now maintained in [`SOLVER_EXACT_SPEC.md`](/home/ka20/roteirizador/SOLVER_EXACT_SPEC.md).
+- On `2026-02-28`, the optimizer objective was made explicit:
+  1. minimize pending `TMIB -> M9`
+  2. among ties, minimize total nautical miles
+  3. use priority, comfort, pax-arrival, M9 consolidation, and cluster cohesion only as tie-breakers
+- Validation after this change:
+  - `venv/bin/python validar_casos.py --details` -> `8/8 OK`
+  - current `solver_input.xlsx` -> `43.511 NM`, full attendance, `0` capacity violations
+
 ### Current Goal
 Improve `solver.py` so it:
 1. Solves **all demand** for the “current” table and the “previous” table.
