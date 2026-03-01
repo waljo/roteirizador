@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "embarcacoes": [
+    {
+      "nome": "SURFER 1930",
+      "tipo": "surfer",
+      "capacidade": 24,
+      "velocidade": 14.0,
+      "ativa": true
+    }
+  ]
+}
