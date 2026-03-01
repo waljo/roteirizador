@@ -29,11 +29,11 @@ AQUA_APPROACH_TIME = 25  # minutos por parada
 MINUTES_PER_PAX = 1  # minuto por pax embarcado/desembarcado
 M9_CONSOLIDATION_PENALTY_NM = 5.0  # penalidade por espalhar embarques M9 em varios barcos
 ENABLE_DISTANT_CLUSTER_DEDICATION = False  # evita reservar barco e reduzir capacidade total
-PRIORITY_TIME_WEIGHT = 0.05  # peso (NM-equivalente por minuto) para antecipar prioridades
-COMFORT_PAX_MIN_WEIGHT = 0.02  # peso (NM-equivalente por pax-minuto) para conforto
-PAX_ARRIVAL_WEIGHT = 0.1  # peso forte (NM-equivalente por pax-minuto) para priorizar grandes entregas cedo
+PRIORITY_TIME_WEIGHT = 0.01  # peso (NM-equivalente por minuto) para antecipar prioridades
+COMFORT_PAX_MIN_WEIGHT = 0.005  # peso (NM-equivalente por pax-minuto) para conforto
+PAX_ARRIVAL_WEIGHT = 0.01  # peso (NM-equivalente por pax-minuto) para priorizar grandes entregas cedo
 BACKTRACK_PENALTY_NM = 10.0  # penalidade por voltar em direção ao início (evitar "ir longe e voltar")
-SPLIT_PLATFORM_PENALTY_NM = 2.0  # evita dividir a mesma plataforma antes/depois de M9 sem necessidade
+SPLIT_PLATFORM_PENALTY_NM = 5.0  # evita dividir a mesma plataforma antes/depois de M9 sem necessidade
 PRIORITY1_PRECEDENCE_PENALTY_NM = 250.0  # penalidade alta para colocar prioridade 1 depois de nao-prioridade
 PRIORITY1_PRE_M9_MAX_DETOUR_NM = 1.5  # promove prioridade 1 para pre-M9 apenas com desvio pequeno
 PRIORITY_MIX_FIT_PENALTY_NM = 120.0  # penaliza separar P2/P3 de barco com P1 quando caberia junto
@@ -930,6 +930,411 @@ def rebuild_pre_m9(route: Route, distances: Dict) -> bool:
     return True
 
 
+# ======== Inter-route optimization ========
+
+def try_relocate_stop(routes: List[Route], distances: Dict) -> bool:
+    """
+    Tenta mover uma parada de uma rota para outra para reduzir distância total.
+    Retorna True se alguma melhoria foi feita.
+    """
+    if len(routes) < 2:
+        return False
+
+    best_improvement = 0.0
+    best_move = None
+
+    for i, route_from in enumerate(routes):
+        all_stops_from = route_from.pre_m9_stops + route_from.stops
+        if len(all_stops_from) <= 1:
+            continue
+
+        for stop_idx, stop in enumerate(all_stops_from):
+            plat, tmib_drop, m9_drop = stop
+
+            for j, route_to in enumerate(routes):
+                if i == j:
+                    continue
+
+                # Verificar capacidade
+                new_load = route_to.max_load() + tmib_drop + m9_drop
+                if new_load > route_to.boat.max_capacity:
+                    continue
+
+                # Se stop tem M9 demand, route_to precisa passar por M9
+                if m9_drop > 0 and not route_to.uses_m9_hub:
+                    continue
+
+                # Calcular distância atual
+                old_dist = route_from.total_distance + route_to.total_distance
+
+                # Simular remoção de stop de route_from
+                new_from = deepcopy(route_from)
+                if stop_idx < len(route_from.pre_m9_stops):
+                    new_from.pre_m9_stops = [s for s in new_from.pre_m9_stops if s[0] != plat]
+                else:
+                    new_from.stops = [s for s in new_from.stops if s[0] != plat]
+                    if m9_drop > 0:
+                        new_from.m9_pickup = max(0, new_from.m9_pickup - m9_drop)
+
+                # Verificar se route_from ainda precisa de M9
+                if not new_from.stops and not new_from.pre_m9_stops:
+                    continue  # Não esvaziar rotas completamente
+
+                new_from.uses_m9_hub = new_from.m9_pickup > 0 or new_from.tmib_to_m9 > 0
+                new_from.total_distance = calc_route_distance(new_from, distances)
+
+                # Simular adição de stop a route_to
+                new_to = deepcopy(route_to)
+                if m9_drop > 0:
+                    new_to.stops.append(stop)
+                    new_to.m9_pickup += m9_drop
+                    new_to.uses_m9_hub = True
+                else:
+                    # TMIB-only: adicionar ao pre_m9 ou post_m9 dependendo do que for melhor
+                    new_to.stops.append((plat, tmib_drop, 0))
+
+                new_to.priority_map[plat] = route_from.priority_map.get(plat, 99)
+
+                # Rebuild para recalcular pre/post M9
+                if not rebuild_pre_m9(new_to, distances):
+                    continue
+
+                # Reordenar paradas
+                if new_to.uses_m9_hub and len(new_to.pre_m9_stops) > 1:
+                    new_to.pre_m9_stops = order_stops_with_priority(
+                        new_to.pre_m9_stops, distances, "TMIB", new_to.boat, new_to.priority_map
+                    )
+                if len(new_to.stops) > 1:
+                    start = norm_plat("M9") if new_to.uses_m9_hub else "TMIB"
+                    new_to.stops = order_stops_with_priority(
+                        new_to.stops, distances, start, new_to.boat, new_to.priority_map
+                    )
+
+                new_to.total_distance = calc_route_distance(new_to, distances)
+
+                new_dist = new_from.total_distance + new_to.total_distance
+                improvement = old_dist - new_dist
+
+                if improvement > best_improvement + 0.01:  # Margem para evitar flutuações
+                    best_improvement = improvement
+                    best_move = (i, j, new_from, new_to)
+
+    if best_move:
+        i, j, new_from, new_to = best_move
+        routes[i] = new_from
+        routes[j] = new_to
+        return True
+
+    return False
+
+
+def try_swap_stops(routes: List[Route], distances: Dict) -> bool:
+    """
+    Tenta trocar paradas entre duas rotas para reduzir distância total.
+    Retorna True se alguma melhoria foi feita.
+    """
+    if len(routes) < 2:
+        return False
+
+    best_improvement = 0.0
+    best_swap = None
+
+    for i, route_a in enumerate(routes):
+        all_stops_a = route_a.pre_m9_stops + route_a.stops
+
+        for j, route_b in enumerate(routes):
+            if j <= i:
+                continue
+            all_stops_b = route_b.pre_m9_stops + route_b.stops
+
+            for stop_a in all_stops_a:
+                plat_a, tmib_a, m9_a = stop_a
+
+                for stop_b in all_stops_b:
+                    plat_b, tmib_b, m9_b = stop_b
+
+                    # Verificar capacidades após troca
+                    delta_a = (tmib_b + m9_b) - (tmib_a + m9_a)
+                    delta_b = (tmib_a + m9_a) - (tmib_b + m9_b)
+
+                    if route_a.max_load() + delta_a > route_a.boat.max_capacity:
+                        continue
+                    if route_b.max_load() + delta_b > route_b.boat.max_capacity:
+                        continue
+
+                    # Verificar compatibilidade M9
+                    if m9_b > 0 and not route_a.uses_m9_hub and route_a.tmib_to_m9 == 0:
+                        continue
+                    if m9_a > 0 and not route_b.uses_m9_hub and route_b.tmib_to_m9 == 0:
+                        continue
+
+                    old_dist = route_a.total_distance + route_b.total_distance
+
+                    # Simular troca
+                    new_a = deepcopy(route_a)
+                    new_b = deepcopy(route_b)
+
+                    # Remover stop_a de new_a, adicionar stop_b
+                    new_a.pre_m9_stops = [s for s in new_a.pre_m9_stops if s[0] != plat_a]
+                    new_a.stops = [s for s in new_a.stops if s[0] != plat_a]
+                    if m9_a > 0:
+                        new_a.m9_pickup = max(0, new_a.m9_pickup - m9_a)
+                    new_a.stops.append(stop_b)
+                    if m9_b > 0:
+                        new_a.m9_pickup += m9_b
+                    new_a.priority_map[plat_b] = route_b.priority_map.get(plat_b, 99)
+
+                    # Remover stop_b de new_b, adicionar stop_a
+                    new_b.pre_m9_stops = [s for s in new_b.pre_m9_stops if s[0] != plat_b]
+                    new_b.stops = [s for s in new_b.stops if s[0] != plat_b]
+                    if m9_b > 0:
+                        new_b.m9_pickup = max(0, new_b.m9_pickup - m9_b)
+                    new_b.stops.append(stop_a)
+                    if m9_a > 0:
+                        new_b.m9_pickup += m9_a
+                    new_b.priority_map[plat_a] = route_a.priority_map.get(plat_a, 99)
+
+                    # Rebuild
+                    new_a.uses_m9_hub = new_a.m9_pickup > 0 or new_a.tmib_to_m9 > 0
+                    new_b.uses_m9_hub = new_b.m9_pickup > 0 or new_b.tmib_to_m9 > 0
+
+                    if not rebuild_pre_m9(new_a, distances):
+                        continue
+                    if not rebuild_pre_m9(new_b, distances):
+                        continue
+
+                    # Reordenar
+                    if new_a.uses_m9_hub and len(new_a.pre_m9_stops) > 1:
+                        new_a.pre_m9_stops = order_stops_with_priority(
+                            new_a.pre_m9_stops, distances, "TMIB", new_a.boat, new_a.priority_map
+                        )
+                    if len(new_a.stops) > 1:
+                        start = norm_plat("M9") if new_a.uses_m9_hub else "TMIB"
+                        new_a.stops = order_stops_with_priority(
+                            new_a.stops, distances, start, new_a.boat, new_a.priority_map
+                        )
+
+                    if new_b.uses_m9_hub and len(new_b.pre_m9_stops) > 1:
+                        new_b.pre_m9_stops = order_stops_with_priority(
+                            new_b.pre_m9_stops, distances, "TMIB", new_b.boat, new_b.priority_map
+                        )
+                    if len(new_b.stops) > 1:
+                        start = norm_plat("M9") if new_b.uses_m9_hub else "TMIB"
+                        new_b.stops = order_stops_with_priority(
+                            new_b.stops, distances, start, new_b.boat, new_b.priority_map
+                        )
+
+                    new_a.total_distance = calc_route_distance(new_a, distances)
+                    new_b.total_distance = calc_route_distance(new_b, distances)
+
+                    new_dist = new_a.total_distance + new_b.total_distance
+                    improvement = old_dist - new_dist
+
+                    if improvement > best_improvement + 0.01:
+                        best_improvement = improvement
+                        best_swap = (i, j, new_a, new_b)
+
+    if best_swap:
+        i, j, new_a, new_b = best_swap
+        routes[i] = new_a
+        routes[j] = new_b
+        return True
+
+    return False
+
+
+def try_fix_split_platforms(routes: List[Route], distances: Dict, debug: bool = False) -> bool:
+    """
+    Identifica plataformas visitadas duas vezes na mesma rota (pre e post M9)
+    e tenta mover a demanda M9 para outra rota para eliminar o backtrack.
+    Retorna True se alguma correção foi feita.
+    """
+    if len(routes) < 2:
+        return False
+
+    best_improvement = 0.0
+    best_fix = None
+
+    for i, route in enumerate(routes):
+        if not route.uses_m9_hub:
+            continue
+
+        # Encontrar plataformas que aparecem tanto em pre_m9 quanto em post_m9 (stops)
+        pre_platforms = {s[0] for s in route.pre_m9_stops}
+        post_platforms = {s[0] for s in route.stops}
+        split_platforms = pre_platforms & post_platforms
+
+        if debug and split_platforms:
+            print(f"DEBUG: Route {i} ({route.boat.name}) has split platforms: {[short_plat(p) for p in split_platforms]}")
+            print(f"  pre_m9_stops: {[(short_plat(s[0]), s[1], s[2]) for s in route.pre_m9_stops]}")
+            print(f"  stops: {[(short_plat(s[0]), s[1], s[2]) for s in route.stops]}")
+
+        if not split_platforms:
+            continue
+
+        for split_plat in split_platforms:
+            # Encontrar o stop post-M9 com essa plataforma
+            post_stop = None
+            for s in route.stops:
+                if s[0] == split_plat:
+                    post_stop = s
+                    break
+
+            if not post_stop or post_stop[2] == 0:
+                # Não tem M9 demand, não é o caso que buscamos
+                continue
+
+            m9_demand = post_stop[2]
+
+            # Tentar mover apenas a demanda M9 para outra rota
+            for j, other_route in enumerate(routes):
+                if i == j:
+                    continue
+
+                # Verificar se a outra rota usa M9 hub e tem capacidade
+                if not other_route.uses_m9_hub:
+                    continue
+
+                new_load = other_route.max_load() + m9_demand
+                if new_load > other_route.boat.max_capacity:
+                    continue
+
+                # Verificar se a outra rota já visita essa plataforma
+                other_visits_plat = any(s[0] == split_plat for s in other_route.stops)
+
+                # Calcular distância atual
+                old_dist = route.total_distance + other_route.total_distance
+
+                # Simular: remover M9 demand de route, consolidar pre_m9 stop
+                new_route = deepcopy(route)
+
+                # Remover a visita post-M9 se só tinha M9 demand
+                if post_stop[1] == 0:  # Só M9 demand
+                    new_route.stops = [s for s in new_route.stops if s[0] != split_plat]
+                else:  # TMIB demand também - remover apenas M9
+                    new_route.stops = [
+                        (s[0], s[1], 0) if s[0] == split_plat else s
+                        for s in new_route.stops
+                    ]
+                new_route.m9_pickup = max(0, new_route.m9_pickup - m9_demand)
+
+                # Mover demanda TMIB de pre_m9 para post_m9 (consolidar)
+                pre_tmib = 0
+                for s in new_route.pre_m9_stops:
+                    if s[0] == split_plat:
+                        pre_tmib = s[1]
+                        break
+
+                if pre_tmib > 0:
+                    new_route.pre_m9_stops = [s for s in new_route.pre_m9_stops if s[0] != split_plat]
+                    # Adicionar ou atualizar em stops
+                    found = False
+                    new_stops = []
+                    for s in new_route.stops:
+                        if s[0] == split_plat:
+                            new_stops.append((s[0], s[1] + pre_tmib, s[2]))
+                            found = True
+                        else:
+                            new_stops.append(s)
+                    if not found:
+                        new_stops.append((split_plat, pre_tmib, 0))
+                    new_route.stops = new_stops
+
+                # Verificar capacidade após consolidação
+                if not rebuild_pre_m9(new_route, distances):
+                    continue
+
+                # Reordenar
+                if len(new_route.stops) > 1:
+                    start = norm_plat("M9") if new_route.uses_m9_hub else "TMIB"
+                    new_route.stops = order_stops_with_priority(
+                        new_route.stops, distances, start, new_route.boat, new_route.priority_map
+                    )
+                new_route.total_distance = calc_route_distance(new_route, distances)
+
+                # Simular: adicionar M9 demand à outra rota
+                new_other = deepcopy(other_route)
+                if other_visits_plat:
+                    # Atualizar stop existente
+                    new_other.stops = [
+                        (s[0], s[1], s[2] + m9_demand) if s[0] == split_plat else s
+                        for s in new_other.stops
+                    ]
+                else:
+                    # Adicionar novo stop
+                    new_other.stops.append((split_plat, 0, m9_demand))
+                    new_other.priority_map[split_plat] = route.priority_map.get(split_plat, 99)
+                new_other.m9_pickup += m9_demand
+
+                if not rebuild_pre_m9(new_other, distances):
+                    continue
+
+                if len(new_other.stops) > 1:
+                    start = norm_plat("M9") if new_other.uses_m9_hub else "TMIB"
+                    new_other.stops = order_stops_with_priority(
+                        new_other.stops, distances, start, new_other.boat, new_other.priority_map
+                    )
+                new_other.total_distance = calc_route_distance(new_other, distances)
+
+                new_dist = new_route.total_distance + new_other.total_distance
+                improvement = old_dist - new_dist
+
+                if debug:
+                    print(f"  Try move {short_plat(split_plat)} M9={m9_demand} to {other_route.boat.name}")
+                    print(f"    old_dist: {old_dist:.2f}, new_dist: {new_dist:.2f}, improvement: {improvement:.2f}")
+                    print(f"    new_route.dist: {new_route.total_distance:.2f}, new_other.dist: {new_other.total_distance:.2f}")
+
+                if improvement > best_improvement + 0.01:
+                    best_improvement = improvement
+                    best_fix = (i, j, new_route, new_other)
+
+    if debug and best_fix:
+        print(f"DEBUG: Best fix found with improvement {best_improvement:.2f} NM")
+
+    if best_fix:
+        i, j, new_route, new_other = best_fix
+        routes[i] = new_route
+        routes[j] = new_other
+        return True
+
+    return False
+
+
+def optimize_routes_inter(routes: List[Route], distances: Dict, max_iterations: int = 50, debug: bool = False) -> float:
+    """
+    Aplica otimização inter-rotas iterativamente até não haver mais melhorias.
+    Retorna a melhoria total em NM.
+    """
+    if len(routes) < 2:
+        return 0.0
+
+    initial_dist = sum(r.total_distance for r in routes)
+    iteration = 0
+
+    while iteration < max_iterations:
+        improved = False
+
+        # Primeiro: tentar corrigir split-platforms (mais impactante)
+        if try_fix_split_platforms(routes, distances, debug=debug):
+            improved = True
+
+        # Tentar relocações
+        if try_relocate_stop(routes, distances):
+            improved = True
+
+        # Tentar trocas
+        if try_swap_stops(routes, distances):
+            improved = True
+
+        if not improved:
+            break
+
+        iteration += 1
+
+    final_dist = sum(r.total_distance for r in routes)
+    return initial_dist - final_dist
+
+
 def find_compatible_platforms(platform_norm: str, demands: List[Demand]) -> List[Demand]:
     """Encontra plataformas compatÃ­veis para rota direta."""
     compatible = DIRECT_COMPATIBLE.get(platform_norm, [])
@@ -1128,6 +1533,8 @@ def are_clusters_compatible(cluster1: str, cluster2: str) -> bool:
         ("M2M3", "B_CLUSTER"),  # M2/M3 com B cluster (todos perto de M9)
         ("B_CLUSTER", "M1M7"),  # B cluster com M1/M7
         ("PDO", "PGA"),  # Clusters distantes juntos
+        ("M1M7", "PDO"),  # M7 is gateway to PDO cluster
+        ("M1M7", "PGA"),  # M7 is also gateway to PGA
     ]
 
     for c1, c2 in compatible_pairs:
@@ -1490,7 +1897,7 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
                         if can_fit_with_some_p1:
                             priority_mix_penalty += PRIORITY_MIX_FIT_PENALTY_NM
 
-                cluster_weight = 1.0 if n_boats <= 2 else 0.0
+                cluster_weight = 1.0
 
                 secondary_score = (
                     penalty
@@ -1874,11 +2281,29 @@ def solve(config: Config, boats: List[Boat], demands: List[Demand],
             )
         route.total_distance = calc_route_distance(route, distances)
 
+    # ── Phase 6.5: Inter-route optimization ──
+    # Tenta mover/trocar paradas entre rotas para reduzir distância total.
+    if len(assigned_routes) >= 2:
+        improvement = optimize_routes_inter(assigned_routes, distances)
+        if improvement > 0.01:
+            # Reordenar paradas após otimização
+            for route in assigned_routes:
+                if route.uses_m9_hub and len(route.pre_m9_stops) > 1:
+                    route.pre_m9_stops = order_stops_with_priority(
+                        route.pre_m9_stops, distances, "TMIB", route.boat, route.priority_map
+                    )
+                if len(route.stops) > 1:
+                    start = norm_plat("M9") if route.uses_m9_hub else "TMIB"
+                    route.stops = order_stops_with_priority(
+                        route.stops, distances, start, route.boat, route.priority_map
+                    )
+                route.total_distance = calc_route_distance(route, distances)
+
     for route in assigned_routes:
         route_str = build_route_string(route)
         results.append((route.boat, route_str))
 
-    # â”€â”€ Phase 7: VerificaÃ§Ãµes â”€â”€
+    # ── Phase 7: Verificações ──
     remaining_demands = [d for d in remaining_demands if d.total() > 0]
     if remaining_demands:
         warnings.append("\nDEMANDA NAO ATENDIDA:")
