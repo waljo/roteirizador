@@ -145,21 +145,14 @@ class ConfigTab(QWidget):
         self.fleet_table = AutoAppendTableWidget(0, 5)
         self.gangway_table = AutoAppendTableWidget(0, 1)
         self.special_table = AutoAppendTableWidget(0, 6)
-        self.path_edit = QLineEdit()
+        self.storage_label = QLabel()
         self._build()
 
     def _build(self) -> None:
         layout = QVBoxLayout(self)
         form = QFormLayout()
-        path_row = QHBoxLayout()
-        browse = QPushButton("Selecionar pasta")
-        browse.clicked.connect(self.select_root)
-        bootstrap = QPushButton("Inicializar configuracao")
-        bootstrap.clicked.connect(self.bootstrap)
-        path_row.addWidget(self.path_edit)
-        path_row.addWidget(browse)
-        path_row.addWidget(bootstrap)
-        form.addRow("Pasta raiz da rede", path_row)
+        self.storage_label.setWordWrap(True)
+        form.addRow("Pasta compartilhada", self.storage_label)
         layout.addLayout(form)
 
         fleet_box = QGroupBox("Frota")
@@ -203,7 +196,7 @@ class ConfigTab(QWidget):
         layout.addWidget(save_btn)
 
     def load(self, app_config: AppConfig, op_config: Optional[OperationalConfig]) -> None:
-        self.path_edit.setText(app_config.storage_root)
+        self.storage_label.setText(app_config.storage_root)
         self.fleet_table.setRowCount(0)
         self.gangway_table.setRowCount(0)
         self.special_table.setRowCount(0)
@@ -215,20 +208,6 @@ class ConfigTab(QWidget):
             self.add_gangway_row(item)
         for item in op_config.demandas_especiais:
             self.add_special_row(item)
-
-    def select_root(self) -> None:
-        selected = QFileDialog.getExistingDirectory(self, "Selecionar pasta de rede")
-        if selected:
-            self.path_edit.setText(selected)
-
-    def bootstrap(self) -> None:
-        root = self.path_edit.text().strip()
-        if not root:
-            QMessageBox.warning(self, "Configuracao", "Selecione uma pasta primeiro.")
-            return
-        self.service.bootstrap_network_config(root)
-        self.parent_window.reload_config()
-        QMessageBox.information(self, "Configuracao", "Pasta inicializada.")
 
     def add_fleet_row(self, vessel: Optional[FleetVessel] = None) -> None:
         row = self.fleet_table.rowCount()
@@ -263,12 +242,7 @@ class ConfigTab(QWidget):
             self.special_table.setItem(row, col, QTableWidgetItem(value))
 
     def save_config(self) -> None:
-        root = self.path_edit.text().strip()
-        if not root:
-            QMessageBox.warning(self, "Configuracao", "Informe a pasta raiz.")
-            return
-        app_config = AppConfig(storage_root=root)
-        self.service.save_app_config(app_config)
+        root = self.parent_window.current_root
         vessels: List[FleetVessel] = []
         for row in range(self.fleet_table.rowCount()):
             nome = self._text(self.fleet_table, row, 0)
@@ -870,7 +844,7 @@ class MainWindow(QMainWindow):
 
     def create_operation(self) -> None:
         if not self.current_root:
-            QMessageBox.warning(self, "Operacao", "Configure a pasta raiz primeiro.")
+            QMessageBox.warning(self, "Operacao", "Pasta compartilhada indisponivel.")
             return
         operation_date, ok = QInputDialog.getText(
             self, "Nova operacao", "Data da operacao (YYYY-MM-DD):", text=today_iso()

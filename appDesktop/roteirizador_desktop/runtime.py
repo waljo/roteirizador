@@ -37,3 +37,7 @@ def app_config_path(filename: str) -> Path:
 
 def shared_app_config_path(filename: str) -> Path:
     return project_root() / filename
+
+
+def default_storage_root() -> Path:
+    return project_root() / "dados_compartilhados"

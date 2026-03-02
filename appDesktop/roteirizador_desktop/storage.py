@@ -14,6 +14,7 @@ from .domain import (
     VersionBundle,
 )
 from .runtime import app_config_path
+from .runtime import default_storage_root
 from .runtime import shared_app_config_path
 
 
@@ -44,20 +45,11 @@ def _append_csv(path: Path, header: Iterable[str], row: Dict[str, Any]) -> None:
 
 class LocalConfigStore:
     def load(self) -> AppConfig:
-        if SHARED_CONFIG_PATH.exists():
-            try:
-                shared = AppConfig.from_dict(
-                    json.loads(SHARED_CONFIG_PATH.read_text(encoding="utf-8"))
-                )
-                if shared.storage_root:
-                    return shared
-            except Exception:
-                pass
-        if LOCAL_CONFIG_PATH.exists():
-            return AppConfig.from_dict(json.loads(LOCAL_CONFIG_PATH.read_text(encoding="utf-8")))
-        return AppConfig()
+        fixed_root = str(default_storage_root())
+        return AppConfig(storage_root=fixed_root)
 
     def save(self, config: AppConfig) -> None:
+        config = AppConfig(storage_root=str(default_storage_root()), version=config.version)
         _atomic_write_json(LOCAL_CONFIG_PATH, config.to_dict())
         try:
             _atomic_write_json(SHARED_CONFIG_PATH, config.to_dict())
