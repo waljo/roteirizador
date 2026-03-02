@@ -14,9 +14,11 @@ from .domain import (
     VersionBundle,
 )
 from .runtime import app_config_path
+from .runtime import shared_app_config_path
 
 
 LOCAL_CONFIG_PATH = app_config_path(".roteirizador_desktop_config.json")
+SHARED_CONFIG_PATH = shared_app_config_path(".roteirizador_desktop_shared_config.json")
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -42,12 +44,26 @@ def _append_csv(path: Path, header: Iterable[str], row: Dict[str, Any]) -> None:
 
 class LocalConfigStore:
     def load(self) -> AppConfig:
-        if not LOCAL_CONFIG_PATH.exists():
-            return AppConfig()
-        return AppConfig.from_dict(json.loads(LOCAL_CONFIG_PATH.read_text(encoding="utf-8")))
+        if SHARED_CONFIG_PATH.exists():
+            try:
+                shared = AppConfig.from_dict(
+                    json.loads(SHARED_CONFIG_PATH.read_text(encoding="utf-8"))
+                )
+                if shared.storage_root:
+                    return shared
+            except Exception:
+                pass
+        if LOCAL_CONFIG_PATH.exists():
+            return AppConfig.from_dict(json.loads(LOCAL_CONFIG_PATH.read_text(encoding="utf-8")))
+        return AppConfig()
 
     def save(self, config: AppConfig) -> None:
         _atomic_write_json(LOCAL_CONFIG_PATH, config.to_dict())
+        try:
+            _atomic_write_json(SHARED_CONFIG_PATH, config.to_dict())
+        except OSError:
+            # Shared config may be read-only in some installations; keep local config as fallback.
+            pass
 
 
 class NetworkStorage:

@@ -33,3 +33,7 @@ def app_config_dir() -> Path:
 
 def app_config_path(filename: str) -> Path:
     return app_config_dir() / filename
+
+
+def shared_app_config_path(filename: str) -> Path:
+    return project_root() / filename
