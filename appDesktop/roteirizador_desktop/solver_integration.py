@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import re
+import unicodedata
 from io import StringIO
 import importlib.util
 from pathlib import Path
@@ -28,10 +29,10 @@ def _load_criar_tabela6_module():
     global _CRIAR_TABELA6_MODULE
     if _CRIAR_TABELA6_MODULE is not None:
         return _CRIAR_TABELA6_MODULE
-    module_path = resource_path("geradorPlanilhaProgramação/criarTabela6.py")
+    module_path = resource_path("resources/geradorPlanilhaProgramação/criarTabela6.py")
     spec = importlib.util.spec_from_file_location("gerador_planilha_programacao", module_path)
     if spec is None or spec.loader is None:
-        raise RuntimeError("Nao foi possivel carregar geradorPlanilhaProgramação/criarTabela6.py")
+        raise RuntimeError("Nao foi possivel carregar resources/geradorPlanilhaProgramação/criarTabela6.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     _CRIAR_TABELA6_MODULE = module
@@ -426,21 +427,43 @@ def export_programacao_planilha(
 
 
 def import_demands_from_csv(csv_path: Path) -> List[DemandItem]:
-    with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        demands: List[DemandItem] = []
-        for row in reader:
-            normalized = {key.strip().lower(): (value or "").strip() for key, value in row.items()}
-            plataforma = (
-                normalized.get("plataforma")
-                or normalized.get("unidade")
-                or normalized.get("platform")
-                or normalized.get("codigo")
-            )
-            if not plataforma:
-                continue
-            tmib = int(normalized.get("tmib") or 0)
-            m9 = int(normalized.get("m9") or 0)
-            prioridade = int(normalized.get("prioridade") or 99)
-            demands.append(DemandItem(plataforma=plataforma, tmib=tmib, m9=m9, prioridade=prioridade))
+    raw_text = csv_path.read_text(encoding="utf-8-sig")
+    try:
+        dialect = csv.Sniffer().sniff(raw_text[:2048], delimiters=";,")
+    except csv.Error:
+        class _FallbackDialect(csv.excel):
+            delimiter = ";"
+        dialect = _FallbackDialect()
+
+    def normalize_key(value: str) -> str:
+        normalized = unicodedata.normalize("NFKD", value or "")
+        normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+        return normalized.strip().lower()
+
+    def parse_int(value: str, default: int = 0) -> int:
+        cleaned = (value or "").strip()
+        if not cleaned:
+            return default
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+        try:
+            return int(float(cleaned))
+        except ValueError:
+            return default
+
+    plataforma_keys = {"plataforma", "unidade", "platform", "codigo", "cod", "sigla"}
+    tmib_keys = {"tmib", "pax tmib", "qtd tmib", "quant tmib", "qtde tmib"}
+    m9_keys = {"m9", "pax m9", "qtd m9", "quant m9", "qtde m9", "pcm9"}
+    prioridade_keys = {"prioridade", "prio", "priority"}
+
+    reader = csv.DictReader(StringIO(raw_text), dialect=dialect)
+    demands: List[DemandItem] = []
+    for row in reader:
+        normalized = {normalize_key(key): (value or "").strip() for key, value in row.items() if key is not None}
+        plataforma = next((normalized[key] for key in plataforma_keys if key in normalized and normalized[key]), "")
+        if not plataforma:
+            continue
+        tmib = next((parse_int(normalized[key]) for key in tmib_keys if key in normalized), 0)
+        m9 = next((parse_int(normalized[key]) for key in m9_keys if key in normalized), 0)
+        prioridade = next((parse_int(normalized[key], 0) for key in prioridade_keys if key in normalized), 0)
+        demands.append(DemandItem(plataforma=plataforma, tmib=tmib, m9=m9, prioridade=prioridade))
     return demands

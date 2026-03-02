@@ -52,11 +52,11 @@ class AppService:
     def bootstrap_network_config(self, root: str) -> None:
         storage = self.network_storage(root)
         if not storage.config_path("distancias.json").exists():
-            shutil.copy2(resource_path("distplat.json"), storage.config_path("distancias.json"))
+            shutil.copy2(resource_path("resources/distplat.json"), storage.config_path("distancias.json"))
         if not storage.config_path("gangway.json").exists():
-            shutil.copy2(resource_path("gangway.json"), storage.config_path("gangway.json"))
+            shutil.copy2(resource_path("resources/gangway.json"), storage.config_path("gangway.json"))
         if not storage.config_path("frota.json").exists():
-            speeds = solver.load_speeds(str(resource_path("velocidades.txt")))
+            speeds = solver.load_speeds(str(resource_path("resources/velocidades.txt")))
             vessel_names = sorted({
                 "SURFER 1870",
                 "SURFER 1871",
@@ -88,7 +88,7 @@ class AppService:
                     {"version": int(frota_payload.get("version", 1)), "embarcacoes": embarcacoes},
                 )
         if not storage.config_path("unidades.json").exists():
-            dist_data = json.loads(resource_path("distplat.json").read_text(encoding="utf-8"))
+            dist_data = json.loads(resource_path("resources/distplat.json").read_text(encoding="utf-8"))
             units = sorted(
                 {
                     solver.short_plat(solver.norm_plat(key))
@@ -143,6 +143,7 @@ class AppService:
             data_operacao=operation_date,
             criada_em=utc_now_iso(),
             status="em_andamento",
+            display_name="",
         )
         storage.save_operation_metadata(metadata)
         return metadata
@@ -167,8 +168,11 @@ class AppService:
         metadata: OperationMetadata,
         version: OperationVersion,
         imported_csv_path: Optional[Path] = None,
-    ) -> None:
+    ) -> OperationMetadata:
         self.network_storage(root).save_version(metadata, VersionBundle(version=version), imported_csv_path)
+        updated = self._metadata_with_version_label(metadata, version)
+        self.network_storage(root).save_operation_metadata(updated)
+        return updated
 
     def load_version(
         self, root: str, metadata: OperationMetadata, version_name: str
@@ -184,7 +188,7 @@ class AppService:
         metadata: OperationMetadata,
         version: OperationVersion,
         imported_csv_path: Optional[Path] = None,
-    ) -> SolverRunResult:
+    ) -> tuple[OperationMetadata, SolverRunResult]:
         op_config = self.load_operational_config(root)
         solver_version = self._filter_special_demands(version, op_config)
         result = run_solver(
@@ -192,8 +196,9 @@ class AppService:
             op_config,
             str(self.network_storage(root).config_path("distancias.json")),
         )
+        updated = self._metadata_with_version_label(metadata, version)
         self.network_storage(root).save_version(
-            metadata,
+            updated,
             VersionBundle(
                 version=version,
                 distribution_text=result.distribution_text,
@@ -201,8 +206,24 @@ class AppService:
             ),
             imported_csv_path,
         )
-        self._refresh_comparison(root, metadata)
-        return result
+        self.network_storage(root).save_operation_metadata(updated)
+        self._refresh_comparison(root, updated)
+        return updated, result
+
+    @staticmethod
+    def _metadata_with_version_label(
+        metadata: OperationMetadata,
+        version: OperationVersion,
+    ) -> OperationMetadata:
+        user = (version.usuario or "usuario").strip()
+        suffix = "DISTCL" if version.versao == VERSION_CL else "DISTPROG"
+        return OperationMetadata(
+            operacao_id=metadata.operacao_id,
+            data_operacao=metadata.data_operacao,
+            criada_em=metadata.criada_em,
+            status=metadata.status,
+            display_name=f"{user} - {suffix}",
+        )
 
     def import_csv(self, csv_path: Path):
         return import_demands_from_csv(csv_path)

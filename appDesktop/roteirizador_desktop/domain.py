@@ -131,6 +131,7 @@ class OperationMetadata:
     data_operacao: str
     criada_em: str
     status: str = "em_andamento"
+    display_name: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -138,6 +139,9 @@ class OperationMetadata:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "OperationMetadata":
         return cls(**data)
+
+    def label(self) -> str:
+        return self.display_name or self.operacao_id
 
 
 @dataclass

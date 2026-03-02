@@ -20,6 +20,25 @@ from .domain import (
 )
 from .services import AppService, default_operation_version, today_iso
 
+ROUTE_HELP_TEXT = """COMO DIGITAR A ROTA:
+
++x = embarque no TMIB ou em M9
+
+-x = desembarque de pax do TMIB
+
+(-x) = desembarque de pax de M9
+
+{destino:+x} = embarque em outra plataforma
+Ex.: O pax esta embarcando em M6 com destino a B1, coloque {B1:+1}
+
+{origem:-x} = desembarque de pax de outra origem
+Ex.: O pax de M6 desembarcando em B1, coloque {M6:-1}
+
+EXEMPLO:
+Lancha pega 22 no TMIB -> M10 deixa 5 -> M9 deixa 7 e pega 4 p/ B2 -> M6 deixa 4 e pega 1 p/ B1 -> B2 deixa 8 (4 TMIB + 4 M9) -> B1 deixa 3 (2 TMIB + 1 M6).
+Rota: TMIB +22/M10 -5/M9 -7 +4/M6 -4 {B1:+1}/B2 -4 (-4)/B1 -2 {M6:-1}
+"""
+
 try:
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import (
@@ -332,6 +351,9 @@ class VersionEditor(QWidget):
         form.addWidget(self.troca_check, 1, 0)
         form.addWidget(QLabel("Rendidos M9"), 1, 2)
         form.addWidget(self.rendidos_edit, 1, 3)
+        help_button = QPushButton("Como digitar rota")
+        help_button.clicked.connect(self.show_route_help)
+        form.addWidget(help_button, 2, 0, 1, 2)
         layout.addLayout(form)
 
         boats_box = QGroupBox("Embarcacoes disponiveis")
@@ -579,6 +601,13 @@ class VersionEditor(QWidget):
             return
         self.imported_csv_path = Path(file_name)
         demands = self.service.import_csv(self.imported_csv_path)
+        if not demands:
+            QMessageBox.warning(
+                self,
+                "Importar CSV",
+                "O arquivo CSV nao trouxe nenhuma demanda valida. Verifique cabecalhos e valores.",
+            )
+            return
         self.origin_combo.setCurrentText("csv")
         self.demand_table.setRowCount(0)
         for item in demands:
@@ -589,7 +618,7 @@ class VersionEditor(QWidget):
             QMessageBox.warning(self, "Operacao", "Selecione ou crie uma operacao.")
             return
         version = self.build_version()
-        self.service.save_version(
+        self.parent_window.current_operation = self.service.save_version(
             self.parent_window.current_root,
             self.parent_window.current_operation,
             version,
@@ -603,7 +632,7 @@ class VersionEditor(QWidget):
             QMessageBox.warning(self, "Operacao", "Selecione ou crie uma operacao.")
             return
         version = self.build_version()
-        result = self.service.run_version(
+        self.parent_window.current_operation, result = self.service.run_version(
             self.parent_window.current_root,
             self.parent_window.current_operation,
             version,
@@ -665,6 +694,13 @@ class VersionEditor(QWidget):
                 "Planilha de Programacao",
                 f"Nao foi possivel gerar a planilha:\n{exc}",
             )
+
+    def show_route_help(self) -> None:
+        QMessageBox.information(
+            self,
+            "Como digitar a rota",
+            ROUTE_HELP_TEXT,
+        )
 
     def export_cl_distribution_txt(self) -> None:
         if self.version_name != VERSION_CL:
@@ -828,7 +864,7 @@ class MainWindow(QMainWindow):
         if not self.current_root:
             return
         for operation in self.service.list_operations(self.current_root):
-            item = QListWidgetItem(f"{operation.data_operacao} | {operation.operacao_id}")
+            item = QListWidgetItem(f"{operation.data_operacao} | {operation.label()}")
             item.setData(Qt.UserRole, operation)
             self.operations_list.addItem(item)
 

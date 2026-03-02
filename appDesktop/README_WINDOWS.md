@@ -1,6 +1,7 @@
 # Build Windows
 
 Este app pode ser empacotado para Windows sem qualquer dependencia de WSL ou Python na maquina do usuario final.
+Tudo que o build precisa agora fica dentro da propria pasta `appDesktop`.
 
 ## Resultado
 
@@ -39,11 +40,11 @@ powershell -ExecutionPolicy Bypass -File appDesktop/windows/build_windows.ps1 -S
 
 O build embute os recursos necessarios ao app:
 
-- `distplat.json`
-- `gangway.json`
-- `velocidades.txt`
-- `geradorPlanilhaProgramação/criarTabela6.py`
-- `solver.py`
+- `appDesktop/solver.py`
+- `appDesktop/resources/distplat.json`
+- `appDesktop/resources/gangway.json`
+- `appDesktop/resources/velocidades.txt`
+- `appDesktop/resources/geradorPlanilhaProgramação/criarTabela6.py`
 
 ## Configuracao local do usuario
 

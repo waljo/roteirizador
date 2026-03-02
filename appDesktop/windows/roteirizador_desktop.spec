@@ -6,10 +6,13 @@ project_root = Path.cwd()
 app_root = project_root / "appDesktop"
 
 datas = [
-    (str(project_root / "distplat.json"), "."),
-    (str(project_root / "gangway.json"), "."),
-    (str(project_root / "velocidades.txt"), "."),
-    (str(project_root / "geradorPlanilhaProgramação" / "criarTabela6.py"), "geradorPlanilhaProgramação"),
+    (str(app_root / "resources" / "distplat.json"), "resources"),
+    (str(app_root / "resources" / "gangway.json"), "resources"),
+    (str(app_root / "resources" / "velocidades.txt"), "resources"),
+    (
+        str(app_root / "resources" / "geradorPlanilhaProgramação" / "criarTabela6.py"),
+        "resources/geradorPlanilhaProgramação",
+    ),
 ]
 
 hiddenimports = [
@@ -18,7 +21,7 @@ hiddenimports = [
 
 a = Analysis(
     [str(app_root / "roteirizador_desktop_main.py")],
-    pathex=[str(project_root), str(app_root)],
+    pathex=[str(app_root)],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
