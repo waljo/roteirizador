@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-import re
 from typing import Any, Dict, List, Optional
 
 
@@ -15,14 +14,6 @@ def utc_now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def normalize_special_code(code: str) -> str:
-    cleaned = code.strip().upper()
-    match = re.match(r"^([A-Z]+)-?0*([0-9]+)$", cleaned)
-    if match:
-        return f"{match.group(1)}-{int(match.group(2))}"
-    return cleaned
-
-
 @dataclass
 class FleetVessel:
     nome: str
@@ -30,19 +21,6 @@ class FleetVessel:
     capacidade: int
     velocidade: float
     ativa: bool = True
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class SpecialDemand:
-    codigo: str
-    origem: str
-    destino: str
-    horario: str
-    descricao: str = ""
-    excluir_do_solver: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -71,17 +49,6 @@ class AvailableBoat:
 
 
 @dataclass
-class SpecialExecution:
-    codigo: str
-    embarcacao: str = ""
-    horario: str = ""
-    trajeto: str = ""
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
 class OperationVersion:
     versao: str
     usuario: str
@@ -91,7 +58,6 @@ class OperationVersion:
     rendidos_m9: int = 0
     embarcacoes_disponiveis: List[AvailableBoat] = field(default_factory=list)
     demanda: List[DemandItem] = field(default_factory=list)
-    execucoes_especiais: List[SpecialExecution] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -103,7 +69,6 @@ class OperationVersion:
             "rendidos_m9": self.rendidos_m9,
             "embarcacoes_disponiveis": [item.to_dict() for item in self.embarcacoes_disponiveis],
             "demanda": [item.to_dict() for item in self.demanda],
-            "execucoes_especiais": [item.to_dict() for item in self.execucoes_especiais],
         }
 
     @classmethod
@@ -119,9 +84,6 @@ class OperationVersion:
                 AvailableBoat(**item) for item in data.get("embarcacoes_disponiveis", [])
             ],
             demanda=[DemandItem(**item) for item in data.get("demanda", [])],
-            execucoes_especiais=[
-                SpecialExecution(**item) for item in data.get("execucoes_especiais", [])
-            ],
         )
 
 
@@ -165,17 +127,9 @@ class OperationalConfig:
     frota: List[FleetVessel]
     unidades: List[str]
     gangway: List[str]
-    demandas_especiais: List[SpecialDemand] = field(default_factory=list)
 
     def vessel_map(self) -> Dict[str, FleetVessel]:
         return {item.nome: item for item in self.frota}
-
-    def special_demand_map(self) -> Dict[str, SpecialDemand]:
-        return {
-            normalize_special_code(item.codigo): item
-            for item in self.demandas_especiais
-            if item.codigo.strip()
-        }
 
 
 @dataclass

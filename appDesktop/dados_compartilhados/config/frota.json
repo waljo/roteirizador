@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "embarcacoes": [
+    {
+      "nome": "AQUA HELIX",
+      "tipo": "aqua",
+      "capacidade": 100,
+      "velocidade": 20.0,
+      "ativa": true
+    },
+    {
+      "nome": "SURFER 1870",
+      "tipo": "surfer",
+      "capacidade": 24,
+      "velocidade": 14.6,
+      "ativa": true
+    },
+    {
+      "nome": "SURFER 1871",
+      "tipo": "surfer",
+      "capacidade": 24,
+      "velocidade": 14.3,
+      "ativa": true
+    },
+    {
+      "nome": "SURFER 1905",
+      "tipo": "surfer",
+      "capacidade": 24,
+      "velocidade": 15.5,
+      "ativa": true
+    },
+    {
+      "nome": "SURFER 1930",
+      "tipo": "surfer",
+      "capacidade": 24,
+      "velocidade": 14.1,
+      "ativa": true
+    },
+    {
+      "nome": "SURFER 1931",
+      "tipo": "surfer",
+      "capacidade": 24,
+      "velocidade": 13.1,
+      "ativa": true
+    }
+  ]
+}

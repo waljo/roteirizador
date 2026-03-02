@@ -12,6 +12,8 @@ from .domain import (
     OperationMetadata,
     OperationVersion,
     VersionBundle,
+    VERSION_CL,
+    VERSION_PROGRAMACAO,
 )
 from .runtime import app_config_path
 from .runtime import default_storage_root
@@ -106,9 +108,17 @@ class NetworkStorage:
             data_operacao=metadata.data_operacao,
             criada_em=metadata.criada_em,
             status=metadata.status,
+            display_name=metadata.display_name,
         )
         _atomic_write_json(new_dir / "metadata.json", renamed.to_dict())
         return renamed
+
+    def update_operation_metadata(self, metadata: OperationMetadata) -> OperationMetadata:
+        op_dir = self.operation_dir(metadata.operacao_id, metadata.data_operacao)
+        if not op_dir.exists():
+            raise FileNotFoundError(f"Operacao nao encontrada: {metadata.operacao_id}")
+        _atomic_write_json(op_dir / "metadata.json", metadata.to_dict())
+        return metadata
 
     def delete_operation(self, metadata: OperationMetadata) -> None:
         op_dir = self.operation_dir(metadata.operacao_id, metadata.data_operacao)
@@ -121,15 +131,44 @@ class NetworkStorage:
             return results
         for meta_path in sorted(self.operations_dir.rglob("metadata.json")):
             try:
-                results.append(
-                    OperationMetadata.from_dict(
-                        json.loads(meta_path.read_text(encoding="utf-8"))
-                    )
+                metadata = OperationMetadata.from_dict(
+                    json.loads(meta_path.read_text(encoding="utf-8"))
                 )
+                if not metadata.display_name:
+                    metadata = self._hydrate_display_name(metadata)
+                results.append(metadata)
             except Exception:
                 continue
         results.sort(key=lambda item: (item.data_operacao, item.operacao_id), reverse=True)
         return results
+
+    def _hydrate_display_name(self, metadata: OperationMetadata) -> OperationMetadata:
+        op_dir = self.operation_dir(metadata.operacao_id, metadata.data_operacao)
+        version_candidates = [
+            (VERSION_CL, "DISTCL"),
+            (VERSION_PROGRAMACAO, "DISTPROG"),
+        ]
+        for version_name, suffix in version_candidates:
+            input_path = op_dir / version_name / "input.json"
+            if not input_path.exists():
+                continue
+            try:
+                version = OperationVersion.from_dict(
+                    json.loads(input_path.read_text(encoding="utf-8"))
+                )
+            except Exception:
+                continue
+            user = (version.usuario or "").strip()
+            if not user:
+                continue
+            return OperationMetadata(
+                operacao_id=metadata.operacao_id,
+                data_operacao=metadata.data_operacao,
+                criada_em=metadata.criada_em,
+                status=metadata.status,
+                display_name=f"{user} - {suffix}",
+            )
+        return metadata
 
     def save_version(
         self,

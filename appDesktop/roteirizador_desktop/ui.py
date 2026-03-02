@@ -12,8 +12,6 @@ from .domain import (
     OperationalConfig,
     OperationMetadata,
     OperationVersion,
-    SpecialExecution,
-    SpecialDemand,
     VersionBundle,
     VERSION_CL,
     VERSION_PROGRAMACAO,
@@ -144,7 +142,6 @@ class ConfigTab(QWidget):
         self.parent_window = parent_window
         self.fleet_table = AutoAppendTableWidget(0, 5)
         self.gangway_table = AutoAppendTableWidget(0, 1)
-        self.special_table = AutoAppendTableWidget(0, 6)
         self.storage_label = QLabel()
         self._build()
 
@@ -158,6 +155,7 @@ class ConfigTab(QWidget):
         fleet_box = QGroupBox("Frota")
         fleet_layout = QVBoxLayout(fleet_box)
         self.fleet_table.set_append_row_callback(self.add_fleet_row)
+        self.fleet_table.set_remove_row_callback(self.remove_selected_rows)
         self.fleet_table.setHorizontalHeaderLabels(
             ["Nome", "Tipo", "Capacidade", "Velocidade", "Ativa"]
         )
@@ -165,7 +163,10 @@ class ConfigTab(QWidget):
         fleet_btns = QHBoxLayout()
         add_fleet = QPushButton("Adicionar embarcacao")
         add_fleet.clicked.connect(self.add_fleet_row)
+        remove_fleet = QPushButton("Excluir embarcacao selecionada")
+        remove_fleet.clicked.connect(lambda: self.remove_selected_rows(self.fleet_table))
         fleet_btns.addWidget(add_fleet)
+        fleet_btns.addWidget(remove_fleet)
         fleet_layout.addLayout(fleet_btns)
         layout.addWidget(fleet_box)
 
@@ -179,18 +180,6 @@ class ConfigTab(QWidget):
         gangway_layout.addWidget(add_gangway)
         layout.addWidget(gangway_box)
 
-        special_box = QGroupBox("Demandas especiais")
-        special_layout = QVBoxLayout(special_box)
-        self.special_table.set_append_row_callback(self.add_special_row)
-        self.special_table.setHorizontalHeaderLabels(
-            ["Codigo", "Origem", "Destino", "Horario", "Descricao", "Excluir do solver"]
-        )
-        special_layout.addWidget(self.special_table)
-        add_special = QPushButton("Adicionar demanda especial")
-        add_special.clicked.connect(self.add_special_row)
-        special_layout.addWidget(add_special)
-        layout.addWidget(special_box)
-
         save_btn = QPushButton("Salvar configuracao")
         save_btn.clicked.connect(self.save_config)
         layout.addWidget(save_btn)
@@ -199,15 +188,12 @@ class ConfigTab(QWidget):
         self.storage_label.setText(app_config.storage_root)
         self.fleet_table.setRowCount(0)
         self.gangway_table.setRowCount(0)
-        self.special_table.setRowCount(0)
         if not op_config:
             return
         for vessel in op_config.frota:
             self.add_fleet_row(vessel)
         for item in op_config.gangway:
             self.add_gangway_row(item)
-        for item in op_config.demandas_especiais:
-            self.add_special_row(item)
 
     def add_fleet_row(self, vessel: Optional[FleetVessel] = None) -> None:
         row = self.fleet_table.rowCount()
@@ -226,20 +212,6 @@ class ConfigTab(QWidget):
         row = self.gangway_table.rowCount()
         self.gangway_table.insertRow(row)
         self.gangway_table.setItem(row, 0, QTableWidgetItem(value))
-
-    def add_special_row(self, item: Optional[SpecialDemand] = None) -> None:
-        row = self.special_table.rowCount()
-        self.special_table.insertRow(row)
-        values = [
-            item.codigo if item else "",
-            item.origem if item else "M9",
-            item.destino if item else "",
-            item.horario if item else "17:00",
-            item.descricao if item else "",
-            "SIM" if item is None or item.excluir_do_solver else "NAO",
-        ]
-        for col, value in enumerate(values):
-            self.special_table.setItem(row, col, QTableWidgetItem(value))
 
     def save_config(self) -> None:
         root = self.parent_window.current_root
@@ -262,28 +234,12 @@ class ConfigTab(QWidget):
             for row in range(self.gangway_table.rowCount())
             if self._text(self.gangway_table, row, 0)
         ]
-        especiais: List[SpecialDemand] = []
-        for row in range(self.special_table.rowCount()):
-            codigo = self._text(self.special_table, row, 0)
-            if not codigo:
-                continue
-            especiais.append(
-                SpecialDemand(
-                    codigo=codigo,
-                    origem=self._text(self.special_table, row, 1) or "M9",
-                    destino=self._text(self.special_table, row, 2),
-                    horario=self._text(self.special_table, row, 3) or "17:00",
-                    descricao=self._text(self.special_table, row, 4),
-                    excluir_do_solver=self._text(self.special_table, row, 5).upper() != "NAO",
-                )
-            )
         self.service.save_operational_config(
             root,
             OperationalConfig(
                 frota=vessels,
                 unidades=self.parent_window.current_op_config.unidades if self.parent_window.current_op_config else [],
                 gangway=gangway,
-                demandas_especiais=especiais,
             ),
         )
         self.parent_window.reload_config()
@@ -293,6 +249,14 @@ class ConfigTab(QWidget):
     def _text(table: QTableWidget, row: int, col: int) -> str:
         item = table.item(row, col)
         return item.text().strip() if item else ""
+
+    @staticmethod
+    def remove_selected_rows(table: QTableWidget) -> None:
+        selected_rows = sorted({index.row() for index in table.selectedIndexes()}, reverse=True)
+        if not selected_rows and table.currentRow() >= 0:
+            selected_rows = [table.currentRow()]
+        for row in selected_rows:
+            table.removeRow(row)
 
 
 class VersionEditor(QWidget):
@@ -308,7 +272,6 @@ class VersionEditor(QWidget):
         self.rendidos_edit = QLineEdit("0")
         self.boats_table = AutoAppendTableWidget(0, 4)
         self.demand_table = AutoAppendTableWidget(0, 4)
-        self.special_exec_table = QTableWidget(0, 4)
         self.output_text = QTextEdit()
         self.export_program_button = QPushButton("Exportar planilha de programacao")
         self.export_cl_txt_button = QPushButton("Exportar TXT de distribuicao")
@@ -365,25 +328,6 @@ class VersionEditor(QWidget):
         demand_layout.addLayout(demand_btns)
         layout.addWidget(demand_box)
 
-        if self.version_name == VERSION_CL:
-            special_exec_box = QGroupBox("Execucao de demandas especiais")
-            special_exec_layout = QVBoxLayout(special_exec_box)
-            self.special_exec_table.setHorizontalHeaderLabels(
-                ["Codigo", "Embarcacao", "Horario", "Trajeto"]
-            )
-            special_exec_layout.addWidget(self.special_exec_table)
-            special_exec_btns = QHBoxLayout()
-            add_special_exec = QPushButton("Adicionar execucao especial")
-            add_special_exec.clicked.connect(self.add_special_exec_with_selection)
-            remove_special_exec = QPushButton("Excluir execucao selecionada")
-            remove_special_exec.clicked.connect(
-                lambda: self.remove_selected_rows(self.special_exec_table)
-            )
-            special_exec_btns.addWidget(add_special_exec)
-            special_exec_btns.addWidget(remove_special_exec)
-            special_exec_layout.addLayout(special_exec_btns)
-            layout.addWidget(special_exec_box)
-
         action_row = QHBoxLayout()
         save_btn = QPushButton("Salvar")
         save_btn.clicked.connect(self.save_only)
@@ -396,8 +340,6 @@ class VersionEditor(QWidget):
         action_row.addWidget(self.export_program_button)
         self.export_cl_txt_button.clicked.connect(self.export_cl_distribution_txt)
         self.export_cl_txt_button.setEnabled(False)
-        if self.version_name != VERSION_CL:
-            self.export_cl_txt_button.hide()
         action_row.addWidget(self.export_cl_txt_button)
         layout.addLayout(action_row)
 
@@ -408,7 +350,6 @@ class VersionEditor(QWidget):
         self.user_edit.setText(default_user)
         self.boats_table.setRowCount(0)
         self.demand_table.setRowCount(0)
-        self.special_exec_table.setRowCount(0)
         self.output_text.clear()
         self.export_program_button.setEnabled(False)
         self.export_cl_txt_button.setEnabled(False)
@@ -436,18 +377,13 @@ class VersionEditor(QWidget):
         self.rendidos_edit.setText(str(version.rendidos_m9))
         self.boats_table.setRowCount(0)
         self.demand_table.setRowCount(0)
-        self.special_exec_table.setRowCount(0)
         for boat in version.embarcacoes_disponiveis:
             self.add_boat_row(boat)
         for demand in version.demanda:
             self.add_demand_row(demand)
-        for special_exec in version.execucoes_especiais:
-            self.add_special_exec_row(special_exec)
         self.output_text.setPlainText(bundle.distribution_text)
         self.export_program_button.setEnabled(bool(bundle.distribution_text.strip()))
-        self.export_cl_txt_button.setEnabled(
-            self.version_name == VERSION_CL and bool(bundle.distribution_text.strip())
-        )
+        self.export_cl_txt_button.setEnabled(bool(bundle.distribution_text.strip()))
 
     def add_boat_row(self, boat: Optional[AvailableBoat] = None) -> None:
         row = self.boats_table.rowCount()
@@ -472,42 +408,6 @@ class VersionEditor(QWidget):
         ]
         for col, value in enumerate(values):
             self.demand_table.setItem(row, col, QTableWidgetItem(value))
-
-    def add_special_exec_row(self, item: Optional[SpecialExecution] = None) -> None:
-        row = self.special_exec_table.rowCount()
-        self.special_exec_table.insertRow(row)
-        values = [
-            item.codigo if item else "",
-            item.embarcacao if item else "",
-            item.horario if item else "17:00",
-            item.trajeto if item else "",
-        ]
-        for offset, value in enumerate(values):
-            self.special_exec_table.setItem(row, offset, QTableWidgetItem(value))
-
-    def add_special_exec_with_selection(self) -> None:
-        codes = []
-        if self.parent_window.current_op_config:
-            codes = [special.codigo for special in self.parent_window.current_op_config.demandas_especiais]
-        codes = sorted(dict.fromkeys(code for code in codes if code.strip()))
-        if not codes:
-            QMessageBox.warning(
-                self,
-                "Execucao especial",
-                "Nao ha demandas especiais cadastradas em Configuracoes.",
-            )
-            return
-        code, ok = QInputDialog.getItem(
-            self,
-            "Execucao especial",
-            "Selecione o codigo da demanda especial:",
-            codes,
-            0,
-            False,
-        )
-        if not ok or not code:
-            return
-        self.add_special_exec_row(SpecialExecution(codigo=code))
 
     @staticmethod
     def remove_selected_rows(table: QTableWidget) -> None:
@@ -544,19 +444,6 @@ class VersionEditor(QWidget):
                     prioridade=int(self._text(self.demand_table, row, 3) or 0),
                 )
             )
-        special_execs: List[SpecialExecution] = []
-        for row in range(self.special_exec_table.rowCount()):
-            codigo = self._text(self.special_exec_table, row, 0)
-            if not codigo:
-                continue
-            special_execs.append(
-                SpecialExecution(
-                    codigo=codigo,
-                    embarcacao=self._text(self.special_exec_table, row, 1),
-                    horario=self._text(self.special_exec_table, row, 2),
-                    trajeto=self._text(self.special_exec_table, row, 3),
-                )
-            )
         return OperationVersion(
             versao=self.version_name,
             usuario=self.user_edit.text().strip() or "usuario",
@@ -566,7 +453,6 @@ class VersionEditor(QWidget):
             rendidos_m9=int(self.rendidos_edit.text().strip() or 0),
             embarcacoes_disponiveis=boats,
             demanda=demands,
-            execucoes_especiais=special_execs,
         )
 
     def import_csv(self) -> None:
@@ -598,6 +484,7 @@ class VersionEditor(QWidget):
             version,
             self.imported_csv_path,
         )
+        self.parent_window.reload_operations(select_operation_id=self.parent_window.current_operation.operacao_id)
         QMessageBox.information(self, "Versao", "Versao salva.")
         self.parent_window.refresh_operation()
 
@@ -614,11 +501,10 @@ class VersionEditor(QWidget):
         )
         self.output_text.setPlainText(result.distribution_text)
         self.export_program_button.setEnabled(bool(result.distribution_text.strip()))
-        self.export_cl_txt_button.setEnabled(
-            self.version_name == VERSION_CL and bool(result.distribution_text.strip())
-        )
+        self.export_cl_txt_button.setEnabled(bool(result.distribution_text.strip()))
         if self.version_name in (VERSION_PROGRAMACAO, VERSION_CL):
             self._offer_program_sheet_export(result.distribution_text)
+        self.parent_window.reload_operations(select_operation_id=self.parent_window.current_operation.operacao_id)
         self.parent_window.refresh_operation()
 
     def export_program_sheet(self) -> None:
@@ -677,8 +563,6 @@ class VersionEditor(QWidget):
         )
 
     def export_cl_distribution_txt(self) -> None:
-        if self.version_name != VERSION_CL:
-            return
         if not self.parent_window.current_operation:
             QMessageBox.warning(self, "Operacao", "Selecione ou crie uma operacao.")
             return
@@ -729,7 +613,7 @@ class VersionEditor(QWidget):
     def _default_cl_distribution_txt_name(self) -> str:
         operation = self.parent_window.current_operation
         if not operation:
-            return "cl_oficial_distribuicao.txt"
+            return f"{self.version_name}_distribuicao.txt"
         date_token = operation.data_operacao.replace("-", "_")
         return f"{date_token}_{operation.operacao_id}_{self.version_name}_distribuicao.txt"
 
@@ -833,7 +717,7 @@ class MainWindow(QMainWindow):
         self.config_tab.load(app_config, op_config)
         self.reload_operations()
 
-    def reload_operations(self) -> None:
+    def reload_operations(self, select_operation_id: Optional[str] = None) -> None:
         self.operations_list.clear()
         if not self.current_root:
             return
@@ -841,6 +725,8 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(f"{operation.data_operacao} | {operation.label()}")
             item.setData(Qt.UserRole, operation)
             self.operations_list.addItem(item)
+            if select_operation_id and operation.operacao_id == select_operation_id:
+                self.operations_list.setCurrentItem(item)
 
     def create_operation(self) -> None:
         if not self.current_root:
@@ -852,32 +738,32 @@ class MainWindow(QMainWindow):
         if not ok or not operation_date:
             return
         self.current_operation = self.service.create_operation(self.current_root, operation_date)
-        self.reload_operations()
+        self.reload_operations(select_operation_id=self.current_operation.operacao_id)
         self.refresh_operation()
 
     def rename_operation(self) -> None:
         if not self.current_root or not self.current_operation:
             QMessageBox.warning(self, "Operacao", "Selecione uma operacao.")
             return
-        new_id, ok = QInputDialog.getText(
+        new_display_name, ok = QInputDialog.getText(
             self,
             "Renomear operacao",
-            "Novo identificador da operacao:",
-            text=self.current_operation.operacao_id,
+            "Novo nome exibido da operacao:",
+            text=self.current_operation.display_name or self.current_operation.label(),
         )
-        if not ok or not new_id.strip():
+        if not ok or not new_display_name.strip():
             return
         try:
             renamed = self.service.rename_operation(
                 self.current_root,
                 self.current_operation,
-                new_id.strip(),
+                new_display_name.strip(),
             )
         except Exception as exc:
             QMessageBox.warning(self, "Operacao", f"Nao foi possivel renomear:\n{exc}")
             return
         self.current_operation = renamed
-        self.reload_operations()
+        self.reload_operations(select_operation_id=self.current_operation.operacao_id)
         self.refresh_operation()
 
     def delete_operation(self) -> None:
@@ -887,7 +773,7 @@ class MainWindow(QMainWindow):
         response = QMessageBox.question(
             self,
             "Excluir operacao",
-            f"Deseja excluir a operacao {self.current_operation.operacao_id}?",
+            f"Deseja excluir a operacao {self.current_operation.label()}?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )

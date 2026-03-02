@@ -14,7 +14,6 @@ from openpyxl import Workbook
 from .domain import (
     AvailableBoat,
     DemandItem,
-    normalize_special_code,
     OperationalConfig,
     OperationVersion,
     SolverRunResult,
@@ -85,23 +84,6 @@ def parse_distribution_text(distribution_text: str) -> List[Tuple[str, str, str]
         if boat_name and route_str:
             routes.append((boat_name, departure, route_str))
     return routes
-
-
-def _resolve_special_aliases(route_str: str, config: OperationalConfig) -> str:
-    special_map = config.special_demand_map()
-    resolved_parts: List[str] = []
-    for part in route_str.split("/"):
-        stripped = part.strip()
-        if not stripped:
-            continue
-        tokens = stripped.split(maxsplit=1)
-        platform = tokens[0]
-        special = special_map.get(normalize_special_code(platform))
-        if special and special.destino:
-            platform = special.destino
-        remainder = tokens[1] if len(tokens) > 1 else ""
-        resolved_parts.append(platform if not remainder else f"{platform} {remainder}")
-    return "/".join(resolved_parts)
 
 
 def route_distance(route_str: str, distances: Dict[str, Dict[str, float]]) -> float:
@@ -262,7 +244,6 @@ def build_metrics(
 
 def run_solver(operation: OperationVersion, config: OperationalConfig, distances_path: str) -> SolverRunResult:
     vessel_map = config.vessel_map()
-    special_map = config.special_demand_map()
     boats: List[solver.Boat] = []
     for item in operation.embarcacoes_disponiveis:
         vessel = vessel_map.get(item.nome)
@@ -289,8 +270,6 @@ def run_solver(operation: OperationVersion, config: OperationalConfig, distances
         )
         for item in operation.demanda
         if int(item.tmib) or int(item.m9)
-        if not special_map.get(normalize_special_code(item.plataforma))
-        or not special_map[normalize_special_code(item.plataforma)].excluir_do_solver
     ]
 
     config_obj = solver.Config(
@@ -386,7 +365,7 @@ def export_programacao_planilha(
             mod.TripDef(
                 vessel=boat_name,
                 start_hhmm=departure,
-                route=_resolve_special_aliases(route_str, config),
+                route=route_str,
             )
         )
 

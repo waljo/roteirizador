@@ -12,11 +12,9 @@ from .domain import (
     AppConfig,
     ComparisonSummary,
     FleetVessel,
-    normalize_special_code,
     OperationalConfig,
     OperationMetadata,
     OperationVersion,
-    SpecialDemand,
     SolverRunResult,
     VersionBundle,
     VERSION_CL,
@@ -97,22 +95,15 @@ class AppService:
                 }
             )
             storage.save_json_config("unidades.json", {"version": 1, "unidades": units})
-        if not storage.config_path("demandas_especiais.json").exists():
-            storage.save_json_config("demandas_especiais.json", {"version": 1, "demandas_especiais": []})
-
     def load_operational_config(self, root: str) -> OperationalConfig:
         storage = self.network_storage(root)
         frota = storage.load_json_config("frota.json")
         unidades = storage.load_json_config("unidades.json")
         gangway = storage.load_json_config("gangway.json")
-        especiais = storage.load_json_config("demandas_especiais.json")
         return OperationalConfig(
             frota=[FleetVessel(**item) for item in frota.get("embarcacoes", [])],
             unidades=unidades.get("unidades", []),
             gangway=gangway.get("plataformas_gangway", []),
-            demandas_especiais=[
-                SpecialDemand(**item) for item in especiais.get("demandas_especiais", [])
-            ],
         )
 
     def save_operational_config(self, root: str, config: OperationalConfig) -> None:
@@ -124,13 +115,6 @@ class AppService:
         storage.save_json_config("unidades.json", {"version": 1, "unidades": config.unidades})
         storage.save_json_config(
             "gangway.json", {"version": 1, "plataformas_gangway": config.gangway}
-        )
-        storage.save_json_config(
-            "demandas_especiais.json",
-            {
-                "version": 1,
-                "demandas_especiais": [item.to_dict() for item in config.demandas_especiais],
-            },
         )
 
     def create_operation(self, root: str, operation_date: str) -> OperationMetadata:
@@ -155,9 +139,16 @@ class AppService:
         self,
         root: str,
         metadata: OperationMetadata,
-        new_operation_id: str,
+        new_display_name: str,
     ) -> OperationMetadata:
-        return self.network_storage(root).rename_operation(metadata, new_operation_id)
+        updated = OperationMetadata(
+            operacao_id=metadata.operacao_id,
+            data_operacao=metadata.data_operacao,
+            criada_em=metadata.criada_em,
+            status=metadata.status,
+            display_name=new_display_name.strip(),
+        )
+        return self.network_storage(root).update_operation_metadata(updated)
 
     def delete_operation(self, root: str, metadata: OperationMetadata) -> None:
         self.network_storage(root).delete_operation(metadata)
@@ -190,9 +181,8 @@ class AppService:
         imported_csv_path: Optional[Path] = None,
     ) -> tuple[OperationMetadata, SolverRunResult]:
         op_config = self.load_operational_config(root)
-        solver_version = self._filter_special_demands(version, op_config)
         result = run_solver(
-            solver_version,
+            version,
             op_config,
             str(self.network_storage(root).config_path("distancias.json")),
         )
@@ -263,11 +253,7 @@ class AppService:
         version: OperationVersion,
         distribution_text: str,
     ) -> str:
-        op_config = self.load_operational_config(root)
-        regular_version = self._filter_special_demands(version, op_config)
         tmib_lines, m9_lines = self._build_tmib_m9_lines(root, distribution_text)
-        m9_lines.extend(self._build_special_execution_lines(version, op_config))
-        m9_lines = list(dict.fromkeys(m9_lines))
         lines = [
             "TABELA DE DEMANDA DE DISTRIBUICAO",
             "=" * 70,
@@ -276,11 +262,8 @@ class AppService:
             f"Versao: {version.versao}",
             f"Usuario: {version.usuario}",
             "",
-            self._format_demand_table(regular_version),
+            self._format_demand_table(version),
         ]
-        special_table = self.format_special_demands_table(version, op_config)
-        if special_table:
-            lines.extend(["", special_table])
         lines.extend(
             [
                 "",
@@ -311,27 +294,6 @@ class AppService:
         return "\n".join(lines)
 
     @staticmethod
-    def _filter_special_demands(version: OperationVersion, config: OperationalConfig) -> OperationVersion:
-        special_map = config.special_demand_map()
-        filtered_demands = [
-            item
-            for item in version.demanda
-            if not special_map.get(normalize_special_code(item.plataforma))
-            or not special_map[normalize_special_code(item.plataforma)].excluir_do_solver
-        ]
-        return OperationVersion(
-            versao=version.versao,
-            usuario=version.usuario,
-            criado_em=version.criado_em,
-            tipo_origem=version.tipo_origem,
-            troca_turma=version.troca_turma,
-            rendidos_m9=version.rendidos_m9,
-            embarcacoes_disponiveis=list(version.embarcacoes_disponiveis),
-            demanda=filtered_demands,
-            execucoes_especiais=list(version.execucoes_especiais),
-        )
-
-    @staticmethod
     def _format_demand_table(version: OperationVersion) -> str:
         header = f"{'PLATAFORMA':<14} {'M9':>6} {'TMIB':>6} {'PRIO':>6}"
         sep = "-" * len(header)
@@ -345,47 +307,6 @@ class AppService:
         if len(rows) == 2:
             rows.append("(sem demanda informada)")
         return "\n".join(rows)
-
-    def format_special_demands_table(self, version: OperationVersion, config: OperationalConfig) -> str:
-        special_map = config.special_demand_map()
-        rows = []
-        row_map = {}
-        header = f"{'CODIGO':<12} {'ORIGEM':<8} {'DESTINO':<8} {'HORARIO':<8} {'QTD':>6}"
-        sep = "-" * len(header)
-        for item in version.demanda:
-            special = special_map.get(normalize_special_code(item.plataforma))
-            if not special:
-                continue
-            qty = int(item.tmib) + int(item.m9)
-            row_map[normalize_special_code(special.codigo)] = (
-                f"{special.codigo:<12} {special.origem:<8} {special.destino:<8} {special.horario:<8} {qty:>6}"
-            )
-        for item in version.execucoes_especiais:
-            special = special_map.get(normalize_special_code(item.codigo))
-            if not special:
-                continue
-            key = normalize_special_code(special.codigo)
-            if key in row_map:
-                continue
-            qty = self._infer_special_execution_qty(item.trajeto)
-            row_map[key] = (
-                f"{special.codigo:<12} {special.origem:<8} {special.destino:<8} {special.horario:<8} {qty:>6}"
-            )
-        rows = [row_map[key] for key in sorted(row_map)]
-        if not rows:
-            return ""
-        return "\n".join(["DEMANDAS ESPECIAIS", "=" * 70, header, sep, *rows])
-
-    @staticmethod
-    def _infer_special_execution_qty(trajeto: str) -> int:
-        first_part = trajeto.strip().split("/", 1)[0].strip()
-        if not first_part:
-            return 0
-        qty = 0
-        for token in first_part.split()[1:]:
-            if token.startswith("+") and token[1:].isdigit():
-                qty += int(token[1:])
-        return qty
 
     def _build_tmib_m9_lines(self, root: str, distribution_text: str) -> tuple[List[str], List[str]]:
         op_config = self.load_operational_config(root)
@@ -413,24 +334,6 @@ class AppService:
                 if departure_m9:
                     m9_lines.append(f"{boat_label} {departure_m9} {m9_route}")
         return tmib_lines, m9_lines
-
-    def _build_special_execution_lines(
-        self,
-        version: OperationVersion,
-        config: OperationalConfig,
-    ) -> List[str]:
-        special_map = config.special_demand_map()
-        lines: List[str] = []
-        for item in version.execucoes_especiais:
-            special = special_map.get(normalize_special_code(item.codigo))
-            trajeto = item.trajeto.strip()
-            horario = item.horario.strip() or (special.horario if special else "")
-            embarcacao = item.embarcacao.strip()
-            if not trajeto:
-                continue
-            boat_label = self._short_boat_name(embarcacao) if embarcacao else item.codigo
-            lines.append(f"{boat_label} {horario} {trajeto}".strip())
-        return lines
 
     @staticmethod
     def _short_boat_name(boat_name: str) -> str:
@@ -527,15 +430,13 @@ class AppService:
         if not programacao or not cl or not programacao.metrics or not cl.metrics:
             return
         op_config = self.load_operational_config(root)
-        filtered_programacao = self._filter_special_demands(programacao.version, op_config)
-        filtered_cl = self._filter_special_demands(cl.version, op_config)
         distances_path = str(storage.config_path("distancias.json"))
         prog_analysis = analyze_distribution(
-            filtered_programacao, programacao.distribution_text, op_config, distances_path
+            programacao.version, programacao.distribution_text, op_config, distances_path
         )
-        cl_analysis = analyze_distribution(filtered_cl, cl.distribution_text, op_config, distances_path)
+        cl_analysis = analyze_distribution(cl.version, cl.distribution_text, op_config, distances_path)
         unit_rows, changed_units_count = self._build_unit_rows(
-            filtered_programacao, filtered_cl, prog_analysis["units"], cl_analysis["units"]
+            programacao.version, cl.version, prog_analysis["units"], cl_analysis["units"]
         )
         boat_rows = self._build_boat_rows(
             programacao.version, cl.version, prog_analysis["boats"], cl_analysis["boats"]
