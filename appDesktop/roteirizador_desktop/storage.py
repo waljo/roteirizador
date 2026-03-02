@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import json
+import os
+import stat
 import shutil
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -43,6 +45,11 @@ def _append_csv(path: Path, header: Iterable[str], row: Dict[str, Any]) -> None:
         if not exists:
             writer.writeheader()
         writer.writerow(row)
+
+
+def _remove_readonly_and_retry(func, path, _exc_info) -> None:
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
 
 
 class LocalConfigStore:
@@ -123,7 +130,7 @@ class NetworkStorage:
     def delete_operation(self, metadata: OperationMetadata) -> None:
         op_dir = self.operation_dir(metadata.operacao_id, metadata.data_operacao)
         if op_dir.exists():
-            shutil.rmtree(op_dir)
+            shutil.rmtree(op_dir, onerror=_remove_readonly_and_retry)
 
     def list_operations(self) -> List[OperationMetadata]:
         results: List[OperationMetadata] = []
@@ -144,9 +151,10 @@ class NetworkStorage:
 
     def _hydrate_display_name(self, metadata: OperationMetadata) -> OperationMetadata:
         op_dir = self.operation_dir(metadata.operacao_id, metadata.data_operacao)
+        labels: List[str] = []
         version_candidates = [
-            (VERSION_CL, "DISTCL"),
             (VERSION_PROGRAMACAO, "DISTPROG"),
+            (VERSION_CL, "DISTCL"),
         ]
         for version_name, suffix in version_candidates:
             input_path = op_dir / version_name / "input.json"
@@ -161,14 +169,16 @@ class NetworkStorage:
             user = (version.usuario or "").strip()
             if not user:
                 continue
-            return OperationMetadata(
-                operacao_id=metadata.operacao_id,
-                data_operacao=metadata.data_operacao,
-                criada_em=metadata.criada_em,
-                status=metadata.status,
-                display_name=f"{user} - {suffix}",
-            )
-        return metadata
+            labels.append(f"{user} - {suffix}")
+        if not labels:
+            return metadata
+        return OperationMetadata(
+            operacao_id=metadata.operacao_id,
+            data_operacao=metadata.data_operacao,
+            criada_em=metadata.criada_em,
+            status=metadata.status,
+            display_name=" | ".join(labels),
+        )
 
     def save_version(
         self,

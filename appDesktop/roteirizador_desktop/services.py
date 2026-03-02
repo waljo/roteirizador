@@ -161,7 +161,7 @@ class AppService:
         imported_csv_path: Optional[Path] = None,
     ) -> OperationMetadata:
         self.network_storage(root).save_version(metadata, VersionBundle(version=version), imported_csv_path)
-        updated = self._metadata_with_version_label(metadata, version)
+        updated = self._metadata_with_operation_label(root, metadata)
         self.network_storage(root).save_operation_metadata(updated)
         return updated
 
@@ -186,9 +186,8 @@ class AppService:
             op_config,
             str(self.network_storage(root).config_path("distancias.json")),
         )
-        updated = self._metadata_with_version_label(metadata, version)
         self.network_storage(root).save_version(
-            updated,
+            metadata,
             VersionBundle(
                 version=version,
                 distribution_text=result.distribution_text,
@@ -196,23 +195,31 @@ class AppService:
             ),
             imported_csv_path,
         )
+        updated = self._metadata_with_operation_label(root, metadata)
         self.network_storage(root).save_operation_metadata(updated)
         self._refresh_comparison(root, updated)
         return updated, result
 
-    @staticmethod
-    def _metadata_with_version_label(
+    def _metadata_with_operation_label(
+        self,
+        root: str,
         metadata: OperationMetadata,
-        version: OperationVersion,
     ) -> OperationMetadata:
-        user = (version.usuario or "usuario").strip()
-        suffix = "DISTCL" if version.versao == VERSION_CL else "DISTPROG"
+        storage = self.network_storage(root)
+        labels: List[str] = []
+        programacao = storage.load_version(metadata, VERSION_PROGRAMACAO)
+        cl = storage.load_version(metadata, VERSION_CL)
+        if programacao and programacao.version.usuario.strip():
+            labels.append(f"{programacao.version.usuario.strip()} - DISTPROG")
+        if cl and cl.version.usuario.strip():
+            labels.append(f"{cl.version.usuario.strip()} - DISTCL")
+        display_name = " | ".join(labels)
         return OperationMetadata(
             operacao_id=metadata.operacao_id,
             data_operacao=metadata.data_operacao,
             criada_em=metadata.criada_em,
             status=metadata.status,
-            display_name=f"{user} - {suffix}",
+            display_name=display_name,
         )
 
     def import_csv(self, csv_path: Path):
