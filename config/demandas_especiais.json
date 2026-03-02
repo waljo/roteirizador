@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "demandas_especiais": [
+    {
+      "codigo": "SPH-02",
+      "origem": "M9",
+      "destino": "M6",
+      "horario": "17:00",
+      "descricao": "Equipe da sonda",
+      "excluir_do_solver": true
+    }
+  ]
+}

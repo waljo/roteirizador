@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "embarcacoes": [
+    {
+      "nome": "1930",
+      "tipo": "Surfer",
+      "capacidade": 24,
+      "velocidade": 13.0,
+      "ativa": true
+    },
+    {
+      "nome": "1931",
+      "tipo": "Surfer",
+      "capacidade": 24,
+      "velocidade": 13.0,
+      "ativa": true
+    },
+    {
+      "nome": "1870",
+      "tipo": "Surfer",
+      "capacidade": 24,
+      "velocidade": 13.0,
+      "ativa": true
+    }
+  ]
+}

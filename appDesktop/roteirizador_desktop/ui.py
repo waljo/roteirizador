@@ -49,7 +49,38 @@ try:
         QInputDialog,
     )
 except ImportError as exc:  # pragma: no cover
+    class _QtFallback:
+        Key_Return = 0
+        Key_Enter = 0
+        Key_Delete = 0
+        UserRole = 0
+        Vertical = 0
+
+    Qt = _QtFallback()
     QApplication = None
+    QCheckBox = object
+    QComboBox = object
+    QFileDialog = object
+    QFormLayout = object
+    QGridLayout = object
+    QGroupBox = object
+    QHBoxLayout = object
+    QLabel = object
+    QLineEdit = object
+    QListWidget = object
+    QListWidgetItem = object
+    QMainWindow = object
+    QMessageBox = object
+    QPushButton = object
+    QDialog = object
+    QSplitter = object
+    QTableWidget = object
+    QTableWidgetItem = object
+    QTabWidget = object
+    QTextEdit = object
+    QVBoxLayout = object
+    QWidget = object
+    QInputDialog = object
     IMPORT_ERROR = exc
 else:
     IMPORT_ERROR = None
@@ -284,7 +315,7 @@ class VersionEditor(QWidget):
         self.rendidos_edit = QLineEdit("0")
         self.boats_table = AutoAppendTableWidget(0, 4)
         self.demand_table = AutoAppendTableWidget(0, 4)
-        self.special_exec_table = AutoAppendTableWidget(0, 4)
+        self.special_exec_table = QTableWidget(0, 4)
         self.output_text = QTextEdit()
         self.export_program_button = QPushButton("Exportar planilha de programacao")
         self.export_cl_txt_button = QPushButton("Exportar TXT de distribuicao")
@@ -341,15 +372,13 @@ class VersionEditor(QWidget):
         if self.version_name == VERSION_CL:
             special_exec_box = QGroupBox("Execucao de demandas especiais")
             special_exec_layout = QVBoxLayout(special_exec_box)
-            self.special_exec_table.set_append_row_callback(self.add_special_exec_row)
-            self.special_exec_table.set_remove_row_callback(self.remove_selected_rows)
             self.special_exec_table.setHorizontalHeaderLabels(
                 ["Codigo", "Embarcacao", "Horario", "Trajeto"]
             )
             special_exec_layout.addWidget(self.special_exec_table)
             special_exec_btns = QHBoxLayout()
             add_special_exec = QPushButton("Adicionar execucao especial")
-            add_special_exec.clicked.connect(self.add_special_exec_row)
+            add_special_exec.clicked.connect(self.add_special_exec_with_selection)
             remove_special_exec = QPushButton("Excluir execucao selecionada")
             remove_special_exec.clicked.connect(
                 lambda: self.remove_selected_rows(self.special_exec_table)
@@ -399,9 +428,6 @@ class VersionEditor(QWidget):
                             disponivel=True,
                         )
                     )
-            if self.version_name == VERSION_CL:
-                for special in op_config.demandas_especiais:
-                    self.add_special_exec_row(SpecialExecution(codigo=special.codigo))
 
     def load_bundle(self, bundle: Optional[VersionBundle], default_user: str, op_config: Optional[OperationalConfig]) -> None:
         self.reset_for_operation(default_user, op_config)
@@ -454,25 +480,38 @@ class VersionEditor(QWidget):
     def add_special_exec_row(self, item: Optional[SpecialExecution] = None) -> None:
         row = self.special_exec_table.rowCount()
         self.special_exec_table.insertRow(row)
-        combo = QComboBox()
-        codes = []
-        if self.parent_window.current_op_config:
-            codes = [special.codigo for special in self.parent_window.current_op_config.demandas_especiais]
-        combo.addItem("")
-        for code in codes:
-            combo.addItem(code)
-        if item and item.codigo:
-            if combo.findText(item.codigo) < 0:
-                combo.addItem(item.codigo)
-            combo.setCurrentText(item.codigo)
-        self.special_exec_table.setCellWidget(row, 0, combo)
         values = [
+            item.codigo if item else "",
             item.embarcacao if item else "",
             item.horario if item else "17:00",
             item.trajeto if item else "",
         ]
-        for offset, value in enumerate(values, start=1):
+        for offset, value in enumerate(values):
             self.special_exec_table.setItem(row, offset, QTableWidgetItem(value))
+
+    def add_special_exec_with_selection(self) -> None:
+        codes = []
+        if self.parent_window.current_op_config:
+            codes = [special.codigo for special in self.parent_window.current_op_config.demandas_especiais]
+        codes = sorted(dict.fromkeys(code for code in codes if code.strip()))
+        if not codes:
+            QMessageBox.warning(
+                self,
+                "Execucao especial",
+                "Nao ha demandas especiais cadastradas em Configuracoes.",
+            )
+            return
+        code, ok = QInputDialog.getItem(
+            self,
+            "Execucao especial",
+            "Selecione o codigo da demanda especial:",
+            codes,
+            0,
+            False,
+        )
+        if not ok or not code:
+            return
+        self.add_special_exec_row(SpecialExecution(codigo=code))
 
     @staticmethod
     def remove_selected_rows(table: QTableWidget) -> None:
@@ -511,8 +550,7 @@ class VersionEditor(QWidget):
             )
         special_execs: List[SpecialExecution] = []
         for row in range(self.special_exec_table.rowCount()):
-            codigo_widget = self.special_exec_table.cellWidget(row, 0)
-            codigo = codigo_widget.currentText().strip() if isinstance(codigo_widget, QComboBox) else self._text(self.special_exec_table, row, 0)
+            codigo = self._text(self.special_exec_table, row, 0)
             if not codigo:
                 continue
             special_execs.append(
