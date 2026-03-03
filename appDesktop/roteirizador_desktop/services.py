@@ -564,12 +564,6 @@ class AppService:
         return rows, total_service_delta
 
     @staticmethod
-    def _fmt_service(value):
-        if value is None:
-            return "-"
-        return str(value)
-
-    @staticmethod
     def _fmt_value(value) -> str:
         if value is None:
             return "-"
@@ -578,20 +572,28 @@ class AppService:
         return str(value)
 
     @staticmethod
-    def _format_ascii_table(headers: List[str], rows: List[List[object]]) -> str:
-        rendered_rows = [[AppService._fmt_value(cell) for cell in row] for row in rows]
-        widths = [len(header) for header in headers]
-        for row in rendered_rows:
-            for idx, cell in enumerate(row):
-                widths[idx] = max(widths[idx], len(cell))
+    def _escape_html(value: object) -> str:
+        text = AppService._fmt_value(value)
+        return (
+            text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
 
-        def build_row(values: List[str]) -> str:
-            return " | ".join(value.ljust(widths[idx]) for idx, value in enumerate(values))
-
-        separator = "-+-".join("-" * width for width in widths)
-        lines = [build_row(headers), separator]
-        lines.extend(build_row(row) for row in rendered_rows)
-        return "\n".join(lines)
+    @staticmethod
+    def _html_table(headers: List[str], rows: List[List[object]]) -> str:
+        head = "".join(f"<th>{AppService._escape_html(header)}</th>" for header in headers)
+        body_rows = []
+        for row in rows:
+            cols = "".join(f"<td>{AppService._escape_html(cell)}</td>" for cell in row)
+            body_rows.append(f"<tr>{cols}</tr>")
+        return (
+            "<table class='compare-table'>"
+            f"<thead><tr>{head}</tr></thead>"
+            f"<tbody>{''.join(body_rows)}</tbody>"
+            "</table>"
+        )
 
     def _build_comparison_details(
         self,
@@ -603,127 +605,91 @@ class AppService:
         programacao: VersionBundle,
         cl: VersionBundle,
     ) -> str:
-        lines = []
-        lines.append(f"OPERACAO: {metadata.operacao_id}")
-        lines.append("")
-        lines.append("RESUMO")
-        lines.append(
-            self._format_ascii_table(
+        html_parts = [
+            """
+            <html>
+            <head>
+            <style>
+            body { font-family: Segoe UI, Arial, sans-serif; color: #1f2937; margin: 10px; }
+            h2 { margin: 18px 0 8px; font-size: 18px; color: #0f172a; }
+            .meta { margin-bottom: 14px; font-size: 13px; color: #475569; }
+            .compare-table { border-collapse: collapse; width: 100%; margin: 8px 0 18px; table-layout: fixed; }
+            .compare-table th { background: #e2e8f0; color: #0f172a; font-weight: 600; text-align: left; }
+            .compare-table th, .compare-table td { border: 1px solid #cbd5e1; padding: 8px 10px; vertical-align: top; font-size: 12px; word-wrap: break-word; }
+            .note { font-size: 12px; color: #475569; margin: 6px 0 12px; }
+            </style>
+            </head>
+            <body>
+            """,
+            f"<div class='meta'><strong>Operacao:</strong> {self._escape_html(metadata.operacao_id)}<br>"
+            f"<strong>Data:</strong> {self._escape_html(metadata.data_operacao)}</div>",
+            "<h2>Resumo</h2>",
+            self._html_table(
                 ["INDICADOR", "PROGRAMACAO", "CONTROLADOR", "DIFERENCA"],
                 [
-                    [
-                        "Distancia total (NM)",
-                        programacao.metrics["total_distance_nm"],
-                        cl.metrics["total_distance_nm"],
-                        summary.delta_distancia_nm,
-                    ],
-                    [
-                        "TMIB total",
-                        programacao.metrics["total_tmib"],
-                        cl.metrics["total_tmib"],
-                        summary.delta_total_tmib,
-                    ],
-                    [
-                        "M9 total",
-                        programacao.metrics["total_m9"],
-                        cl.metrics["total_m9"],
-                        summary.delta_total_m9,
-                    ],
-                    [
-                        "Plataformas completas",
-                        programacao.metrics["platforms_complete"],
-                        cl.metrics["platforms_complete"],
-                        summary.delta_platforms_complete,
-                    ],
-                    [
-                        "Service complete (min)",
-                        programacao.metrics["service_minutes_complete"],
-                        cl.metrics["service_minutes_complete"],
-                        summary.delta_service_minutes_complete,
-                    ],
+                    ["Distancia total (NM)", programacao.metrics["total_distance_nm"], cl.metrics["total_distance_nm"], summary.delta_distancia_nm],
+                    ["TMIB total", programacao.metrics["total_tmib"], cl.metrics["total_tmib"], summary.delta_total_tmib],
+                    ["M9 total", programacao.metrics["total_m9"], cl.metrics["total_m9"], summary.delta_total_m9],
+                    ["Plataformas completas", programacao.metrics["platforms_complete"], cl.metrics["platforms_complete"], summary.delta_platforms_complete],
                 ],
-            )
-        )
-        lines.append("")
-        lines.append("RESUMO EXECUTIVO")
-        lines.append(
-            self._format_ascii_table(
+            ),
+            "<h2>Resumo Executivo</h2>",
+            self._html_table(
                 ["INFORMACAO", "PROGRAMACAO", "CONTROLADOR"],
                 [
                     ["Operacao", metadata.operacao_id, metadata.operacao_id],
                     ["Data", metadata.data_operacao, metadata.data_operacao],
                     ["Unidades alteradas", summary.changed_units_count, summary.changed_units_count],
-                    ["Programacao existe", "SIM", "SIM" if summary.programacao_existe else "NAO"],
-                    ["Controlador existe", "NAO" if not summary.cl_oficial_existe else "SIM", "SIM"],
+                    ["Programacao existe", "SIM" if summary.programacao_existe else "NAO", "-"],
+                    ["Controlador existe", "-", "SIM" if summary.cl_oficial_existe else "NAO"],
                 ],
-            )
-        )
-        lines.append("")
-        lines.append("IMPACTO EM PRIORIDADES")
+            ),
+            "<h2>Impacto Em Prioridades</h2>",
+        ]
         if not priority_rows:
-            lines.append("- Nenhuma unidade com prioridade definida nas duas versoes.")
+            html_parts.append("<div class='note'>Nenhuma unidade com prioridade definida nas duas versoes.</div>")
         else:
-            lines.append(
-                self._format_ascii_table(
-                    ["PLATAFORMA", "PROGRAMACAO", "CONTROLADOR", "DIFERENCA"],
+            html_parts.append(
+                self._html_table(
+                    ["INDICADOR", "PROGRAMACAO", "CONTROLADOR", "DIFERENCA"],
                     [
-                        [
-                            "Unidades prioritarias",
-                            summary.priority_units_count,
-                            summary.priority_units_count,
-                            0,
-                        ],
-                        [
-                            "Service agregado (min)",
-                            0,
-                            summary.priority_service_delta_minutes,
-                            summary.priority_service_delta_minutes,
-                        ],
-                    ]
-                    + [
-                        [
-                            row["plataforma"],
-                            f"Prio {row['prog_prio']} | TMIB {row['prog_tmib']} | M9 {row['prog_m9']} | Svc {self._fmt_service(row['prog_service'])}",
-                            f"Prio {row['cl_prio']} | TMIB {row['cl_tmib']} | M9 {row['cl_m9']} | Svc {self._fmt_service(row['cl_service'])}",
-                            row["delta_service"],
-                        ]
-                        for row in priority_rows
+                        ["Unidades prioritarias avaliadas", summary.priority_units_count, summary.priority_units_count, 0],
+                        ["Impacto agregado (min)", "-", "-", summary.priority_service_delta_minutes],
                     ],
                 )
             )
-        lines.append("")
-        lines.append("DIFERENCAS POR UNIDADE")
-        lines.append(
-            self._format_ascii_table(
-                ["UNIDADE", "PROGRAMACAO", "CONTROLADOR", "DIFERENCA"],
-                [
+        html_parts.extend(
+            [
+                "<h2>Diferencas Por Unidade</h2>",
+                self._html_table(
+                    ["UNIDADE", "PROGRAMACAO", "CONTROLADOR", "DIFERENCA"],
                     [
-                        row["plataforma"],
-                        f"TMIB {row['prog_tmib']} | M9 {row['prog_m9']} | Prio {row['prog_prio']} | Svc {self._fmt_service(row['prog_service'])}",
-                        f"TMIB {row['cl_tmib']} | M9 {row['cl_m9']} | Prio {row['cl_prio']} | Svc {self._fmt_service(row['cl_service'])}",
-                        f"TMIB {row['delta_tmib']:+} | M9 {row['delta_m9']:+} | Svc {row['delta_service']:+}",
-                    ]
-                    for row in unit_rows
-                ],
-            )
-        )
-        lines.append("")
-        lines.append("DIFERENCAS POR EMBARCACAO")
-        lines.append(
-            self._format_ascii_table(
-                ["EMBARCACAO", "PROGRAMACAO", "CONTROLADOR", "DIFERENCA"],
-                [
+                        [
+                            row["plataforma"],
+                            f"TMIB {row['prog_tmib']} | M9 {row['prog_m9']}",
+                            f"TMIB {row['cl_tmib']} | M9 {row['cl_m9']}",
+                            f"TMIB {row['delta_tmib']:+} | M9 {row['delta_m9']:+}",
+                        ]
+                        for row in unit_rows
+                    ],
+                ),
+                "<h2>Diferencas Por Embarcacao</h2>",
+                self._html_table(
+                    ["EMBARCACAO", "PROGRAMACAO", "CONTROLADOR", "DIFERENCA"],
                     [
-                        row["embarcacao"],
-                        f"Ativa {'SIM' if row['prog_ativa'] else 'NAO'} | Dist {self._fmt_value(row['prog_dist'])} | {row['prog_route'] or '-'}",
-                        f"Ativa {'SIM' if row['cl_ativa'] else 'NAO'} | Dist {self._fmt_value(row['cl_dist'])} | {row['cl_route'] or '-'}",
-                        f"Dist {row['delta_dist']:+}",
-                    ]
-                    for row in boat_rows
-                ],
-            )
+                        [
+                            row["embarcacao"],
+                            f"Ativa {'SIM' if row['prog_ativa'] else 'NAO'} | Dist {self._fmt_value(row['prog_dist'])} | {row['prog_route'] or '-'}",
+                            f"Ativa {'SIM' if row['cl_ativa'] else 'NAO'} | Dist {self._fmt_value(row['cl_dist'])} | {row['cl_route'] or '-'}",
+                            f"Dist {row['delta_dist']:+}",
+                        ]
+                        for row in boat_rows
+                    ],
+                ),
+                "</body></html>",
+            ]
         )
-        return "\n".join(lines)
+        return "".join(html_parts)
 
 
 def default_operation_version(version_name: str, user_name: str) -> OperationVersion:

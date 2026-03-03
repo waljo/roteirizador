@@ -42,7 +42,6 @@ try:
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
-        QComboBox,
         QFileDialog,
         QFormLayout,
         QGridLayout,
@@ -76,7 +75,6 @@ except ImportError as exc:  # pragma: no cover
     Qt = _QtFallback()
     QApplication = None
     QCheckBox = object
-    QComboBox = object
     QFileDialog = object
     QFormLayout = object
     QGridLayout = object
@@ -266,11 +264,9 @@ class VersionEditor(QWidget):
         self.parent_window = parent_window
         self.version_name = version_name
         self.user_edit = QLineEdit()
-        self.origin_combo = QComboBox()
-        self.origin_combo.addItems(["formulario", "csv"])
         self.troca_check = QCheckBox("Troca de turma")
         self.rendidos_edit = QLineEdit("0")
-        self.boats_table = AutoAppendTableWidget(0, 4)
+        self.boats_table = AutoAppendTableWidget(0, 3)
         self.demand_table = AutoAppendTableWidget(0, 4)
         self.output_text = QTextEdit()
         self.export_program_button = QPushButton("Exportar planilha de programacao")
@@ -283,8 +279,6 @@ class VersionEditor(QWidget):
         form = QGridLayout()
         form.addWidget(QLabel("Usuario"), 0, 0)
         form.addWidget(self.user_edit, 0, 1)
-        form.addWidget(QLabel("Origem"), 0, 2)
-        form.addWidget(self.origin_combo, 0, 3)
         form.addWidget(self.troca_check, 1, 0)
         form.addWidget(QLabel("Rendidos M9"), 1, 2)
         form.addWidget(self.rendidos_edit, 1, 3)
@@ -297,7 +291,7 @@ class VersionEditor(QWidget):
         boats_layout = QVBoxLayout(boats_box)
         self.boats_table.set_append_row_callback(self.add_boat_row)
         self.boats_table.set_remove_row_callback(self.remove_selected_rows)
-        self.boats_table.setHorizontalHeaderLabels(["Nome", "Hora saida", "Rota fixa", "Disponivel"])
+        self.boats_table.setHorizontalHeaderLabels(["Nome", "Hora saida", "Rota fixa"])
         boats_layout.addWidget(self.boats_table)
         boats_btns = QHBoxLayout()
         add_boat = QPushButton("Adicionar embarcacao")
@@ -347,7 +341,7 @@ class VersionEditor(QWidget):
         layout.addWidget(self.output_text)
 
     def reset_for_operation(self, default_user: str, op_config: Optional[OperationalConfig]) -> None:
-        self.user_edit.setText(default_user)
+        self.user_edit.setText("")
         self.boats_table.setRowCount(0)
         self.demand_table.setRowCount(0)
         self.output_text.clear()
@@ -372,7 +366,6 @@ class VersionEditor(QWidget):
             return
         version = bundle.version
         self.user_edit.setText(version.usuario)
-        self.origin_combo.setCurrentText(version.tipo_origem)
         self.troca_check.setChecked(version.troca_turma)
         self.rendidos_edit.setText(str(version.rendidos_m9))
         self.boats_table.setRowCount(0)
@@ -392,7 +385,6 @@ class VersionEditor(QWidget):
             boat.nome if boat else "",
             boat.hora_saida if boat else "",
             boat.rota_fixa if boat else "",
-            "SIM" if boat is None or boat.disponivel else "NAO",
         ]
         for col, value in enumerate(values):
             self.boats_table.setItem(row, col, QTableWidgetItem(value))
@@ -418,6 +410,9 @@ class VersionEditor(QWidget):
             table.removeRow(row)
 
     def build_version(self) -> OperationVersion:
+        user_name = self.user_edit.text().strip()
+        if not user_name:
+            raise ValueError("Informe o usuario antes de continuar.")
         boats: List[AvailableBoat] = []
         for row in range(self.boats_table.rowCount()):
             nome = self._text(self.boats_table, row, 0)
@@ -428,7 +423,7 @@ class VersionEditor(QWidget):
                     nome=nome,
                     hora_saida=self._text(self.boats_table, row, 1),
                     rota_fixa=self._text(self.boats_table, row, 2),
-                    disponivel=self._text(self.boats_table, row, 3).upper() == "SIM",
+                    disponivel=True,
                 )
             )
         demands: List[DemandItem] = []
@@ -446,9 +441,9 @@ class VersionEditor(QWidget):
             )
         return OperationVersion(
             versao=self.version_name,
-            usuario=self.user_edit.text().strip() or "usuario",
+            usuario=user_name,
             criado_em=default_operation_version(self.version_name, "").criado_em,
-            tipo_origem=self.origin_combo.currentText(),
+            tipo_origem="csv" if self.imported_csv_path else "formulario",
             troca_turma=self.troca_check.isChecked(),
             rendidos_m9=int(self.rendidos_edit.text().strip() or 0),
             embarcacoes_disponiveis=boats,
@@ -468,7 +463,6 @@ class VersionEditor(QWidget):
                 "O arquivo CSV nao trouxe nenhuma demanda valida. Verifique cabecalhos e valores.",
             )
             return
-        self.origin_combo.setCurrentText("csv")
         self.demand_table.setRowCount(0)
         for item in demands:
             self.add_demand_row(item)
@@ -477,7 +471,11 @@ class VersionEditor(QWidget):
         if not self.parent_window.current_operation:
             QMessageBox.warning(self, "Operacao", "Selecione ou crie uma operacao.")
             return
-        version = self.build_version()
+        try:
+            version = self.build_version()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Versao", str(exc))
+            return
         self.parent_window.current_operation = self.service.save_version(
             self.parent_window.current_root,
             self.parent_window.current_operation,
@@ -492,7 +490,11 @@ class VersionEditor(QWidget):
         if not self.parent_window.current_operation:
             QMessageBox.warning(self, "Operacao", "Selecione ou crie uma operacao.")
             return
-        version = self.build_version()
+        try:
+            version = self.build_version()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Distribuicao", str(exc))
+            return
         self.parent_window.current_operation, result = self.service.run_version(
             self.parent_window.current_root,
             self.parent_window.current_operation,
@@ -574,7 +576,11 @@ class VersionEditor(QWidget):
                 "Gere ou carregue uma distribuicao antes de exportar o TXT.",
             )
             return
-        version = self.build_version()
+        try:
+            version = self.build_version()
+        except ValueError as exc:
+            QMessageBox.warning(self, "TXT de Distribuicao", str(exc))
+            return
         file_name, _ = QFileDialog.getSaveFileName(
             self,
             "Salvar TXT de distribuicao",
@@ -635,22 +641,13 @@ class ComparisonTab(QWidget):
 
     def load(self, comparison: Optional[dict]) -> None:
         if not comparison:
-            self.summary_text.setPlainText("Comparacao indisponivel.")
+            self.summary_text.setHtml("<p>Comparacao indisponivel.</p>")
             return
-        summary = comparison.get("summary", {})
-        header = [
-            "RESUMO",
-            f"Distancia (CL - Prog): {summary.get('delta_distancia_nm', 0)} NM",
-            f"Delta TMIB: {summary.get('delta_total_tmib', 0)}",
-            f"Delta M9: {summary.get('delta_total_m9', 0)}",
-            f"Delta plataformas completas: {summary.get('delta_platforms_complete', 0)}",
-            f"Delta service complete: {summary.get('delta_service_minutes_complete', 0)}",
-            f"Unidades alteradas: {summary.get('changed_units_count', 0)}",
-            f"Unidades prioritarias: {summary.get('priority_units_count', 0)}",
-            f"Impacto agregado nas prioridades: {summary.get('priority_service_delta_minutes', 0)}",
-            "",
-        ]
-        self.summary_text.setPlainText("\n".join(header) + comparison.get("details", ""))
+        details = comparison.get("details", "")
+        if details.lstrip().startswith("<"):
+            self.summary_text.setHtml(details)
+        else:
+            self.summary_text.setPlainText(details)
 
 
 class MainWindow(QMainWindow):
@@ -796,7 +793,7 @@ class MainWindow(QMainWindow):
         self.refresh_operation()
 
     def refresh_operation(self) -> None:
-        user_name = "usuario"
+        user_name = ""
         self.programacao_tab.load_bundle(
             self.service.load_version(self.current_root, self.current_operation, VERSION_PROGRAMACAO)
             if self.current_operation and self.current_root

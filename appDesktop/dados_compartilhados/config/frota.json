@@ -6,7 +6,7 @@
       "tipo": "aqua",
       "capacidade": 100,
       "velocidade": 20.0,
-      "ativa": true
+      "ativa": false
     },
     {
       "nome": "SURFER 1870",
@@ -20,14 +20,14 @@
       "tipo": "surfer",
       "capacidade": 24,
       "velocidade": 14.3,
-      "ativa": true
+      "ativa": false
     },
     {
       "nome": "SURFER 1905",
       "tipo": "surfer",
       "capacidade": 24,
       "velocidade": 15.5,
-      "ativa": true
+      "ativa": false
     },
     {
       "nome": "SURFER 1930",
