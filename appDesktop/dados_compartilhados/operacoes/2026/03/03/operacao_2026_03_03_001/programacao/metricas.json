@@ -1,11 +1,11 @@
 {
   "boats_used": 2,
-  "total_tmib": 28,
+  "total_tmib": 30,
   "total_m9": 6,
-  "total_distance_nm": 22.703,
-  "service_minutes_complete": 1848,
-  "service_minutes_partial": 1848,
-  "platforms_complete": 4,
-  "platforms_total": 4,
+  "total_distance_nm": 22.736,
+  "service_minutes_complete": 2331,
+  "service_minutes_partial": 2331,
+  "platforms_complete": 5,
+  "platforms_total": 5,
   "missing": {}
 }

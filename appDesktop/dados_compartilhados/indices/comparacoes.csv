@@ -1,2 +1,3 @@
 operacao_id,data_operacao,generated_at,delta_distancia_nm,delta_total_tmib,delta_total_m9,delta_platforms_complete,delta_service_minutes_complete,changed_units_count,priority_units_count,priority_service_delta_minutes
 operacao_2026_03_03_001,2026-03-03,2026-03-03T09:55:04,-1.213,13,4,0,-52,8,0,0
+operacao_2026_03_03_001,2026-03-03,2026-03-03T11:37:13,-1.246,11,4,-1,-535,9,0,0
