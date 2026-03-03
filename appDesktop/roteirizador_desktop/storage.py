@@ -152,11 +152,8 @@ class NetworkStorage:
     def _hydrate_display_name(self, metadata: OperationMetadata) -> OperationMetadata:
         op_dir = self.operation_dir(metadata.operacao_id, metadata.data_operacao)
         labels: List[str] = []
-        version_candidates = [
-            (VERSION_PROGRAMACAO, "DISTPROG"),
-            (VERSION_CL, "DISTCL"),
-        ]
-        for version_name, suffix in version_candidates:
+        version_candidates = [VERSION_PROGRAMACAO, VERSION_CL]
+        for version_name in version_candidates:
             input_path = op_dir / version_name / "input.json"
             if not input_path.exists():
                 continue
@@ -169,7 +166,7 @@ class NetworkStorage:
             user = (version.usuario or "").strip()
             if not user:
                 continue
-            labels.append(f"{user} - {suffix}")
+            labels.append(user)
         if not labels:
             return metadata
         return OperationMetadata(

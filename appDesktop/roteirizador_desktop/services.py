@@ -206,14 +206,15 @@ class AppService:
         metadata: OperationMetadata,
     ) -> OperationMetadata:
         storage = self.network_storage(root)
-        labels: List[str] = []
+        programacao_name = ""
+        cl_name = ""
         programacao = storage.load_version(metadata, VERSION_PROGRAMACAO)
         cl = storage.load_version(metadata, VERSION_CL)
         if programacao and programacao.version.usuario.strip():
-            labels.append(f"{programacao.version.usuario.strip()} - DISTPROG")
+            programacao_name = programacao.version.usuario.strip()
         if cl and cl.version.usuario.strip():
-            labels.append(f"{cl.version.usuario.strip()} - DISTCL")
-        display_name = " | ".join(labels)
+            cl_name = cl.version.usuario.strip()
+        display_name = " | ".join(part for part in [programacao_name, cl_name] if part)
         return OperationMetadata(
             operacao_id=metadata.operacao_id,
             data_operacao=metadata.data_operacao,
@@ -568,6 +569,30 @@ class AppService:
             return "-"
         return str(value)
 
+    @staticmethod
+    def _fmt_value(value) -> str:
+        if value is None:
+            return "-"
+        if isinstance(value, float):
+            return f"{value:.3f}".rstrip("0").rstrip(".")
+        return str(value)
+
+    @staticmethod
+    def _format_ascii_table(headers: List[str], rows: List[List[object]]) -> str:
+        rendered_rows = [[AppService._fmt_value(cell) for cell in row] for row in rows]
+        widths = [len(header) for header in headers]
+        for row in rendered_rows:
+            for idx, cell in enumerate(row):
+                widths[idx] = max(widths[idx], len(cell))
+
+        def build_row(values: List[str]) -> str:
+            return " | ".join(value.ljust(widths[idx]) for idx, value in enumerate(values))
+
+        separator = "-+-".join("-" * width for width in widths)
+        lines = [build_row(headers), separator]
+        lines.extend(build_row(row) for row in rendered_rows)
+        return "\n".join(lines)
+
     def _build_comparison_details(
         self,
         metadata: OperationMetadata,
@@ -581,55 +606,123 @@ class AppService:
         lines = []
         lines.append(f"OPERACAO: {metadata.operacao_id}")
         lines.append("")
+        lines.append("RESUMO")
+        lines.append(
+            self._format_ascii_table(
+                ["INDICADOR", "PROGRAMACAO", "CONTROLADOR", "DIFERENCA"],
+                [
+                    [
+                        "Distancia total (NM)",
+                        programacao.metrics["total_distance_nm"],
+                        cl.metrics["total_distance_nm"],
+                        summary.delta_distancia_nm,
+                    ],
+                    [
+                        "TMIB total",
+                        programacao.metrics["total_tmib"],
+                        cl.metrics["total_tmib"],
+                        summary.delta_total_tmib,
+                    ],
+                    [
+                        "M9 total",
+                        programacao.metrics["total_m9"],
+                        cl.metrics["total_m9"],
+                        summary.delta_total_m9,
+                    ],
+                    [
+                        "Plataformas completas",
+                        programacao.metrics["platforms_complete"],
+                        cl.metrics["platforms_complete"],
+                        summary.delta_platforms_complete,
+                    ],
+                    [
+                        "Service complete (min)",
+                        programacao.metrics["service_minutes_complete"],
+                        cl.metrics["service_minutes_complete"],
+                        summary.delta_service_minutes_complete,
+                    ],
+                ],
+            )
+        )
+        lines.append("")
         lines.append("RESUMO EXECUTIVO")
-        lines.append(f"- Distancia total Programacao: {programacao.metrics['total_distance_nm']} NM")
-        lines.append(f"- Distancia total CL Oficial: {cl.metrics['total_distance_nm']} NM")
-        lines.append(f"- Delta distancia (CL - Programacao): {summary.delta_distancia_nm} NM")
-        lines.append(f"- Delta TMIB: {summary.delta_total_tmib}")
-        lines.append(f"- Delta M9: {summary.delta_total_m9}")
-        lines.append(f"- Delta plataformas completas: {summary.delta_platforms_complete}")
-        lines.append(f"- Delta service minutes complete: {summary.delta_service_minutes_complete}")
-        lines.append(f"- Unidades alteradas: {summary.changed_units_count}")
+        lines.append(
+            self._format_ascii_table(
+                ["INFORMACAO", "PROGRAMACAO", "CONTROLADOR"],
+                [
+                    ["Operacao", metadata.operacao_id, metadata.operacao_id],
+                    ["Data", metadata.data_operacao, metadata.data_operacao],
+                    ["Unidades alteradas", summary.changed_units_count, summary.changed_units_count],
+                    ["Programacao existe", "SIM", "SIM" if summary.programacao_existe else "NAO"],
+                    ["Controlador existe", "NAO" if not summary.cl_oficial_existe else "SIM", "SIM"],
+                ],
+            )
+        )
         lines.append("")
         lines.append("IMPACTO EM PRIORIDADES")
         if not priority_rows:
             lines.append("- Nenhuma unidade com prioridade definida nas duas versoes.")
         else:
-            lines.append(f"- Unidades prioritarias avaliadas: {summary.priority_units_count}")
             lines.append(
-                f"- Delta agregado de service minutes nas prioridades (CL - Programacao): "
-                f"{summary.priority_service_delta_minutes}"
-            )
-            for row in priority_rows:
-                lines.append(
-                    f"- {row['plataforma']}: prio {row['prog_prio']} -> {row['cl_prio']}, "
-                    f"TMIB {row['prog_tmib']} -> {row['cl_tmib']}, "
-                    f"M9 {row['prog_m9']} -> {row['cl_m9']}, "
-                    f"service {self._fmt_service(row['prog_service'])} -> {self._fmt_service(row['cl_service'])}, "
-                    f"delta {row['delta_service']}"
+                self._format_ascii_table(
+                    ["PLATAFORMA", "PROGRAMACAO", "CONTROLADOR", "DIFERENCA"],
+                    [
+                        [
+                            "Unidades prioritarias",
+                            summary.priority_units_count,
+                            summary.priority_units_count,
+                            0,
+                        ],
+                        [
+                            "Service agregado (min)",
+                            0,
+                            summary.priority_service_delta_minutes,
+                            summary.priority_service_delta_minutes,
+                        ],
+                    ]
+                    + [
+                        [
+                            row["plataforma"],
+                            f"Prio {row['prog_prio']} | TMIB {row['prog_tmib']} | M9 {row['prog_m9']} | Svc {self._fmt_service(row['prog_service'])}",
+                            f"Prio {row['cl_prio']} | TMIB {row['cl_tmib']} | M9 {row['cl_m9']} | Svc {self._fmt_service(row['cl_service'])}",
+                            row["delta_service"],
+                        ]
+                        for row in priority_rows
+                    ],
                 )
+            )
         lines.append("")
         lines.append("DIFERENCAS POR UNIDADE")
-        for row in unit_rows:
-            marker = "*" if row["changed"] else "="
-            lines.append(
-                f"{marker} {row['plataforma']}: "
-                f"TMIB {row['prog_tmib']} -> {row['cl_tmib']} ({row['delta_tmib']:+}), "
-                f"M9 {row['prog_m9']} -> {row['cl_m9']} ({row['delta_m9']:+}), "
-                f"Prio {row['prog_prio']} -> {row['cl_prio']}, "
-                f"Service {self._fmt_service(row['prog_service'])} -> {self._fmt_service(row['cl_service'])} "
-                f"({row['delta_service']:+})"
+        lines.append(
+            self._format_ascii_table(
+                ["UNIDADE", "PROGRAMACAO", "CONTROLADOR", "DIFERENCA"],
+                [
+                    [
+                        row["plataforma"],
+                        f"TMIB {row['prog_tmib']} | M9 {row['prog_m9']} | Prio {row['prog_prio']} | Svc {self._fmt_service(row['prog_service'])}",
+                        f"TMIB {row['cl_tmib']} | M9 {row['cl_m9']} | Prio {row['cl_prio']} | Svc {self._fmt_service(row['cl_service'])}",
+                        f"TMIB {row['delta_tmib']:+} | M9 {row['delta_m9']:+} | Svc {row['delta_service']:+}",
+                    ]
+                    for row in unit_rows
+                ],
             )
+        )
         lines.append("")
         lines.append("DIFERENCAS POR EMBARCACAO")
-        for row in boat_rows:
-            lines.append(
-                f"- {row['embarcacao']}: ativa Prog={row['prog_ativa']} CL={row['cl_ativa']}, "
-                f"dist {row['prog_dist']} -> {row['cl_dist']} ({row['delta_dist']:+})"
+        lines.append(
+            self._format_ascii_table(
+                ["EMBARCACAO", "PROGRAMACAO", "CONTROLADOR", "DIFERENCA"],
+                [
+                    [
+                        row["embarcacao"],
+                        f"Ativa {'SIM' if row['prog_ativa'] else 'NAO'} | Dist {self._fmt_value(row['prog_dist'])} | {row['prog_route'] or '-'}",
+                        f"Ativa {'SIM' if row['cl_ativa'] else 'NAO'} | Dist {self._fmt_value(row['cl_dist'])} | {row['cl_route'] or '-'}",
+                        f"Dist {row['delta_dist']:+}",
+                    ]
+                    for row in boat_rows
+                ],
             )
-            if row["prog_route"] or row["cl_route"]:
-                lines.append(f"  Prog: {row['prog_route'] or '-'}")
-                lines.append(f"  CL  : {row['cl_route'] or '-'}")
+        )
         return "\n".join(lines)
 
 
