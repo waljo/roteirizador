@@ -118,6 +118,23 @@ def short_plat(norm: str) -> str:
     return n
 
 
+def _time_to_minutes(value: str) -> Optional[int]:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not re.match(r"^\d{2}:\d{2}$", text):
+        return None
+    hour, minute = text.split(":")
+    return int(hour) * 60 + int(minute)
+
+
+def fixed_route_abates_demand(boat: "Boat") -> bool:
+    departure_min = _time_to_minutes(boat.departure)
+    if departure_min is None:
+        return False
+    return (6 * 60 + 30) <= departure_min < (14 * 60)
+
+
 def get_geo_cluster(platform_norm: str) -> str:
     for cluster_name, platforms in GEO_CLUSTERS.items():
         if platform_norm in platforms:
@@ -2083,6 +2100,10 @@ def solve(config: Config, boats: List[Boat], demands: List[Demand],
     results = []
     for boat in fixed_boats:
         results.append((boat, boat.fixed_route))
+        if not fixed_route_abates_demand(boat):
+            print(f"  Rota fixa {boat.name}: fora da janela de abatimento")
+            continue
+
         deliveries = parse_fixed_route(boat.fixed_route)
 
         for plat_norm, delivered in deliveries.items():

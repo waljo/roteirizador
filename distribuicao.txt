@@ -1,12 +1,14 @@
 DISTRIBUICAO DE PAX
 ======================================================================
 
-SURFER 1931  06:30  TMIB +5/M9 +6/B1 -5 (-6)
+SURFER 1931  06:30  TMIB +24/M9 -10 +5/M4 -3 (-3)/M3 -11 (-2)
+SURFER 1870  07:10  TMIB +18/M9 -9 +9/M6 -1 (-4)/B3 -4 (-4)/B2 -1/B1 -3 (-1)
+SURFER 1930  07:20  TMIB +5/M5 -5
 
 ----------------------------------------------------------------------
-Resumo: 5 pax TMIB + 6 pax M9 = 11 pax total
-Barcos utilizados: 1
+Resumo: 47 pax TMIB + 14 pax M9 = 61 pax total
+Barcos utilizados: 3
 ======================================================================
 
 
-Distancia total (rotas livres): 10.3 NM
+Distancia total (rotas livres): 32.4 NM
