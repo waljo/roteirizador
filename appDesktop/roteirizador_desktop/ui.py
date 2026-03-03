@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 from typing import List, Optional
 
 from .domain import (
@@ -418,10 +419,15 @@ class VersionEditor(QWidget):
             nome = self._text(self.boats_table, row, 0)
             if not nome:
                 continue
+            hora_saida = self._text(self.boats_table, row, 1)
+            if not hora_saida:
+                raise ValueError(f"Informe a hora de saida da embarcacao {nome}.")
+            if not re.match(r"^\d{2}:\d{2}$", hora_saida):
+                raise ValueError(f"Hora de saida invalida para {nome}. Use HH:MM.")
             boats.append(
                 AvailableBoat(
                     nome=nome,
-                    hora_saida=self._text(self.boats_table, row, 1),
+                    hora_saida=hora_saida,
                     rota_fixa=self._text(self.boats_table, row, 2),
                     disponivel=True,
                 )

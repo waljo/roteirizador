@@ -515,8 +515,6 @@ class AppService:
                 [
                     row["delta_tmib"] != 0,
                     row["delta_m9"] != 0,
-                    row["prog_prio"] != row["cl_prio"],
-                    row["delta_service"] != 0,
                 ]
             )
             if row["changed"]:
