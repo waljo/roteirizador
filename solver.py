@@ -118,6 +118,10 @@ def short_plat(norm: str) -> str:
     return n
 
 
+def is_ranked_priority(priority: int) -> bool:
+    return priority in (1, 2, 3)
+
+
 def _time_to_minutes(value: str) -> Optional[int]:
     if not value:
         return None
@@ -532,7 +536,7 @@ def order_stops_with_priority(stops: List[Tuple[str, int, int]],
     if len(stops) <= 1:
         return list(stops)
 
-    has_priority = any(priority_map.get(s[0], 99) <= 3 for s in stops)
+    has_priority = any(is_ranked_priority(priority_map.get(s[0], 99)) for s in stops)
     if not has_priority:
         # fallback para distÃ¢ncia pura
         stop_demands = [Demand(short_plat(s[0]), s[0], s[1], s[2]) for s in stops]
@@ -638,9 +642,6 @@ def parse_fixed_route(route_str: str) -> Dict[str, Dict[str, int]]:
         tokens = part.split()
         platform = tokens[0]
         platform_norm = norm_plat(platform)
-
-        if platform_norm == 'TMIB':
-            continue
 
         tmib_drop = 0
         m9_drop = 0
