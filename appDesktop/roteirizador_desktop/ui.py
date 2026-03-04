@@ -41,6 +41,7 @@ Rota: TMIB +22/M10 -5/M9 -7 +4/M6 -4 {B1:+1}/B2 -4 (-4)/B1 -2 {M6:-1}
 try:
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import (
+        QHeaderView,
         QApplication,
         QCheckBox,
         QComboBox,
@@ -75,6 +76,7 @@ except ImportError as exc:  # pragma: no cover
         UserRole = 0
         Vertical = 0
 
+    QHeaderView = object
     Qt = _QtFallback()
     QApplication = None
     QCheckBox = object
@@ -111,6 +113,8 @@ class AutoAppendTableWidget(QTableWidget):
         super().__init__(rows, cols, parent)
         self._append_row_callback = None
         self._remove_row_callback = None
+        if hasattr(self.horizontalHeader(), "setSectionResizeMode"):
+            self.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
 
     def set_append_row_callback(self, callback) -> None:
         self._append_row_callback = callback
@@ -320,23 +324,34 @@ class VersionEditor(QWidget):
 
     def _build(self) -> None:
         layout = QVBoxLayout(self)
-        form = QGridLayout()
-        form.addWidget(QLabel("Usuario"), 0, 0)
-        form.addWidget(self.user_edit, 0, 1)
-        form.addWidget(self.troca_check, 1, 0)
-        form.addWidget(QLabel("Rendidos M9"), 1, 2)
-        form.addWidget(self.rendidos_edit, 1, 3)
+
+        # --- Header Section (Metadata) ---
+        header_group = QGroupBox("Dados da Operacao")
+        header_layout = QGridLayout(header_group)
+        header_layout.addWidget(QLabel("Usuario:"), 0, 0)
+        header_layout.addWidget(self.user_edit, 0, 1)
+        header_layout.addWidget(self.troca_check, 0, 2)
+        header_layout.addWidget(QLabel("Rendidos M9:"), 0, 3)
+        header_layout.addWidget(self.rendidos_edit, 0, 4)
         help_button = QPushButton("Como digitar rota")
         help_button.clicked.connect(self.show_route_help)
-        form.addWidget(help_button, 2, 0, 1, 2)
-        layout.addLayout(form)
+        header_layout.addWidget(help_button, 0, 5)
+        layout.addWidget(header_group)
 
+        # --- Main Splitter (Vertical: Inputs vs Output) ---
+        main_splitter = QSplitter(Qt.Vertical)
+
+        # --- Input Section (Splitter Horizontal) ---
+        input_splitter = QSplitter(Qt.Horizontal)
+
+        # Left: Boats
         boats_box = QGroupBox("Embarcacoes disponiveis")
         boats_layout = QVBoxLayout(boats_box)
         self.boats_table.set_append_row_callback(self.add_boat_row)
         self.boats_table.set_remove_row_callback(self.remove_selected_rows)
         self.boats_table.setHorizontalHeaderLabels(["Nome", "Hora saida", "Rota fixa"])
         boats_layout.addWidget(self.boats_table)
+
         boats_btns = QHBoxLayout()
         add_boat = QPushButton("Adicionar embarcacao")
         add_boat.clicked.connect(self.add_boat_row)
@@ -345,16 +360,16 @@ class VersionEditor(QWidget):
         boats_btns.addWidget(add_boat)
         boats_btns.addWidget(remove_boat)
         boats_layout.addLayout(boats_btns)
-        self.boats_section = CollapsibleSection("Embarcacoes disponiveis", expanded=True)
-        self.boats_section.add_widget(boats_box)
-        layout.addWidget(self.boats_section)
+        input_splitter.addWidget(boats_box)
 
+        # Right: Demand
         demand_box = QGroupBox("Demanda")
         demand_layout = QVBoxLayout(demand_box)
         self.demand_table.set_append_row_callback(self.add_demand_row)
         self.demand_table.set_remove_row_callback(self.remove_selected_rows)
         self.demand_table.setHorizontalHeaderLabels(["Plataforma", "M9", "TMIB", "Prioridade"])
         demand_layout.addWidget(self.demand_table)
+
         demand_btns = QHBoxLayout()
         add_demand = QPushButton("Adicionar demanda")
         add_demand.clicked.connect(self.add_demand_row)
@@ -366,10 +381,22 @@ class VersionEditor(QWidget):
         demand_btns.addWidget(remove_demand)
         demand_btns.addWidget(import_csv)
         demand_layout.addLayout(demand_btns)
-        self.demand_section = CollapsibleSection("Demanda", expanded=True)
-        self.demand_section.add_widget(demand_box)
-        layout.addWidget(self.demand_section)
+        input_splitter.addWidget(demand_box)
 
+        main_splitter.addWidget(input_splitter)
+
+        # --- Output Section ---
+        output_group = QGroupBox("Resultado / Distribuicao")
+        output_layout = QVBoxLayout(output_group)
+        self.output_text.setReadOnly(True)
+        output_layout.addWidget(self.output_text)
+        main_splitter.addWidget(output_group)
+
+        main_splitter.setStretchFactor(0, 2)  # Inputs take more space initially
+        main_splitter.setStretchFactor(1, 1)
+        layout.addWidget(main_splitter)
+
+        # --- Action Buttons (Bottom) ---
         action_row = QHBoxLayout()
         save_btn = QPushButton("Salvar")
         save_btn.clicked.connect(self.save_only)
@@ -385,11 +412,6 @@ class VersionEditor(QWidget):
         action_row.addWidget(self.export_cl_txt_button)
         layout.addLayout(action_row)
 
-        self.output_text.setReadOnly(True)
-        self.output_section = CollapsibleSection("Distribuicao gerada", expanded=True)
-        self.output_section.add_widget(self.output_text)
-        layout.addWidget(self.output_section)
-
     def reset_for_operation(self, default_user: str, op_config: Optional[OperationalConfig]) -> None:
         self.user_edit.setText("")
         self.boats_table.setRowCount(0)
@@ -398,7 +420,6 @@ class VersionEditor(QWidget):
         self.export_program_button.setEnabled(False)
         self.export_cl_txt_button.setEnabled(False)
         self.imported_csv_path = None
-        self.output_section.set_expanded(True)
         if op_config:
             for vessel in op_config.frota:
                 if vessel.ativa:
@@ -426,7 +447,6 @@ class VersionEditor(QWidget):
         for demand in version.demanda:
             self.add_demand_row(demand)
         self.output_text.setPlainText(bundle.distribution_text)
-        self.output_section.set_expanded(True)
         self.export_program_button.setEnabled(bool(bundle.distribution_text.strip()))
         self.export_cl_txt_button.setEnabled(bool(bundle.distribution_text.strip()))
 
@@ -558,7 +578,6 @@ class VersionEditor(QWidget):
             self.imported_csv_path,
         )
         self.output_text.setPlainText(result.distribution_text)
-        self.output_section.set_expanded(True)
         self.export_program_button.setEnabled(bool(result.distribution_text.strip()))
         self.export_cl_txt_button.setEnabled(bool(result.distribution_text.strip()))
         if self.version_name in (VERSION_PROGRAMACAO, VERSION_CL):
@@ -743,6 +762,7 @@ class MainWindow(QMainWindow):
         self.current_op_config: Optional[OperationalConfig] = None
         self._build()
         self.reload_config()
+        self._apply_styles()
 
     def _build(self) -> None:
         self.setWindowTitle("Roteirizador Desktop")
@@ -783,6 +803,89 @@ class MainWindow(QMainWindow):
         splitter.addWidget(right)
         splitter.setStretchFactor(1, 1)
         layout.addWidget(splitter)
+
+    def _apply_styles(self) -> None:
+        # Premium / Modern Style Sheet
+        self.setStyleSheet("""
+            QMainWindow, QWidget {
+                background-color: #f4f6f9;
+                font-family: "Segoe UI", "Helvetica Neue", "Arial", sans-serif;
+                font-size: 9pt;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #dcdcdc;
+                border-radius: 6px;
+                margin-top: 12px;
+                background-color: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 5px;
+                color: #2c3e50;
+            }
+            QPushButton {
+                background-color: #3498db;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #2980b9;
+            }
+            QPushButton:disabled {
+                background-color: #bdc3c7;
+            }
+            QTableWidget {
+                background-color: #ffffff;
+                alternate-background-color: #f9f9f9;
+                gridline-color: #ecf0f1;
+                selection-background-color: #3498db;
+                border: 1px solid #dcdcdc;
+            }
+            QHeaderView::section {
+                background-color: #ecf0f1;
+                padding: 4px;
+                border: 1px solid #dcdcdc;
+                font-weight: bold;
+                color: #2c3e50;
+            }
+            QLineEdit, QTextEdit {
+                border: 1px solid #bdc3c7;
+                border-radius: 4px;
+                padding: 4px;
+                background-color: #ffffff;
+            }
+            QListWidget {
+                border: 1px solid #dcdcdc;
+                background-color: #ffffff;
+            }
+            QListWidget::item {
+                padding: 8px;
+            }
+            QListWidget::item:selected {
+                background-color: #3498db;
+                color: white;
+            }
+            QTabWidget::pane {
+                border: 1px solid #dcdcdc;
+                background-color: #ffffff;
+            }
+            QTabBar::tab {
+                background: #ecf0f1;
+                padding: 8px 16px;
+                margin-right: 2px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }
+            QTabBar::tab:selected {
+                background: #ffffff;
+                border-bottom: 2px solid #3498db;
+            }
+        """)
 
     def reload_config(self) -> None:
         app_config = self.service.load_app_config()
