@@ -188,6 +188,7 @@ class ConfigTab(QWidget):
         self.parent_window = parent_window
         self.fleet_table = AutoAppendTableWidget(0, 5)
         self.gangway_table = AutoAppendTableWidget(0, 1)
+        self.conves_table = AutoAppendTableWidget(0, 1)
         self.storage_label = QLabel()
         self._build()
 
@@ -226,6 +227,22 @@ class ConfigTab(QWidget):
         gangway_layout.addWidget(add_gangway)
         layout.addWidget(gangway_box)
 
+        conves_box = QGroupBox("Embarcacoes de conves")
+        conves_layout = QVBoxLayout(conves_box)
+        self.conves_table.set_append_row_callback(self.add_conves_row)
+        self.conves_table.set_remove_row_callback(self.remove_selected_rows)
+        self.conves_table.setHorizontalHeaderLabels(["Embarcacao"])
+        conves_layout.addWidget(self.conves_table)
+        conves_btns = QHBoxLayout()
+        add_conves = QPushButton("Adicionar embarcacao de conves")
+        add_conves.clicked.connect(self.add_conves_row)
+        remove_conves = QPushButton("Excluir embarcacao selecionada")
+        remove_conves.clicked.connect(lambda: self.remove_selected_rows(self.conves_table))
+        conves_btns.addWidget(add_conves)
+        conves_btns.addWidget(remove_conves)
+        conves_layout.addLayout(conves_btns)
+        layout.addWidget(conves_box)
+
         save_btn = QPushButton("Salvar configuracao")
         save_btn.clicked.connect(self.save_config)
         layout.addWidget(save_btn)
@@ -234,12 +251,15 @@ class ConfigTab(QWidget):
         self.storage_label.setText(app_config.storage_root)
         self.fleet_table.setRowCount(0)
         self.gangway_table.setRowCount(0)
+        self.conves_table.setRowCount(0)
         if not op_config:
             return
         for vessel in op_config.frota:
             self.add_fleet_row(vessel)
         for item in op_config.gangway:
             self.add_gangway_row(item)
+        for item in op_config.embarcacoes_conves:
+            self.add_conves_row(item)
 
     def add_fleet_row(self, vessel: Optional[FleetVessel] = None) -> None:
         row = self.fleet_table.rowCount()
@@ -258,6 +278,11 @@ class ConfigTab(QWidget):
         row = self.gangway_table.rowCount()
         self.gangway_table.insertRow(row)
         self.gangway_table.setItem(row, 0, QTableWidgetItem(value))
+
+    def add_conves_row(self, value: str = "") -> None:
+        row = self.conves_table.rowCount()
+        self.conves_table.insertRow(row)
+        self.conves_table.setItem(row, 0, QTableWidgetItem(value))
 
     def save_config(self) -> None:
         root = self.parent_window.current_root
@@ -280,12 +305,18 @@ class ConfigTab(QWidget):
             for row in range(self.gangway_table.rowCount())
             if self._text(self.gangway_table, row, 0)
         ]
+        embarcacoes_conves = [
+            self._text(self.conves_table, row, 0)
+            for row in range(self.conves_table.rowCount())
+            if self._text(self.conves_table, row, 0)
+        ]
         self.service.save_operational_config(
             root,
             OperationalConfig(
                 frota=vessels,
                 unidades=self.parent_window.current_op_config.unidades if self.parent_window.current_op_config else [],
                 gangway=gangway,
+                embarcacoes_conves=embarcacoes_conves,
             ),
         )
         self.parent_window.reload_config()
@@ -317,8 +348,10 @@ class VersionEditor(QWidget):
         self.boats_table = AutoAppendTableWidget(0, 3)
         self.demand_table = AutoAppendTableWidget(0, 4)
         self.output_text = QTextEdit()
+        self.manual_route_text = QTextEdit()
         self.export_program_button = QPushButton("Exportar planilha de programacao")
         self.export_cl_txt_button = QPushButton("Exportar TXT de distribuicao")
+        self.compare_routes_button = QPushButton("COMPARAR ROTEIROS")
         self.imported_csv_path: Optional[Path] = None
         self._build()
 
@@ -388,8 +421,22 @@ class VersionEditor(QWidget):
         # --- Output Section ---
         output_group = QGroupBox("Resultado / Distribuicao")
         output_layout = QVBoxLayout(output_group)
+        output_splitter = QSplitter(Qt.Horizontal)
+        automatic_group = QGroupBox("Roteiro Automatico")
+        automatic_layout = QVBoxLayout(automatic_group)
         self.output_text.setReadOnly(True)
-        output_layout.addWidget(self.output_text)
+        automatic_layout.addWidget(self.output_text)
+        output_splitter.addWidget(automatic_group)
+        if self.version_name == VERSION_CL:
+            manual_group = QGroupBox("Roteiro Manual")
+            manual_layout = QVBoxLayout(manual_group)
+            manual_layout.addWidget(self.manual_route_text)
+            self.compare_routes_button.clicked.connect(self.compare_routes)
+            manual_layout.addWidget(self.compare_routes_button)
+            output_splitter.addWidget(manual_group)
+            output_splitter.setStretchFactor(0, 1)
+            output_splitter.setStretchFactor(1, 1)
+        output_layout.addWidget(output_splitter)
         main_splitter.addWidget(output_group)
 
         main_splitter.setStretchFactor(0, 2)  # Inputs take more space initially
@@ -417,6 +464,7 @@ class VersionEditor(QWidget):
         self.boats_table.setRowCount(0)
         self.demand_table.setRowCount(0)
         self.output_text.clear()
+        self.manual_route_text.clear()
         self.export_program_button.setEnabled(False)
         self.export_cl_txt_button.setEnabled(False)
         self.imported_csv_path = None
@@ -584,6 +632,103 @@ class VersionEditor(QWidget):
             self._offer_program_sheet_export(result.distribution_text)
         self.parent_window.reload_operations(select_operation_id=self.parent_window.current_operation.operacao_id)
         self.parent_window.refresh_operation()
+
+    def compare_routes(self) -> None:
+        automatic_distribution = self.output_text.toPlainText().strip()
+        manual_distribution = self.manual_route_text.toPlainText().strip()
+        if not automatic_distribution:
+            QMessageBox.warning(
+                self,
+                "Comparar roteiros",
+                "Gere ou carregue uma distribuicao automatica antes de comparar.",
+            )
+            return
+        if not manual_distribution:
+            QMessageBox.warning(
+                self,
+                "Comparar roteiros",
+                "Preencha o roteiro manual antes de comparar.",
+            )
+            return
+        try:
+            result = self.service.compare_automatic_vs_manual_routes(
+                self.parent_window.current_root,
+                automatic_distribution,
+                manual_distribution,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Comparar roteiros", str(exc))
+            return
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Comparar roteiros",
+                f"Nao foi possivel comparar os roteiros:\n{exc}",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Comparacao de Roteiros")
+        dialog.resize(900, 650)
+        layout = QVBoxLayout(dialog)
+        viewer = QTextEdit()
+        viewer.setReadOnly(True)
+        viewer.setHtml(self._build_route_comparison_html(result))
+        layout.addWidget(viewer)
+        dialog.exec()
+
+    @staticmethod
+    def _build_route_comparison_html(result: dict) -> str:
+        distance_rows = (
+            "<tr>"
+            "<td>Distancia total percorrida (NM)</td>"
+            f"<td>{result['automatic_total_distance_nm']}</td>"
+            f"<td>{result['manual_total_distance_nm']}</td>"
+            "</tr>"
+        )
+        platform_rows = "".join(
+            [
+                "<tr>"
+                f"<td>{row['platform']}</td>"
+                f"<td>{row['automatic_arrival']}</td>"
+                f"<td>{row['manual_arrival']}</td>"
+                "</tr>"
+                for row in result["platform_rows"]
+            ]
+        )
+        return f"""
+        <html>
+        <head>
+        <style>
+        body {{ font-family: Segoe UI, Arial, sans-serif; color: #1f2937; margin: 10px; }}
+        h2 {{ margin: 18px 0 8px; font-size: 18px; color: #0f172a; }}
+        table {{ border-collapse: collapse; width: 100%; margin: 8px 0 18px; table-layout: fixed; }}
+        th {{ background: #e2e8f0; color: #0f172a; font-weight: 600; text-align: left; }}
+        th, td {{ border: 1px solid #cbd5e1; padding: 8px 10px; vertical-align: top; font-size: 12px; word-wrap: break-word; }}
+        </style>
+        </head>
+        <body>
+        <h2>Resumo</h2>
+        <table>
+        <thead>
+        <tr><th>INDICADOR</th><th>AUTOMATICO</th><th>MANUAL</th></tr>
+        </thead>
+        <tbody>
+        {distance_rows}
+        </tbody>
+        </table>
+        <h2>Horario de chegada por plataforma</h2>
+        <table>
+        <thead>
+        <tr><th>PLATAFORMA</th><th>AUTOMATICO</th><th>MANUAL</th></tr>
+        </thead>
+        <tbody>
+        {platform_rows}
+        </tbody>
+        </table>
+        </body>
+        </html>
+        """
 
     def export_program_sheet(self) -> None:
         distribution_text = self.output_text.toPlainText().strip()

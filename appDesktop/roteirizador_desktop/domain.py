@@ -127,6 +127,7 @@ class OperationalConfig:
     frota: List[FleetVessel]
     unidades: List[str]
     gangway: List[str]
+    embarcacoes_conves: List[str]
 
     def vessel_map(self) -> Dict[str, FleetVessel]:
         return {item.nome: item for item in self.frota}

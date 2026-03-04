@@ -27,6 +27,7 @@ from .solver_integration import (
     import_demands_from_csv,
     parse_distribution_text,
     run_solver,
+    summarize_distribution_for_compare,
 )
 from .storage import LocalConfigStore, NetworkStorage
 from .solver_integration import analyze_distribution
@@ -95,15 +96,33 @@ class AppService:
                 }
             )
             storage.save_json_config("unidades.json", {"version": 1, "unidades": units})
+        if not storage.config_path("embarcacoes_conves.json").exists():
+            storage.save_json_config(
+                "embarcacoes_conves.json",
+                {
+                    "version": 1,
+                    "embarcacoes_conves": [
+                        "BARU TAURUS",
+                        "C-ITACURUCA",
+                        "COSTA OCEANICA",
+                    ],
+                },
+            )
+
     def load_operational_config(self, root: str) -> OperationalConfig:
         storage = self.network_storage(root)
         frota = storage.load_json_config("frota.json")
         unidades = storage.load_json_config("unidades.json")
         gangway = storage.load_json_config("gangway.json")
+        conves = storage.load_json_config("embarcacoes_conves.json")
         return OperationalConfig(
             frota=[FleetVessel(**item) for item in frota.get("embarcacoes", [])],
             unidades=unidades.get("unidades", []),
             gangway=gangway.get("plataformas_gangway", []),
+            embarcacoes_conves=conves.get(
+                "embarcacoes_conves",
+                ["BARU TAURUS", "C-ITACURUCA", "COSTA OCEANICA"],
+            ),
         )
 
     def save_operational_config(self, root: str, config: OperationalConfig) -> None:
@@ -115,6 +134,10 @@ class AppService:
         storage.save_json_config("unidades.json", {"version": 1, "unidades": config.unidades})
         storage.save_json_config(
             "gangway.json", {"version": 1, "plataformas_gangway": config.gangway}
+        )
+        storage.save_json_config(
+            "embarcacoes_conves.json",
+            {"version": 1, "embarcacoes_conves": config.embarcacoes_conves},
         )
 
     def create_operation(self, root: str, operation_date: str) -> OperationMetadata:
@@ -239,6 +262,7 @@ class AppService:
             config=op_config,
             distances_path=str(storage.config_path("distancias.json")),
             output_path=output_path,
+            embarcacoes_conves=op_config.embarcacoes_conves,
         )
 
     def export_cl_distribution_txt(
@@ -301,6 +325,90 @@ class AppService:
         lines.append("")
         return "\n".join(lines)
 
+    def compare_automatic_vs_manual_routes(
+        self,
+        root: str,
+        automatic_distribution_text: str,
+        manual_distribution_text: str,
+    ) -> Dict[str, Any]:
+        op_config = self.load_operational_config(root)
+        storage = self.network_storage(root)
+        distances_path = str(storage.config_path("distancias.json"))
+        normalized_manual_text = self._normalize_manual_distribution_for_compare(
+            automatic_distribution_text,
+            manual_distribution_text,
+        )
+        automatic = summarize_distribution_for_compare(
+            automatic_distribution_text,
+            op_config,
+            distances_path,
+        )
+        manual = summarize_distribution_for_compare(
+            normalized_manual_text,
+            op_config,
+            distances_path,
+        )
+        if automatic["demand"] != manual["demand"]:
+            raise ValueError("Para rodar a comparação as demandas de pax devem ser iguais")
+
+        platforms = sorted(set(automatic["arrivals"]) | set(manual["arrivals"]))
+        return {
+            "automatic_total_distance_nm": automatic["total_distance_nm"],
+            "manual_total_distance_nm": manual["total_distance_nm"],
+            "platform_rows": [
+                {
+                    "platform": platform,
+                    "automatic_arrival": automatic["arrivals"].get(platform, "-"),
+                    "manual_arrival": manual["arrivals"].get(platform, "-"),
+                }
+                for platform in platforms
+            ],
+        }
+
+    @staticmethod
+    def _normalize_manual_distribution_for_compare(
+        automatic_distribution_text: str,
+        manual_distribution_text: str,
+    ) -> str:
+        auto_routes = parse_distribution_text(automatic_distribution_text)
+        manual_routes = parse_distribution_text(manual_distribution_text)
+        if manual_routes:
+            return manual_distribution_text
+        if not auto_routes:
+            return manual_distribution_text
+
+        departure_by_boat = {boat_name.strip().upper(): departure for boat_name, departure, _ in auto_routes}
+        boat_names = sorted(departure_by_boat.keys(), key=len, reverse=True)
+        normalized_lines: List[str] = []
+        changed = False
+        for raw_line in manual_distribution_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            upper_line = line.upper()
+            matched_boat = None
+            for boat_name in boat_names:
+                prefix = f"{boat_name} "
+                if upper_line == boat_name or upper_line.startswith(prefix):
+                    matched_boat = boat_name
+                    break
+            if not matched_boat:
+                normalized_lines.append(line)
+                continue
+            departure = departure_by_boat.get(matched_boat)
+            if not departure:
+                normalized_lines.append(line)
+                continue
+            route_part = line[len(matched_boat):].strip()
+            if not route_part:
+                normalized_lines.append(line)
+                continue
+            normalized_lines.append(f"{matched_boat}  {departure}  {route_part}")
+            changed = True
+        if not changed:
+            return manual_distribution_text
+        return "\n".join(normalized_lines) + "\n"
+
     @staticmethod
     def _format_demand_table(version: OperationVersion) -> str:
         header = f"{'PLATAFORMA':<14} {'M9':>6} {'TMIB':>6} {'PRIO':>6}"
@@ -327,9 +435,14 @@ class AppService:
             if not parts:
                 continue
             boat_label = self._short_boat_name(boat_name)
-            tmib_route = self._build_tmib_route(parts)
-            if tmib_route:
-                tmib_lines.append(f"{boat_label} {departure} {tmib_route}")
+            for tmib_departure, tmib_route in self._build_tmib_departures(
+                boat_name,
+                departure,
+                parts,
+                vessel_map,
+                distances,
+            ):
+                tmib_lines.append(f"{boat_label} {tmib_departure} {tmib_route}")
             m9_route = self._build_m9_route(parts)
             if m9_route:
                 departure_m9 = self._compute_m9_departure_time(
@@ -383,6 +496,41 @@ class AppService:
                 segments.append(" ".join(tokens))
         return "/".join(segments)
 
+    def _build_tmib_departures(
+        self,
+        boat_name: str,
+        departure: str,
+        parts: List[dict],
+        vessel_map: dict,
+        distances: dict,
+    ) -> List[tuple[str, str]]:
+        tmib_departures: List[tuple[str, str]] = []
+        if not parts:
+            return tmib_departures
+
+        primary_route = self._build_tmib_route(parts)
+        if primary_route:
+            tmib_departures.append((departure, primary_route))
+
+        for idx, part in enumerate(parts[1:], start=1):
+            if part["platform"] != "TMIB" or part["pickup"] <= 0:
+                continue
+            route = self._build_tmib_route(parts[idx:])
+            if not route:
+                continue
+            departure_tmib = self._compute_part_departure_time(
+                boat_name,
+                departure,
+                parts,
+                idx,
+                vessel_map,
+                distances,
+            )
+            if departure_tmib:
+                tmib_departures.append((departure_tmib, route))
+
+        return tmib_departures
+
     @staticmethod
     def _build_m9_route(parts: List[dict]) -> str:
         seen_m9 = False
@@ -408,17 +556,42 @@ class AppService:
         vessel_map: dict,
         distances: dict,
     ) -> Optional[str]:
+        return AppService._compute_part_departure_time(
+            boat_name,
+            departure,
+            parts,
+            next((idx for idx, part in enumerate(parts) if part["platform"] == "M9"), -1),
+            vessel_map,
+            distances,
+            require_pickup=True,
+        )
+
+    @staticmethod
+    def _compute_part_departure_time(
+        boat_name: str,
+        departure: str,
+        parts: List[dict],
+        target_index: int,
+        vessel_map: dict,
+        distances: dict,
+        require_pickup: bool = False,
+    ) -> Optional[str]:
         if not parts:
+            return None
+        if target_index < 0 or target_index >= len(parts):
             return None
         hour, minute = departure.split(":", 1)
         current_time = int(hour) * 60 + int(minute)
         current_pos = parts[0]["platform"]
-        if current_pos == "M9":
+        target_part = parts[target_index]
+        if current_pos == target_part["platform"] and target_index == 0:
+            if require_pickup and target_part["pickup"] <= 0:
+                return None
             return departure
         vessel = vessel_map.get(boat_name)
         speed = float(vessel.velocidade) if vessel else 14.0
         is_aqua = bool(vessel and vessel.tipo.lower() == "aqua")
-        for part in parts[1:]:
+        for idx, part in enumerate(parts[1:], start=1):
             platform = part["platform"]
             dist = solver.get_dist(distances, solver.norm_plat(current_pos), solver.norm_plat(platform))
             current_time += solver.travel_time_minutes(dist, speed)
@@ -426,7 +599,9 @@ class AppService:
                 current_time += solver.AQUA_APPROACH_TIME
             op_minutes = int(part["pickup"]) + int(part["tmib_drop"]) + int(part["m9_drop"])
             current_time += op_minutes
-            if platform == "M9":
+            if idx == target_index:
+                if require_pickup and int(part["pickup"]) <= 0:
+                    return None
                 return f"{current_time // 60:02d}:{current_time % 60:02d}"
             current_pos = platform
         return None

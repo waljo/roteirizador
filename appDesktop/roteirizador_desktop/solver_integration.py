@@ -6,7 +6,7 @@ import unicodedata
 from io import StringIO
 import importlib.util
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import solver
 from openpyxl import Workbook
@@ -350,11 +350,67 @@ def analyze_distribution(
     return {"boats": by_boat, "units": per_unit}
 
 
+def summarize_distribution_for_compare(
+    distribution_text: str,
+    config: OperationalConfig,
+    distances_path: str,
+) -> Dict[str, Any]:
+    distances = solver.load_distances(distances_path)
+    vessel_map = config.vessel_map()
+    routes = parse_distribution_text(distribution_text)
+    demand: Dict[str, Dict[str, int]] = {}
+    last_delivery: Dict[str, int] = {}
+    total_distance = 0.0
+
+    for boat_name, departure, route_str in routes:
+        vessel = vessel_map.get(boat_name)
+        if vessel is None:
+            continue
+        boat = solver.Boat(
+            name=boat_name,
+            available=True,
+            departure=departure,
+            speed=float(vessel.velocidade),
+            max_capacity=int(vessel.capacidade),
+        )
+        route_last, _ = _simulate_route_times(boat, route_str, distances)
+        total_distance += route_distance(route_str, distances)
+        for plat_norm, value in route_last.items():
+            if value > last_delivery.get(plat_norm, -1):
+                last_delivery[plat_norm] = value
+
+        for part in route_str.split("/"):
+            tokens = part.split()
+            if not tokens:
+                continue
+            platform = solver.short_plat(solver.norm_plat(tokens[0]))
+            demand.setdefault(platform, {"tmib": 0, "m9": 0})
+            for token in tokens[1:]:
+                if token.startswith("(-") and token.endswith(")") and token[2:-1].isdigit():
+                    demand[platform]["m9"] += int(token[2:-1])
+                elif token.startswith("-") and token[1:].isdigit():
+                    demand[platform]["tmib"] += int(token[1:])
+
+    return {
+        "total_distance_nm": round(total_distance, 3),
+        "demand": {
+            platform: values
+            for platform, values in demand.items()
+            if values["tmib"] or values["m9"]
+        },
+        "arrivals": {
+            solver.short_plat(plat_norm): f"{minutes // 60:02d}:{minutes % 60:02d}"
+            for plat_norm, minutes in last_delivery.items()
+        },
+    }
+
+
 def export_programacao_planilha(
     distribution_text: str,
     config: OperationalConfig,
     distances_path: str,
     output_path: Path,
+    embarcacoes_conves: Optional[List[str]] = None,
 ) -> Path:
     mod = _load_criar_tabela6_module()
     dist = mod.load_distances_json(distances_path)
@@ -398,7 +454,11 @@ def export_programacao_planilha(
             rows=rows,
         )
 
-    row_ptr = mod.write_extra_vessels_and_observations(ws, row_ptr)
+    row_ptr = mod.write_extra_vessels_and_observations(
+        ws,
+        row_ptr,
+        embarcacoes_conves=embarcacoes_conves,
+    )
     mod.set_column_widths(ws)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)

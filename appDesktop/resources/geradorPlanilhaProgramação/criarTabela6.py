@@ -884,7 +884,7 @@ def safe_save(wb: Workbook, filename: str) -> str:
         return alt
 
 
-def write_extra_vessels_and_observations(ws, start_row: int) -> int:
+def write_extra_vessels_and_observations(ws, start_row: int, embarcacoes_conves: Optional[List[str]] = None) -> int:
     """Write the three extra vessel lines and observation section."""
     thin = Side(style="thin", color="4F4F4F")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -893,7 +893,7 @@ def write_extra_vessels_and_observations(ws, start_row: int) -> int:
     r = start_row
 
     # Three formatted lines with vessels in red/bold, merge C to L
-    extra_vessels = ["BARU TAURUS", "C-ITACURUÇÁ", "COSTA OCEÂNICA"]
+    extra_vessels = list(embarcacoes_conves or ["BARU TAURUS", "C-ITACURUÇÁ", "COSTA OCEÂNICA"])
     for vessel in extra_vessels:
         # Vessel cell in column B
         vessel_cell = ws.cell(row=r, column=2, value=vessel)
