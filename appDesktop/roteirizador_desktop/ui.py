@@ -43,6 +43,7 @@ try:
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
+        QComboBox,
         QFileDialog,
         QFormLayout,
         QGridLayout,
@@ -55,6 +56,7 @@ try:
         QMainWindow,
         QMessageBox,
         QPushButton,
+        QSizePolicy,
         QDialog,
         QSplitter,
         QTableWidget,
@@ -76,6 +78,7 @@ except ImportError as exc:  # pragma: no cover
     Qt = _QtFallback()
     QApplication = None
     QCheckBox = object
+    QComboBox = object
     QFileDialog = object
     QFormLayout = object
     QGridLayout = object
@@ -88,6 +91,7 @@ except ImportError as exc:  # pragma: no cover
     QMainWindow = object
     QMessageBox = object
     QPushButton = object
+    QSizePolicy = object
     QDialog = object
     QSplitter = object
     QTableWidget = object
@@ -132,6 +136,45 @@ class AutoAppendTableWidget(QTableWidget):
             self._remove_row_callback(self)
             return
         super().keyPressEvent(event)
+
+
+class CollapsibleSection(QWidget):
+    def __init__(self, title: str, expanded: bool = True, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.toggle_button = QPushButton()
+        self.toggle_button.setCheckable(True)
+        self.toggle_button.setChecked(expanded)
+        self.toggle_button.clicked.connect(self._apply_state)
+        self.content = QWidget()
+        self.content_layout = QVBoxLayout(self.content)
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self.toggle_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        layout.addWidget(self.toggle_button)
+        layout.addWidget(self.content)
+
+        self._title = title
+        self._apply_state()
+
+    def add_widget(self, widget: QWidget) -> None:
+        self.content_layout.addWidget(widget)
+
+    def add_layout(self, layout) -> None:
+        self.content_layout.addLayout(layout)
+
+    def set_expanded(self, expanded: bool) -> None:
+        self.toggle_button.setChecked(expanded)
+        self._apply_state()
+
+    def _apply_state(self) -> None:
+        expanded = self.toggle_button.isChecked()
+        marker = "▼" if expanded else "▶"
+        self.toggle_button.setText(f"{marker} {self._title}")
+        self.content.setVisible(expanded)
 
 
 class ConfigTab(QWidget):
@@ -302,7 +345,9 @@ class VersionEditor(QWidget):
         boats_btns.addWidget(add_boat)
         boats_btns.addWidget(remove_boat)
         boats_layout.addLayout(boats_btns)
-        layout.addWidget(boats_box)
+        self.boats_section = CollapsibleSection("Embarcacoes disponiveis", expanded=True)
+        self.boats_section.add_widget(boats_box)
+        layout.addWidget(self.boats_section)
 
         demand_box = QGroupBox("Demanda")
         demand_layout = QVBoxLayout(demand_box)
@@ -321,7 +366,9 @@ class VersionEditor(QWidget):
         demand_btns.addWidget(remove_demand)
         demand_btns.addWidget(import_csv)
         demand_layout.addLayout(demand_btns)
-        layout.addWidget(demand_box)
+        self.demand_section = CollapsibleSection("Demanda", expanded=True)
+        self.demand_section.add_widget(demand_box)
+        layout.addWidget(self.demand_section)
 
         action_row = QHBoxLayout()
         save_btn = QPushButton("Salvar")
@@ -339,7 +386,9 @@ class VersionEditor(QWidget):
         layout.addLayout(action_row)
 
         self.output_text.setReadOnly(True)
-        layout.addWidget(self.output_text)
+        self.output_section = CollapsibleSection("Distribuicao gerada", expanded=True)
+        self.output_section.add_widget(self.output_text)
+        layout.addWidget(self.output_section)
 
     def reset_for_operation(self, default_user: str, op_config: Optional[OperationalConfig]) -> None:
         self.user_edit.setText("")
@@ -349,6 +398,7 @@ class VersionEditor(QWidget):
         self.export_program_button.setEnabled(False)
         self.export_cl_txt_button.setEnabled(False)
         self.imported_csv_path = None
+        self.output_section.set_expanded(True)
         if op_config:
             for vessel in op_config.frota:
                 if vessel.ativa:
@@ -376,19 +426,19 @@ class VersionEditor(QWidget):
         for demand in version.demanda:
             self.add_demand_row(demand)
         self.output_text.setPlainText(bundle.distribution_text)
+        self.output_section.set_expanded(True)
         self.export_program_button.setEnabled(bool(bundle.distribution_text.strip()))
         self.export_cl_txt_button.setEnabled(bool(bundle.distribution_text.strip()))
 
     def add_boat_row(self, boat: Optional[AvailableBoat] = None) -> None:
         row = self.boats_table.rowCount()
         self.boats_table.insertRow(row)
-        values = [
-            boat.nome if boat else "",
-            boat.hora_saida if boat else "",
-            boat.rota_fixa if boat else "",
-        ]
-        for col, value in enumerate(values):
-            self.boats_table.setItem(row, col, QTableWidgetItem(value))
+        boat_name = boat.nome if boat else self._select_vessel_name()
+        if boat is None and not boat_name:
+            return
+        self.boats_table.setItem(row, 0, QTableWidgetItem(boat_name))
+        self.boats_table.setItem(row, 1, QTableWidgetItem(boat.hora_saida if boat else ""))
+        self.boats_table.setItem(row, 2, QTableWidgetItem(boat.rota_fixa if boat else ""))
 
     def add_demand_row(self, demand: Optional[DemandItem] = None) -> None:
         row = self.demand_table.rowCount()
@@ -508,6 +558,7 @@ class VersionEditor(QWidget):
             self.imported_csv_path,
         )
         self.output_text.setPlainText(result.distribution_text)
+        self.output_section.set_expanded(True)
         self.export_program_button.setEnabled(bool(result.distribution_text.strip()))
         self.export_cl_txt_button.setEnabled(bool(result.distribution_text.strip()))
         if self.version_name in (VERSION_PROGRAMACAO, VERSION_CL):
@@ -628,6 +679,33 @@ class VersionEditor(QWidget):
             return f"{self.version_name}_distribuicao.txt"
         date_token = operation.data_operacao.replace("-", "_")
         return f"{date_token}_{operation.operacao_id}_{self.version_name}_distribuicao.txt"
+
+    def _available_vessel_names(self) -> List[str]:
+        op_config = self.parent_window.current_op_config
+        if not op_config:
+            return []
+        return [vessel.nome for vessel in op_config.frota if vessel.ativa]
+
+    def _select_vessel_name(self) -> str:
+        vessel_names = self._available_vessel_names()
+        if not vessel_names:
+            QMessageBox.warning(
+                self,
+                "Embarcacoes",
+                "Nao ha embarcacoes ativas cadastradas na configuracao.",
+            )
+            return ""
+        selected, ok = QInputDialog.getItem(
+            self,
+            "Selecionar embarcacao",
+            "Embarcacao:",
+            vessel_names,
+            0,
+            False,
+        )
+        if not ok:
+            return ""
+        return str(selected).strip()
 
     @staticmethod
     def _text(table: QTableWidget, row: int, col: int) -> str:

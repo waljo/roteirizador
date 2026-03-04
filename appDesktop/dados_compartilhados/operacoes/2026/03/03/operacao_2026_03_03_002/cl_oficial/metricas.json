@@ -1,0 +1,16 @@
+{
+  "boats_used": 3,
+  "total_tmib": 71,
+  "total_m9": 40,
+  "total_distance_nm": 58.707,
+  "service_minutes_complete": 3915,
+  "service_minutes_partial": 3915,
+  "platforms_complete": 9,
+  "platforms_total": 10,
+  "missing": {
+    "TMIB": {
+      "tmib": 0,
+      "m9": 1
+    }
+  }
+}

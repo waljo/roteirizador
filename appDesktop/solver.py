@@ -639,9 +639,6 @@ def parse_fixed_route(route_str: str) -> Dict[str, Dict[str, int]]:
         platform = tokens[0]
         platform_norm = norm_plat(platform)
 
-        if platform_norm == 'TMIB':
-            continue
-
         tmib_drop = 0
         m9_drop = 0
 
