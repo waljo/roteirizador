@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 import re
@@ -410,9 +411,12 @@ class VersionEditor(QWidget):
         remove_demand.clicked.connect(lambda: self.remove_selected_rows(self.demand_table))
         import_csv = QPushButton("Importar CSV")
         import_csv.clicked.connect(self.import_csv)
+        export_csv = QPushButton("Exportar CSV")
+        export_csv.clicked.connect(self.export_csv)
         demand_btns.addWidget(add_demand)
         demand_btns.addWidget(remove_demand)
         demand_btns.addWidget(import_csv)
+        demand_btns.addWidget(export_csv)
         demand_layout.addLayout(demand_btns)
         input_splitter.addWidget(demand_box)
 
@@ -590,6 +594,58 @@ class VersionEditor(QWidget):
         self.demand_table.setRowCount(0)
         for item in demands:
             self.add_demand_row(item)
+
+    def export_csv(self) -> None:
+        rows = []
+        for row in range(self.demand_table.rowCount()):
+            plataforma = self._text(self.demand_table, row, 0)
+            if not plataforma:
+                continue
+            rows.append(
+                {
+                    "PLATAFORMA": plataforma,
+                    "M9": self._text(self.demand_table, row, 1) or "0",
+                    "TMIB": self._text(self.demand_table, row, 2) or "0",
+                    "PRIORIDADE": self._text(self.demand_table, row, 3) or "0",
+                }
+            )
+        if not rows:
+            QMessageBox.warning(
+                self,
+                "Exportar CSV",
+                "Nao ha demanda preenchida para exportar.",
+            )
+            return
+
+        if self.parent_window.current_operation:
+            default_name = f"{self.parent_window.current_operation.operacao_id}_{self.version_name}_demanda.csv"
+        else:
+            default_name = f"{self.version_name}_demanda.csv"
+
+        file_name, _ = QFileDialog.getSaveFileName(
+            self,
+            "Salvar demanda em CSV",
+            default_name,
+            "CSV (*.csv)",
+        )
+        if not file_name:
+            return
+
+        output_path = Path(file_name)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=["PLATAFORMA", "M9", "TMIB", "PRIORIDADE"],
+                delimiter=";",
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+        QMessageBox.information(
+            self,
+            "Exportar CSV",
+            f"Demanda exportada para:\n{output_path}",
+        )
 
     def save_only(self) -> None:
         if not self.parent_window.current_operation:
