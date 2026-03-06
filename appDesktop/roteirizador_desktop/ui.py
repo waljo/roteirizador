@@ -39,6 +39,29 @@ Lancha pega 22 no TMIB -> M10 deixa 5 -> M9 deixa 7 e pega 4 p/ B2 -> M6 deixa 4
 Rota: TMIB +22/M10 -5/M9 -7 +4/M6 -4 {B1:+1}/B2 -4 (-4)/B1 -2 {M6:-1}
 """
 
+DEMAND_HELP_TEXT = """DICA DE PREENCHIMENTO DA DEMANDA
+
+Apos importar a demanda, revise os dados antes de gerar a distribuicao.
+
+Ajustes obrigatorios apos importacao:
+- Padronize plataformas com sufixo de turno.
+  Ex.: PGA3 (D) e PGA3 (N) devem ser ajustadas para PGA3.
+- Remova a linha SPH-02 da tabela de demanda.
+  Esse atendimento deve ser lancado como rota fixa.
+  Ao cadastrar a rota fixa, use M6 (nao SPH-02).
+
+Importante sobre o escopo do roteirizador:
+- O roteirizador otimiza principalmente a demanda de saida de passageiros do TMIB.
+- Rotas Fixas com saida ate 15:00 abatem da demanda automaticamente.
+- Rotas Fixas com saida apos 15:00 nao abatem da demanda (apenas aparecem na distribuicao).
+
+Exemplos de Rotas Fixas:
+- Operacao iniciando as 05:10 em M6 (troca de turma da sonda e embarque em M10) abate da demanda.
+- Operacao iniciando as 17:00 em M9 (troca de turma da sonda) nao abate da demanda.
+
+Em caso de duvida, verifique operacoes de dias anteriores.
+"""
+
 try:
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import (
@@ -74,6 +97,7 @@ except ImportError as exc:  # pragma: no cover
         Key_Return = 0
         Key_Enter = 0
         Key_Delete = 0
+        Key_Backspace = 0
         UserRole = 0
         Vertical = 0
 
@@ -114,6 +138,7 @@ class AutoAppendTableWidget(QTableWidget):
         super().__init__(rows, cols, parent)
         self._append_row_callback = None
         self._remove_row_callback = None
+        self._block_delete_backspace = False
         if hasattr(self.horizontalHeader(), "setSectionResizeMode"):
             self.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
 
@@ -122,6 +147,9 @@ class AutoAppendTableWidget(QTableWidget):
 
     def set_remove_row_callback(self, callback) -> None:
         self._remove_row_callback = callback
+
+    def set_block_delete_backspace(self, enabled: bool) -> None:
+        self._block_delete_backspace = bool(enabled)
 
     def keyPressEvent(self, event) -> None:
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
@@ -137,9 +165,14 @@ class AutoAppendTableWidget(QTableWidget):
             if item is not None:
                 self.editItem(item)
             return
-        if event.key() == Qt.Key_Delete and self._remove_row_callback is not None:
-            self._remove_row_callback(self)
-            return
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            if self._block_delete_backspace:
+                # Bloqueia remocao por teclado, mas preserva a edicao normal da celula.
+                super().keyPressEvent(event)
+                return
+            if self._remove_row_callback is not None:
+                self._remove_row_callback(self)
+                return
         super().keyPressEvent(event)
 
 
@@ -182,6 +215,204 @@ class CollapsibleSection(QWidget):
         self.content.setVisible(expanded)
 
 
+class RouteBuilderDialog(QDialog):
+    def __init__(self, boat_name: str, initial_route: str = "", parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.boat_name = boat_name
+        self._updating_preview = False
+        self.route_table = AutoAppendTableWidget(0, 8)
+        self.preview_edit = QTextEdit()
+        self.route_text = initial_route.strip()
+        self.setWindowTitle(f"Editor de Rota Fixa - {boat_name}")
+        self.resize(980, 520)
+        self._build()
+        self._load_initial_route(initial_route)
+        self._update_preview()
+
+    def _build(self) -> None:
+        layout = QVBoxLayout(self)
+
+        title = QLabel(
+            "Preencha as paradas da rota. O texto da sintaxe sera gerado automaticamente."
+        )
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
+        self.route_table.setHorizontalHeaderLabels(
+            [
+                "Plataforma",
+                "Embarque +",
+                "Desemb. TMIB -",
+                "Desemb. M9 (-)",
+                "Transb. + Destino",
+                "Qtd +",
+                "Transb. - Origem",
+                "Qtd -",
+            ]
+        )
+        self.route_table.set_append_row_callback(self.add_stop_row)
+        layout.addWidget(self.route_table)
+
+        row_actions = QHBoxLayout()
+        add_btn = QPushButton("Adicionar parada")
+        add_btn.clicked.connect(self.add_stop_row)
+        remove_btn = QPushButton("Excluir parada selecionada")
+        remove_btn.clicked.connect(self._remove_selected_rows)
+        row_actions.addWidget(add_btn)
+        row_actions.addWidget(remove_btn)
+        layout.addLayout(row_actions)
+
+        layout.addWidget(QLabel("Rota gerada:"))
+        self.preview_edit.setReadOnly(True)
+        self.preview_edit.setMaximumHeight(90)
+        layout.addWidget(self.preview_edit)
+
+        actions = QHBoxLayout()
+        cancel_btn = QPushButton("Cancelar")
+        cancel_btn.clicked.connect(self.reject)
+        apply_btn = QPushButton("Aplicar")
+        apply_btn.clicked.connect(self._apply)
+        actions.addStretch(1)
+        actions.addWidget(cancel_btn)
+        actions.addWidget(apply_btn)
+        layout.addLayout(actions)
+
+        self.route_table.itemChanged.connect(lambda _item: self._update_preview())
+
+    def _load_initial_route(self, route_text: str) -> None:
+        self.route_table.setRowCount(0)
+        parsed_rows = self._parse_route(route_text)
+        if not parsed_rows:
+            self.add_stop_row()
+            return
+        for row_data in parsed_rows:
+            self.add_stop_row(row_data)
+
+    @staticmethod
+    def _parse_route(route_text: str) -> List[dict]:
+        if not route_text.strip():
+            return []
+        rows: List[dict] = []
+        for raw_part in route_text.split("/"):
+            part = raw_part.strip()
+            if not part:
+                continue
+            tokens = part.split()
+            if not tokens:
+                continue
+            row = {
+                "platform": tokens[0],
+                "pickup": "0",
+                "drop_tmib": "0",
+                "drop_m9": "0",
+                "plus_dest": "",
+                "plus_qty": "0",
+                "minus_origin": "",
+                "minus_qty": "0",
+            }
+            for token in tokens[1:]:
+                if token.startswith("+") and token[1:].isdigit():
+                    row["pickup"] = token[1:]
+                elif token.startswith("(-") and token.endswith(")") and token[2:-1].isdigit():
+                    row["drop_m9"] = token[2:-1]
+                elif token.startswith("-") and token[1:].isdigit():
+                    row["drop_tmib"] = token[1:]
+                else:
+                    trans_plus = re.fullmatch(r"\{([^:{}]+):\+(\d+)\}", token)
+                    if trans_plus:
+                        row["plus_dest"] = trans_plus.group(1)
+                        row["plus_qty"] = trans_plus.group(2)
+                        continue
+                    trans_minus = re.fullmatch(r"\{([^:{}]+):-(\d+)\}", token)
+                    if trans_minus:
+                        row["minus_origin"] = trans_minus.group(1)
+                        row["minus_qty"] = trans_minus.group(2)
+            rows.append(row)
+        return rows
+
+    def add_stop_row(self, row_data: Optional[dict] = None) -> None:
+        row = self.route_table.rowCount()
+        self.route_table.insertRow(row)
+        data = row_data or {}
+        values = [
+            data.get("platform", ""),
+            data.get("pickup", "0"),
+            data.get("drop_tmib", "0"),
+            data.get("drop_m9", "0"),
+            data.get("plus_dest", ""),
+            data.get("plus_qty", "0"),
+            data.get("minus_origin", ""),
+            data.get("minus_qty", "0"),
+        ]
+        for col, value in enumerate(values):
+            self.route_table.setItem(row, col, QTableWidgetItem(str(value)))
+        self._update_preview()
+
+    def _remove_selected_rows(self) -> None:
+        selected_rows = sorted({index.row() for index in self.route_table.selectedIndexes()}, reverse=True)
+        if not selected_rows and self.route_table.currentRow() >= 0:
+            selected_rows = [self.route_table.currentRow()]
+        for row in selected_rows:
+            self.route_table.removeRow(row)
+        if self.route_table.rowCount() == 0:
+            self.add_stop_row()
+        self._update_preview()
+
+    @staticmethod
+    def _to_int_token(value: str) -> int:
+        text = (value or "").strip()
+        if not text:
+            return 0
+        if text.isdigit():
+            return int(text)
+        return 0
+
+    def _build_route_text(self) -> str:
+        parts: List[str] = []
+        for row in range(self.route_table.rowCount()):
+            platform = self._text(row, 0).upper()
+            if not platform:
+                continue
+            pickup = self._to_int_token(self._text(row, 1))
+            drop_tmib = self._to_int_token(self._text(row, 2))
+            drop_m9 = self._to_int_token(self._text(row, 3))
+            plus_dest = self._text(row, 4).upper()
+            plus_qty = self._to_int_token(self._text(row, 5))
+            minus_origin = self._text(row, 6).upper()
+            minus_qty = self._to_int_token(self._text(row, 7))
+
+            tokens = [platform]
+            if pickup > 0:
+                tokens.append(f"+{pickup}")
+            if drop_tmib > 0:
+                tokens.append(f"-{drop_tmib}")
+            if drop_m9 > 0:
+                tokens.append(f"(-{drop_m9})")
+            if plus_dest and plus_qty > 0:
+                tokens.append(f"{{{plus_dest}:+{plus_qty}}}")
+            if minus_origin and minus_qty > 0:
+                tokens.append(f"{{{minus_origin}:-{minus_qty}}}")
+            parts.append(" ".join(tokens))
+        return "/".join(parts)
+
+    def _update_preview(self) -> None:
+        if self._updating_preview:
+            return
+        self._updating_preview = True
+        try:
+            self.preview_edit.setPlainText(self._build_route_text())
+        finally:
+            self._updating_preview = False
+
+    def _apply(self) -> None:
+        self.route_text = self._build_route_text().strip()
+        self.accept()
+
+    def _text(self, row: int, col: int) -> str:
+        item = self.route_table.item(row, col)
+        return item.text().strip() if item else ""
+
+
 class ConfigTab(QWidget):
     def __init__(self, service: AppService, parent_window: "MainWindow"):
         super().__init__()
@@ -204,6 +435,7 @@ class ConfigTab(QWidget):
         fleet_layout = QVBoxLayout(fleet_box)
         self.fleet_table.set_append_row_callback(self.add_fleet_row)
         self.fleet_table.set_remove_row_callback(self.remove_selected_rows)
+        self.fleet_table.set_block_delete_backspace(True)
         self.fleet_table.setHorizontalHeaderLabels(
             ["Nome", "Tipo", "Capacidade", "Velocidade", "Ativa"]
         )
@@ -221,6 +453,7 @@ class ConfigTab(QWidget):
         gangway_box = QGroupBox("Gangway Aqua")
         gangway_layout = QVBoxLayout(gangway_box)
         self.gangway_table.set_append_row_callback(self.add_gangway_row)
+        self.gangway_table.set_block_delete_backspace(True)
         self.gangway_table.setHorizontalHeaderLabels(["Unidade"])
         gangway_layout.addWidget(self.gangway_table)
         add_gangway = QPushButton("Adicionar unidade")
@@ -232,6 +465,7 @@ class ConfigTab(QWidget):
         conves_layout = QVBoxLayout(conves_box)
         self.conves_table.set_append_row_callback(self.add_conves_row)
         self.conves_table.set_remove_row_callback(self.remove_selected_rows)
+        self.conves_table.set_block_delete_backspace(True)
         self.conves_table.setHorizontalHeaderLabels(["Embarcacao"])
         conves_layout.addWidget(self.conves_table)
         conves_btns = QHBoxLayout()
@@ -346,7 +580,7 @@ class VersionEditor(QWidget):
         self.user_edit = QLineEdit()
         self.troca_check = QCheckBox("Troca de turma")
         self.rendidos_edit = QLineEdit("0")
-        self.boats_table = AutoAppendTableWidget(0, 3)
+        self.boats_table = AutoAppendTableWidget(0, 4)
         self.demand_table = AutoAppendTableWidget(0, 4)
         self.output_text = QTextEdit()
         self.manual_route_text = QTextEdit()
@@ -382,8 +616,8 @@ class VersionEditor(QWidget):
         boats_box = QGroupBox("Embarcacoes disponiveis")
         boats_layout = QVBoxLayout(boats_box)
         self.boats_table.set_append_row_callback(self.add_boat_row)
-        self.boats_table.set_remove_row_callback(self.remove_selected_rows)
-        self.boats_table.setHorizontalHeaderLabels(["Nome", "Hora saida", "Rota fixa"])
+        self.boats_table.set_block_delete_backspace(True)
+        self.boats_table.setHorizontalHeaderLabels(["Nome", "Hora saida", "Rota fixa", "Editor"])
         boats_layout.addWidget(self.boats_table)
 
         boats_btns = QHBoxLayout()
@@ -399,23 +633,32 @@ class VersionEditor(QWidget):
         # Right: Demand
         demand_box = QGroupBox("Demanda")
         demand_layout = QVBoxLayout(demand_box)
+        demand_hint_section = CollapsibleSection("Dica de preenchimento da demanda", expanded=False)
+        demand_hint = QLabel(DEMAND_HELP_TEXT)
+        demand_hint.setWordWrap(True)
+        demand_hint.setStyleSheet("color: #475569; font-size: 11px;")
+        demand_hint_section.add_widget(demand_hint)
+        demand_layout.addWidget(demand_hint_section)
         self.demand_table.set_append_row_callback(self.add_demand_row)
-        self.demand_table.set_remove_row_callback(self.remove_selected_rows)
+        self.demand_table.set_block_delete_backspace(True)
         self.demand_table.setHorizontalHeaderLabels(["Plataforma", "M9", "TMIB", "Prioridade"])
         demand_layout.addWidget(self.demand_table)
 
         demand_btns = QHBoxLayout()
-        add_demand = QPushButton("Adicionar demanda")
+        add_demand = QPushButton("Adicionar Linha")
         add_demand.clicked.connect(self.add_demand_row)
-        remove_demand = QPushButton("Excluir demanda selecionada")
+        remove_demand = QPushButton("Excluir Linha Selecionada")
         remove_demand.clicked.connect(lambda: self.remove_selected_rows(self.demand_table))
         import_csv = QPushButton("Importar CSV")
         import_csv.clicked.connect(self.import_csv)
+        import_pdf = QPushButton("Importar Extrato PDF")
+        import_pdf.clicked.connect(self.import_extrato_pdf)
         export_csv = QPushButton("Exportar CSV")
         export_csv.clicked.connect(self.export_csv)
         demand_btns.addWidget(add_demand)
         demand_btns.addWidget(remove_demand)
         demand_btns.addWidget(import_csv)
+        demand_btns.addWidget(import_pdf)
         demand_btns.addWidget(export_csv)
         demand_layout.addLayout(demand_btns)
         input_splitter.addWidget(demand_box)
@@ -504,13 +747,351 @@ class VersionEditor(QWidget):
 
     def add_boat_row(self, boat: Optional[AvailableBoat] = None) -> None:
         row = self.boats_table.rowCount()
-        self.boats_table.insertRow(row)
         boat_name = boat.nome if boat else self._select_vessel_name()
         if boat is None and not boat_name:
             return
+        self.boats_table.insertRow(row)
         self.boats_table.setItem(row, 0, QTableWidgetItem(boat_name))
         self.boats_table.setItem(row, 1, QTableWidgetItem(boat.hora_saida if boat else ""))
         self.boats_table.setItem(row, 2, QTableWidgetItem(boat.rota_fixa if boat else ""))
+        editor_button = QPushButton("Montar rota")
+        editor_button.clicked.connect(self._on_route_editor_button_clicked)
+        self.boats_table.setCellWidget(row, 3, editor_button)
+
+    def _on_route_editor_button_clicked(self) -> None:
+        sender = self.sender()
+        if sender is None:
+            return
+        for row in range(self.boats_table.rowCount()):
+            if self.boats_table.cellWidget(row, 3) is sender:
+                self._open_route_builder_for_row(row)
+                return
+
+    def _open_route_builder_for_row(self, row: int) -> None:
+        if row < 0:
+            return
+        boat_name = self._text(self.boats_table, row, 0) or "Embarcacao"
+        current_route = self._text(self.boats_table, row, 2)
+        guided_route = self._run_guided_route_builder(boat_name=boat_name, current_route=current_route)
+        if guided_route is None:
+            return
+        self.boats_table.setItem(row, 2, QTableWidgetItem(guided_route))
+
+    def _run_guided_route_builder(self, boat_name: str, current_route: str) -> Optional[str]:
+        if current_route.strip():
+            replace = QMessageBox.question(
+                self,
+                "Montador de rota",
+                (
+                    f"A embarcacao {boat_name} ja possui uma rota fixa.\n\n"
+                    "Deseja substituir pela rota montada no assistente guiado?"
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if replace != QMessageBox.Yes:
+                return None
+
+        QMessageBox.information(
+            self,
+            "Montador de rota",
+            (
+                "Assistente guiado iniciado.\n\n"
+                "Voce respondera uma pergunta por vez.\n"
+                "Para encerrar a rota, use a opcao [FINALIZAR ROTA] na pergunta de proximo destino."
+            ),
+        )
+
+        stops: List[dict] = []
+        pending_transfer_dropoffs: dict = {}
+        onboard_tmib = 0
+        onboard_m9 = 0
+
+        start_platform = self._prompt_platform(
+            title=f"Montador de rota - {boat_name}",
+            label="Digite o ponto inicial:",
+            allow_finish=False,
+        )
+        if start_platform is None:
+            return None
+
+        first_stop = self._new_route_stop(start_platform)
+        self._apply_pending_dropoffs(first_stop, pending_transfer_dropoffs)
+
+        while True:
+            first_pickup = self._prompt_int(
+                title=f"Montador de rota - {boat_name}",
+                label=f"Quantos pax irao embarcar em {start_platform}?",
+                minimum=0,
+                maximum=999,
+                default=0,
+            )
+            if first_pickup is None:
+                return None
+            if start_platform not in ("TMIB", "M9") and first_pickup > 0:
+                QMessageBox.warning(
+                    self,
+                    "Montador de rota",
+                    (
+                        f"Em {start_platform}, use embarque com destino via {{DESTINO:+x}}.\n"
+                        "O campo +x direto e usado apenas em TMIB/M9."
+                    ),
+                )
+                continue
+            break
+
+        first_stop["pickup"] = first_pickup
+        if start_platform == "TMIB":
+            onboard_tmib += first_pickup
+        elif start_platform == "M9":
+            onboard_m9 += first_pickup
+        else:
+            self._collect_transfer_boardings(
+                stop=first_stop,
+                pending_dropoffs=pending_transfer_dropoffs,
+            )
+        stops.append(first_stop)
+
+        while True:
+            next_platform = self._prompt_platform(
+                title=f"Montador de rota - {boat_name}",
+                label="Digite o proximo destino (ou [FINALIZAR ROTA]):",
+                allow_finish=True,
+                finish_label="[FINALIZAR ROTA]",
+            )
+            if next_platform is None:
+                return None
+            if next_platform == "[FINALIZAR ROTA]":
+                break
+
+            stop = self._new_route_stop(next_platform)
+            self._apply_pending_dropoffs(stop, pending_transfer_dropoffs)
+
+            if onboard_tmib > 0:
+                drop_tmib = self._prompt_int(
+                    title=f"Montador de rota - {boat_name}",
+                    label=f"Quantos pax do TMIB irao desembarcar em {next_platform}? (a bordo: {onboard_tmib})",
+                    minimum=0,
+                    maximum=onboard_tmib,
+                    default=0,
+                )
+                if drop_tmib is None:
+                    return None
+                stop["drop_tmib"] = drop_tmib
+                onboard_tmib -= drop_tmib
+
+            if onboard_m9 > 0:
+                drop_m9 = self._prompt_int(
+                    title=f"Montador de rota - {boat_name}",
+                    label=f"Quantos pax de M9 irao desembarcar em {next_platform}? (a bordo: {onboard_m9})",
+                    minimum=0,
+                    maximum=onboard_m9,
+                    default=0,
+                )
+                if drop_m9 is None:
+                    return None
+                stop["drop_m9"] = drop_m9
+                onboard_m9 -= drop_m9
+
+            if next_platform in ("TMIB", "M9"):
+                pickup = self._prompt_int(
+                    title=f"Montador de rota - {boat_name}",
+                    label=f"Quantos pax irao embarcar em {next_platform}?",
+                    minimum=0,
+                    maximum=999,
+                    default=0,
+                )
+                if pickup is None:
+                    return None
+                stop["pickup"] = pickup
+                if next_platform == "TMIB":
+                    onboard_tmib += pickup
+                else:
+                    onboard_m9 += pickup
+            else:
+                self._collect_transfer_boardings(
+                    stop=stop,
+                    pending_dropoffs=pending_transfer_dropoffs,
+                )
+
+            stops.append(stop)
+
+        route_text = self._build_route_from_stops(stops)
+        if not route_text:
+            QMessageBox.warning(
+                self,
+                "Montador de rota",
+                "Nenhuma etapa valida foi preenchida. A rota nao foi alterada.",
+            )
+            return None
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirmar rota",
+            f"Aplicar a rota abaixo?\n\n{route_text}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if confirm != QMessageBox.Yes:
+            return None
+        return route_text
+
+    def _collect_transfer_boardings(self, stop: dict, pending_dropoffs: dict) -> None:
+        should_collect = QMessageBox.question(
+            self,
+            "Montador de rota",
+            f"Em {stop['platform']}, havera embarque para outros destinos?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if should_collect != QMessageBox.Yes:
+            return
+
+        while True:
+            destination = self._prompt_platform(
+                title="Montador de rota",
+                label=(
+                    f"Para onde os pax embarcados em {stop['platform']} vao?\n"
+                    "(Use [ENCERRAR EMBARQUES] para concluir esta parada)"
+                ),
+                allow_finish=True,
+                finish_label="[ENCERRAR EMBARQUES]",
+                forbid_value=stop["platform"],
+            )
+            if destination is None:
+                return
+            if destination == "[ENCERRAR EMBARQUES]":
+                break
+
+            qty = self._prompt_int(
+                title="Montador de rota",
+                label=f"Quantos pax de {stop['platform']} vao para {destination}?",
+                minimum=1,
+                maximum=999,
+                default=1,
+            )
+            if qty is None:
+                return
+
+            stop["plus_transfers"][destination] = stop["plus_transfers"].get(destination, 0) + qty
+            dest_map = pending_dropoffs.setdefault(destination, {})
+            dest_map[stop["platform"]] = dest_map.get(stop["platform"], 0) + qty
+
+    def _new_route_stop(self, platform: str) -> dict:
+        return {
+            "platform": platform,
+            "pickup": 0,
+            "drop_tmib": 0,
+            "drop_m9": 0,
+            "plus_transfers": {},
+            "minus_transfers": {},
+        }
+
+    def _apply_pending_dropoffs(self, stop: dict, pending_dropoffs: dict) -> None:
+        pending_for_stop = pending_dropoffs.pop(stop["platform"], None)
+        if not pending_for_stop:
+            return
+        for origin, qty in pending_for_stop.items():
+            if qty <= 0:
+                continue
+            stop["minus_transfers"][origin] = stop["minus_transfers"].get(origin, 0) + qty
+
+    def _build_route_from_stops(self, stops: List[dict]) -> str:
+        parts: List[str] = []
+        for stop in stops:
+            platform = stop["platform"].strip().upper()
+            if not platform:
+                continue
+            tokens: List[str] = [platform]
+            if int(stop.get("pickup", 0)) > 0:
+                tokens.append(f"+{int(stop['pickup'])}")
+            if int(stop.get("drop_tmib", 0)) > 0:
+                tokens.append(f"-{int(stop['drop_tmib'])}")
+            if int(stop.get("drop_m9", 0)) > 0:
+                tokens.append(f"(-{int(stop['drop_m9'])})")
+            for destination, qty in stop.get("plus_transfers", {}).items():
+                if int(qty) > 0:
+                    tokens.append(f"{{{destination}:+{int(qty)}}}")
+            for origin, qty in stop.get("minus_transfers", {}).items():
+                if int(qty) > 0:
+                    tokens.append(f"{{{origin}:-{int(qty)}}}")
+            parts.append(" ".join(tokens))
+        return "/".join(parts)
+
+    def _platform_options(self) -> List[str]:
+        options = {"TMIB", "M9"}
+        if self.parent_window.current_op_config:
+            for unit in self.parent_window.current_op_config.unidades:
+                value = str(unit).strip().upper()
+                if value:
+                    options.add(value)
+        for row in range(self.demand_table.rowCount()):
+            value = self._text(self.demand_table, row, 0).upper()
+            if value:
+                options.add(value)
+        ordered = sorted(options)
+        preferred = [item for item in ("TMIB", "M9") if item in ordered]
+        others = [item for item in ordered if item not in ("TMIB", "M9")]
+        return preferred + others
+
+    def _prompt_platform(
+        self,
+        title: str,
+        label: str,
+        allow_finish: bool,
+        finish_label: str = "",
+        forbid_value: str = "",
+    ) -> Optional[str]:
+        options = self._platform_options()
+        if allow_finish and finish_label:
+            options = [finish_label] + options
+
+        while True:
+            value, ok = QInputDialog.getItem(
+                self,
+                title,
+                label,
+                options,
+                0,
+                True,
+            )
+            if not ok:
+                return None
+            text = (value or "").strip().upper()
+            if allow_finish and text == finish_label:
+                return finish_label
+            if not text:
+                QMessageBox.warning(self, "Montador de rota", "Informe uma plataforma valida.")
+                continue
+            if forbid_value and text == forbid_value.upper():
+                QMessageBox.warning(
+                    self,
+                    "Montador de rota",
+                    "A plataforma de destino nao pode ser igual a origem nesta etapa.",
+                )
+                continue
+            return text
+
+    def _prompt_int(
+        self,
+        title: str,
+        label: str,
+        minimum: int,
+        maximum: int,
+        default: int,
+    ) -> Optional[int]:
+        value, ok = QInputDialog.getInt(
+            self,
+            title,
+            label,
+            default,
+            minimum,
+            maximum,
+            1,
+        )
+        if not ok:
+            return None
+        return int(value)
 
     def add_demand_row(self, demand: Optional[DemandItem] = None) -> None:
         row = self.demand_table.rowCount()
@@ -591,6 +1172,31 @@ class VersionEditor(QWidget):
                 "O arquivo CSV nao trouxe nenhuma demanda valida. Verifique cabecalhos e valores.",
             )
             return
+        self.demand_table.setRowCount(0)
+        for item in demands:
+            self.add_demand_row(item)
+
+    def import_extrato_pdf(self) -> None:
+        file_name, _ = QFileDialog.getOpenFileName(self, "Selecionar Extrato PDF", filter="PDF (*.pdf)")
+        if not file_name:
+            return
+        try:
+            demands = self.service.import_extrato_pdf(Path(file_name))
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Importar Extrato PDF",
+                f"Nao foi possivel ler o extrato PDF:\n{exc}",
+            )
+            return
+        if not demands:
+            QMessageBox.warning(
+                self,
+                "Importar Extrato PDF",
+                "O extrato PDF nao trouxe nenhuma demanda valida.",
+            )
+            return
+        self.imported_csv_path = None
         self.demand_table.setRowCount(0)
         for item in demands:
             self.add_demand_row(item)

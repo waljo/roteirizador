@@ -506,3 +506,115 @@ def import_demands_from_csv(csv_path: Path) -> List[DemandItem]:
         prioridade = next((parse_int(normalized[key], 0) for key in prioridade_keys if key in normalized), 0)
         demands.append(DemandItem(plataforma=plataforma, tmib=tmib, m9=m9, prioridade=prioridade))
     return demands
+
+
+def import_demands_from_extrato_pdf(pdf_path: Path) -> List[DemandItem]:
+    try:
+        from PySide6.QtCore import QCoreApplication
+        from PySide6.QtPdf import QPdfDocument
+    except Exception as exc:
+        raise RuntimeError("Leitura de PDF indisponivel no ambiente atual (PySide6.QtPdf).") from exc
+
+    app = QCoreApplication.instance()
+    owns_app = False
+    if app is None:
+        app = QCoreApplication([])
+        owns_app = True
+
+    try:
+        doc = QPdfDocument()
+        status = doc.load(str(pdf_path))
+        if status != QPdfDocument.Error.None_:
+            raise ValueError(f"Nao foi possivel abrir o PDF (status={status}).")
+        text_pages: List[str] = []
+        for page in range(doc.pageCount()):
+            selection = doc.getAllText(page)
+            text_pages.append(selection.text() if selection else "")
+        raw_text = "\n".join(text_pages)
+    finally:
+        if owns_app:
+            app.quit()
+
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    if "Plataforma" not in lines:
+        raise ValueError("Formato de extrato nao reconhecido: cabecalho 'Plataforma' nao encontrado.")
+
+    start_idx = lines.index("Plataforma") + 1
+
+    def is_int_token(token: str) -> bool:
+        return bool(re.fullmatch(r"-?\d+", token))
+
+    non_numeric: List[str] = []
+    idx = start_idx
+    while idx < len(lines) and not is_int_token(lines[idx]):
+        non_numeric.append(lines[idx])
+        idx += 1
+    if len(non_numeric) < 2:
+        raise ValueError("Formato de extrato nao reconhecido: blocos de linhas insuficientes.")
+
+    row_labels = non_numeric[:-1]
+    first_origin = non_numeric[-1]
+    n_rows = len(row_labels)
+
+    matrix: Dict[str, List[int]] = {}
+    current_origin = first_origin
+    pos = idx
+    while current_origin:
+        if pos + n_rows > len(lines):
+            break
+        values_tokens = lines[pos : pos + n_rows]
+        if not all(is_int_token(token) for token in values_tokens):
+            break
+        matrix[current_origin] = [int(token) for token in values_tokens]
+        pos += n_rows
+        if pos >= len(lines):
+            break
+        next_token = lines[pos]
+        if is_int_token(next_token):
+            break
+        current_origin = next_token
+        pos += 1
+
+    if not matrix:
+        raise ValueError("Formato de extrato nao reconhecido: nenhuma coluna de origem encontrada.")
+
+    def normalize_origin_label(label: str) -> str:
+        text = (label or "").strip().upper()
+        text = re.sub(r"\s*\((D|N)\)\s*$", "", text)
+        return text
+
+    origin_m9 = None
+    origin_tmib = None
+    for origin in matrix.keys():
+        short = solver.short_plat(solver.norm_plat(normalize_origin_label(origin)))
+        if short == "M9":
+            origin_m9 = origin
+        elif short == "TMIB":
+            origin_tmib = origin
+    if origin_m9 is None or origin_tmib is None:
+        raise ValueError("Extrato sem colunas obrigatorias de origem (PCM-09/M9 e TMIB).")
+
+    m9_values = matrix[origin_m9]
+    tmib_values = matrix[origin_tmib]
+    def normalize_row_platform(label: str) -> str:
+        text = (label or "").strip().upper()
+        sph = re.match(r"^SPH[-\s]?(\d+)$", text)
+        if sph:
+            return f"SPH-{int(sph.group(1)):02d}"
+        pga_shift = re.match(r"^PGA-?(\d{1,2})\s*\((D|N)\)\s*$", text)
+        if pga_shift:
+            return f"PGA{int(pga_shift.group(1))} ({pga_shift.group(2)})"
+        text = re.sub(r"\s*\((D|N)\)\s*$", "", text)
+        return solver.short_plat(solver.norm_plat(text))
+
+    demands: List[DemandItem] = []
+    for row_idx, row_label in enumerate(row_labels):
+        plataforma = normalize_row_platform(row_label)
+        m9 = int(m9_values[row_idx]) if row_idx < len(m9_values) else 0
+        tmib = int(tmib_values[row_idx]) if row_idx < len(tmib_values) else 0
+        if m9 == 0 and tmib == 0:
+            continue
+        if not re.match(r"^(TMIB|NORWIND GALE|M\d+|B\d+|PGA\d+( \([DN]\))?|PDO\d+|PRB\d+|SPH-\d{2})$", plataforma):
+            continue
+        demands.append(DemandItem(plataforma=plataforma, tmib=tmib, m9=m9, prioridade=0))
+    return sorted(demands, key=lambda item: item.plataforma)

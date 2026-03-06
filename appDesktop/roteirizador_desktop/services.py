@@ -25,6 +25,7 @@ from .runtime import resource_path
 from .solver_integration import (
     export_programacao_planilha,
     import_demands_from_csv,
+    import_demands_from_extrato_pdf,
     parse_distribution_text,
     run_solver,
     summarize_distribution_for_compare,
@@ -248,6 +249,9 @@ class AppService:
 
     def import_csv(self, csv_path: Path):
         return import_demands_from_csv(csv_path)
+
+    def import_extrato_pdf(self, pdf_path: Path):
+        return import_demands_from_extrato_pdf(pdf_path)
 
     def export_program_sheet(
         self,

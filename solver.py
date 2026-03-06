@@ -136,7 +136,7 @@ def fixed_route_abates_demand(boat: "Boat") -> bool:
     departure_min = _time_to_minutes(boat.departure)
     if departure_min is None:
         return False
-    return (6 * 60 + 30) <= departure_min < (14 * 60)
+    return departure_min <= (15 * 60)
 
 
 def get_geo_cluster(platform_norm: str) -> str:
