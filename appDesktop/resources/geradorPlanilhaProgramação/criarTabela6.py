@@ -5,6 +5,7 @@
 import json
 import os
 import re
+import textwrap
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
@@ -709,6 +710,7 @@ def apply_layout(ws):
     ws.merge_cells(start_row=9, start_column=3, end_row=9, end_column=5)
     sergipe_cell = ws.cell(row=9, column=3, value="SERGIPE")
     sergipe_cell.border = bottom_border
+    sergipe_cell.alignment = Alignment(horizontal="center", vertical="center")
     ws.cell(row=9, column=4).border = bottom_border
     ws.cell(row=9, column=5).border = bottom_border
 
@@ -716,13 +718,17 @@ def apply_layout(ws):
     data_cell.font = Font(bold=True)
 
     ws.cell(row=9, column=8).border = bottom_right_border
+    ws.cell(row=9, column=8).alignment = Alignment(horizontal="center", vertical="center")
     ws.cell(row=9, column=9).border = bottom_border
+    ws.cell(row=9, column=9).alignment = Alignment(horizontal="center", vertical="center")
     ws.cell(row=9, column=10).border = bottom_left_border
+    ws.cell(row=9, column=10).alignment = Alignment(horizontal="center", vertical="center")
 
     # Row 11: CL Resp.
     ws.cell(row=11, column=2, value="CL Resp.:")
     ws.merge_cells(start_row=11, start_column=3, end_row=11, end_column=5)
     ws.cell(row=11, column=3).border = bottom_border
+    ws.cell(row=11, column=3).alignment = Alignment(horizontal="center", vertical="center")
     ws.cell(row=11, column=4).border = bottom_border
     ws.cell(row=11, column=5).border = bottom_border
 
@@ -768,6 +774,36 @@ def apply_layout(ws):
     ws.row_dimensions[12].height = 48.0
     ws.row_dimensions[13].height = 24.0
     ws.row_dimensions[15].height = 57.75
+
+
+def _estimate_wrapped_line_count(text: str, max_chars: int) -> int:
+    normalized = str(text or "").replace("\r", "")
+    if not normalized.strip():
+        return 1
+    total_lines = 0
+    for raw_line in normalized.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            total_lines += 1
+            continue
+        wrapped = textwrap.wrap(
+            line,
+            width=max_chars,
+            break_long_words=True,
+            break_on_hyphens=True,
+        )
+        total_lines += max(1, len(wrapped))
+    return max(1, total_lines)
+
+
+def _auto_adjust_operacao_row_height(ws, row_idx: int, operacao_text: str, column_l_width: float = 25.0) -> None:
+    base_height = 18.0
+    if not str(operacao_text or "").strip():
+        ws.row_dimensions[row_idx].height = base_height
+        return
+    max_chars = max(10, int(column_l_width - 2))
+    line_count = _estimate_wrapped_line_count(str(operacao_text), max_chars)
+    ws.row_dimensions[row_idx].height = max(base_height, 15.0 * line_count)
 
 
 def write_trip_block(ws, start_row: int, vessel: str, summary: str, rows: List[Dict]) -> int:
@@ -844,7 +880,12 @@ def write_trip_block(ws, start_row: int, vessel: str, summary: str, rows: List[D
                 cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             else:
                 cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-        ws.row_dimensions[r].height = 18
+        _auto_adjust_operacao_row_height(
+            ws=ws,
+            row_idx=r,
+            operacao_text=row["OPERACAO"],
+            column_l_width=25.0,
+        )
         r += 1
         is_first_row = False
 

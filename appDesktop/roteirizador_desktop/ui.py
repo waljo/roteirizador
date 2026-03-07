@@ -580,7 +580,7 @@ class VersionEditor(QWidget):
         self.user_edit = QLineEdit()
         self.troca_check = QCheckBox("Troca de turma")
         self.rendidos_edit = QLineEdit("0")
-        self.boats_table = AutoAppendTableWidget(0, 4)
+        self.boats_table = AutoAppendTableWidget(0, 3)
         self.demand_table = AutoAppendTableWidget(0, 4)
         self.output_text = QTextEdit()
         self.manual_route_text = QTextEdit()
@@ -617,7 +617,13 @@ class VersionEditor(QWidget):
         boats_layout = QVBoxLayout(boats_box)
         self.boats_table.set_append_row_callback(self.add_boat_row)
         self.boats_table.set_block_delete_backspace(True)
-        self.boats_table.setHorizontalHeaderLabels(["Nome", "Hora saida", "Rota fixa", "Editor"])
+        self.boats_table.setColumnCount(3)
+        self.boats_table.setHorizontalHeaderLabels(["Nome", "Hora saida", "Rota fixa"])
+        boats_header = self.boats_table.horizontalHeader()
+        boats_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        boats_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        boats_header.setSectionResizeMode(2, QHeaderView.Stretch)
+        self.boats_table.itemChanged.connect(self._on_boats_item_changed)
         boats_layout.addWidget(self.boats_table)
 
         boats_btns = QHBoxLayout()
@@ -625,8 +631,11 @@ class VersionEditor(QWidget):
         add_boat.clicked.connect(self.add_boat_row)
         remove_boat = QPushButton("Excluir embarcacao selecionada")
         remove_boat.clicked.connect(lambda: self.remove_selected_rows(self.boats_table))
+        build_route = QPushButton("Montar rota da linha selecionada")
+        build_route.clicked.connect(self._open_route_builder_for_selected_row)
         boats_btns.addWidget(add_boat)
         boats_btns.addWidget(remove_boat)
+        boats_btns.addWidget(build_route)
         boats_layout.addLayout(boats_btns)
         input_splitter.addWidget(boats_box)
 
@@ -752,20 +761,34 @@ class VersionEditor(QWidget):
             return
         self.boats_table.insertRow(row)
         self.boats_table.setItem(row, 0, QTableWidgetItem(boat_name))
-        self.boats_table.setItem(row, 1, QTableWidgetItem(boat.hora_saida if boat else ""))
+        hour_item = QTableWidgetItem(boat.hora_saida if boat else "")
+        hour_item.setTextAlignment(Qt.AlignCenter)
+        self.boats_table.setItem(row, 1, hour_item)
         self.boats_table.setItem(row, 2, QTableWidgetItem(boat.rota_fixa if boat else ""))
-        editor_button = QPushButton("Montar rota")
-        editor_button.clicked.connect(self._on_route_editor_button_clicked)
-        self.boats_table.setCellWidget(row, 3, editor_button)
+        self._adjust_boats_columns()
 
-    def _on_route_editor_button_clicked(self) -> None:
-        sender = self.sender()
-        if sender is None:
+    def _on_boats_item_changed(self, item: QTableWidgetItem) -> None:
+        if item is None:
             return
-        for row in range(self.boats_table.rowCount()):
-            if self.boats_table.cellWidget(row, 3) is sender:
-                self._open_route_builder_for_row(row)
-                return
+        if item.column() == 1:
+            item.setTextAlignment(Qt.AlignCenter)
+        if item.column() in (0, 1):
+            self._adjust_boats_columns()
+
+    def _adjust_boats_columns(self) -> None:
+        self.boats_table.resizeColumnToContents(0)
+        self.boats_table.resizeColumnToContents(1)
+
+    def _open_route_builder_for_selected_row(self) -> None:
+        row = self.boats_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(
+                self,
+                "Montador de rota",
+                "Selecione uma linha de embarcacao para montar a rota.",
+            )
+            return
+        self._open_route_builder_for_row(row)
 
     def _open_route_builder_for_row(self, row: int) -> None:
         if row < 0:
@@ -798,14 +821,12 @@ class VersionEditor(QWidget):
             (
                 "Assistente guiado iniciado.\n\n"
                 "Voce respondera uma pergunta por vez.\n"
-                "Para encerrar a rota, use a opcao [FINALIZAR ROTA] na pergunta de proximo destino."
+                "Para encerrar a rota, use a opcao [DESTINO FINAL] na pergunta de proxima parada."
             ),
         )
 
         stops: List[dict] = []
-        pending_transfer_dropoffs: dict = {}
-        onboard_tmib = 0
-        onboard_m9 = 0
+        active_batches: List[dict] = []
 
         start_platform = self._prompt_platform(
             title=f"Montador de rota - {boat_name}",
@@ -816,103 +837,74 @@ class VersionEditor(QWidget):
             return None
 
         first_stop = self._new_route_stop(start_platform)
-        self._apply_pending_dropoffs(first_stop, pending_transfer_dropoffs)
 
         while True:
             first_pickup = self._prompt_int(
                 title=f"Montador de rota - {boat_name}",
-                label=f"Quantos pax irao embarcar em {start_platform}?",
+                label=f"O barco vai pegar quantos pax em {start_platform}?",
                 minimum=0,
                 maximum=999,
                 default=0,
             )
             if first_pickup is None:
                 return None
-            if start_platform not in ("TMIB", "M9") and first_pickup > 0:
-                QMessageBox.warning(
-                    self,
-                    "Montador de rota",
-                    (
-                        f"Em {start_platform}, use embarque com destino via {{DESTINO:+x}}.\n"
-                        "O campo +x direto e usado apenas em TMIB/M9."
-                    ),
-                )
-                continue
             break
 
-        first_stop["pickup"] = first_pickup
-        if start_platform == "TMIB":
-            onboard_tmib += first_pickup
-        elif start_platform == "M9":
-            onboard_m9 += first_pickup
-        else:
-            self._collect_transfer_boardings(
-                stop=first_stop,
-                pending_dropoffs=pending_transfer_dropoffs,
-            )
+        if not self._register_pickup_batch(
+            stop=first_stop,
+            total_qty=first_pickup,
+            active_batches=active_batches,
+        ):
+            return None
         stops.append(first_stop)
 
         while True:
             next_platform = self._prompt_platform(
                 title=f"Montador de rota - {boat_name}",
-                label="Digite o proximo destino (ou [FINALIZAR ROTA]):",
+                label="Digite a proxima parada:",
                 allow_finish=True,
-                finish_label="[FINALIZAR ROTA]",
+                finish_label="[DESTINO FINAL]",
             )
             if next_platform is None:
                 return None
-            if next_platform == "[FINALIZAR ROTA]":
+            if next_platform == "[DESTINO FINAL]":
+                pending = sum(int(batch.get("remaining", 0)) for batch in active_batches)
+                if pending > 0:
+                    QMessageBox.warning(
+                        self,
+                        "Montador de rota",
+                        (
+                            f"Ainda existem {pending} pax sem desembarque registrado.\n"
+                            "Informe os proximos destinos ate zerar os pax a bordo."
+                        ),
+                    )
+                    continue
                 break
 
             stop = self._new_route_stop(next_platform)
-            self._apply_pending_dropoffs(stop, pending_transfer_dropoffs)
 
-            if onboard_tmib > 0:
-                drop_tmib = self._prompt_int(
-                    title=f"Montador de rota - {boat_name}",
-                    label=f"Quantos pax do TMIB irao desembarcar em {next_platform}? (a bordo: {onboard_tmib})",
-                    minimum=0,
-                    maximum=onboard_tmib,
-                    default=0,
-                )
-                if drop_tmib is None:
-                    return None
-                stop["drop_tmib"] = drop_tmib
-                onboard_tmib -= drop_tmib
+            if not self._collect_dropoffs_for_stop(
+                stop=stop,
+                active_batches=active_batches,
+                boat_name=boat_name,
+            ):
+                return None
 
-            if onboard_m9 > 0:
-                drop_m9 = self._prompt_int(
-                    title=f"Montador de rota - {boat_name}",
-                    label=f"Quantos pax de M9 irao desembarcar em {next_platform}? (a bordo: {onboard_m9})",
-                    minimum=0,
-                    maximum=onboard_m9,
-                    default=0,
-                )
-                if drop_m9 is None:
-                    return None
-                stop["drop_m9"] = drop_m9
-                onboard_m9 -= drop_m9
-
-            if next_platform in ("TMIB", "M9"):
-                pickup = self._prompt_int(
-                    title=f"Montador de rota - {boat_name}",
-                    label=f"Quantos pax irao embarcar em {next_platform}?",
-                    minimum=0,
-                    maximum=999,
-                    default=0,
-                )
-                if pickup is None:
-                    return None
-                stop["pickup"] = pickup
-                if next_platform == "TMIB":
-                    onboard_tmib += pickup
-                else:
-                    onboard_m9 += pickup
-            else:
-                self._collect_transfer_boardings(
-                    stop=stop,
-                    pending_dropoffs=pending_transfer_dropoffs,
-                )
+            pickup = self._prompt_int(
+                title=f"Montador de rota - {boat_name}",
+                label=f"O barco vai pegar quantos pax em {next_platform}?",
+                minimum=0,
+                maximum=999,
+                default=0,
+            )
+            if pickup is None:
+                return None
+            if not self._register_pickup_batch(
+                stop=stop,
+                total_qty=pickup,
+                active_batches=active_batches,
+            ):
+                return None
 
             stops.append(stop)
 
@@ -936,46 +928,109 @@ class VersionEditor(QWidget):
             return None
         return route_text
 
-    def _collect_transfer_boardings(self, stop: dict, pending_dropoffs: dict) -> None:
-        should_collect = QMessageBox.question(
-            self,
-            "Montador de rota",
-            f"Em {stop['platform']}, havera embarque para outros destinos?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+    def _register_pickup_batch(self, stop: dict, total_qty: int, active_batches: List[dict]) -> bool:
+        if total_qty <= 0:
+            return True
+        platform = stop["platform"]
+        destinations = self._prompt_destinations_list(platform=platform, total_qty=total_qty)
+        if destinations is None:
+            return False
+        if platform in ("TMIB", "M9"):
+            stop["pickup"] = stop.get("pickup", 0) + total_qty
+        active_batches.append(
+            {
+                "origin": platform,
+                "remaining": total_qty,
+                "destinations": set(destinations),
+                "origin_stop": stop,
+            }
         )
-        if should_collect != QMessageBox.Yes:
-            return
+        return True
 
+    def _prompt_destinations_list(self, platform: str, total_qty: int) -> Optional[List[str]]:
         while True:
-            destination = self._prompt_platform(
-                title="Montador de rota",
-                label=(
-                    f"Para onde os pax embarcados em {stop['platform']} vao?\n"
-                    "(Use [ENCERRAR EMBARQUES] para concluir esta parada)"
+            raw_destinations, ok = QInputDialog.getText(
+                self,
+                "Montador de rota",
+                (
+                    f"Digite o(s) destino(s) para os {total_qty} pax embarcados em {platform}.\n"
+                    "Se houver mais de um, separe por virgulas."
                 ),
-                allow_finish=True,
-                finish_label="[ENCERRAR EMBARQUES]",
-                forbid_value=stop["platform"],
             )
-            if destination is None:
-                return
-            if destination == "[ENCERRAR EMBARQUES]":
-                break
+            if not ok:
+                return None
+            destinations = [part.strip().upper() for part in (raw_destinations or "").split(",") if part.strip()]
+            if not destinations:
+                QMessageBox.warning(self, "Montador de rota", "Informe pelo menos um destino.")
+                continue
+            if any(dest == platform for dest in destinations):
+                QMessageBox.warning(
+                    self,
+                    "Montador de rota",
+                    "Um destino nao pode ser igual a plataforma de origem.",
+                )
+                continue
+            unique_destinations: List[str] = []
+            seen = set()
+            for destination in destinations:
+                if destination in seen:
+                    continue
+                seen.add(destination)
+                unique_destinations.append(destination)
+            return unique_destinations
 
-            qty = self._prompt_int(
-                title="Montador de rota",
-                label=f"Quantos pax de {stop['platform']} vao para {destination}?",
-                minimum=1,
-                maximum=999,
-                default=1,
-            )
-            if qty is None:
-                return
+    def _collect_dropoffs_for_stop(self, stop: dict, active_batches: List[dict], boat_name: str) -> bool:
+        platform = stop["platform"]
+        candidates = [
+            batch
+            for batch in active_batches
+            if int(batch.get("remaining", 0)) > 0 and platform in batch.get("destinations", set())
+        ]
+        if not candidates:
+            return True
 
-            stop["plus_transfers"][destination] = stop["plus_transfers"].get(destination, 0) + qty
-            dest_map = pending_dropoffs.setdefault(destination, {})
-            dest_map[stop["platform"]] = dest_map.get(stop["platform"], 0) + qty
+        for batch in candidates:
+            remaining = int(batch.get("remaining", 0))
+            if remaining <= 0:
+                continue
+            destinations = batch.get("destinations", set())
+            if len(destinations) == 1:
+                drop_qty = remaining
+            else:
+                if len(candidates) == 1:
+                    label = f"Quantos pax vao descer em {platform}? (a bordo para este destino: {remaining})"
+                else:
+                    label = (
+                        f"Quantos pax com origem em {batch['origin']} vao descer em {platform}? "
+                        f"(a bordo para este destino: {remaining})"
+                    )
+                drop_qty = self._prompt_int(
+                    title=f"Montador de rota - {boat_name}",
+                    label=label,
+                    minimum=0,
+                    maximum=remaining,
+                    default=0,
+                )
+                if drop_qty is None:
+                    return False
+            self._apply_dropoff(stop=stop, batch=batch, destination=platform, qty=drop_qty)
+
+        return True
+
+    def _apply_dropoff(self, stop: dict, batch: dict, destination: str, qty: int) -> None:
+        if qty <= 0:
+            return
+        origin = str(batch.get("origin", "")).upper()
+        if origin == "TMIB":
+            stop["drop_tmib"] = int(stop.get("drop_tmib", 0)) + qty
+        elif origin == "M9":
+            stop["drop_m9"] = int(stop.get("drop_m9", 0)) + qty
+        else:
+            stop["minus_transfers"][origin] = int(stop["minus_transfers"].get(origin, 0)) + qty
+            origin_stop = batch.get("origin_stop")
+            if isinstance(origin_stop, dict):
+                origin_stop["plus_transfers"][destination] = int(origin_stop["plus_transfers"].get(destination, 0)) + qty
+        batch["remaining"] = int(batch.get("remaining", 0)) - qty
 
     def _new_route_stop(self, platform: str) -> dict:
         return {
@@ -986,15 +1041,6 @@ class VersionEditor(QWidget):
             "plus_transfers": {},
             "minus_transfers": {},
         }
-
-    def _apply_pending_dropoffs(self, stop: dict, pending_dropoffs: dict) -> None:
-        pending_for_stop = pending_dropoffs.pop(stop["platform"], None)
-        if not pending_for_stop:
-            return
-        for origin, qty in pending_for_stop.items():
-            if qty <= 0:
-                continue
-            stop["minus_transfers"][origin] = stop["minus_transfers"].get(origin, 0) + qty
 
     def _build_route_from_stops(self, stops: List[dict]) -> str:
         parts: List[str] = []
