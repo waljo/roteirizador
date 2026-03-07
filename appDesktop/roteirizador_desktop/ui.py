@@ -67,7 +67,6 @@ try:
     from PySide6.QtWidgets import (
         QHeaderView,
         QApplication,
-        QCheckBox,
         QComboBox,
         QFileDialog,
         QFormLayout,
@@ -104,7 +103,6 @@ except ImportError as exc:  # pragma: no cover
     QHeaderView = object
     Qt = _QtFallback()
     QApplication = None
-    QCheckBox = object
     QComboBox = object
     QFileDialog = object
     QFormLayout = object
@@ -578,8 +576,6 @@ class VersionEditor(QWidget):
         self.parent_window = parent_window
         self.version_name = version_name
         self.user_edit = QLineEdit()
-        self.troca_check = QCheckBox("Troca de turma")
-        self.rendidos_edit = QLineEdit("0")
         self.boats_table = AutoAppendTableWidget(0, 3)
         self.demand_table = AutoAppendTableWidget(0, 4)
         self.output_text = QTextEdit()
@@ -595,15 +591,11 @@ class VersionEditor(QWidget):
 
         # --- Header Section (Metadata) ---
         header_group = QGroupBox("Dados da Operacao")
-        header_layout = QGridLayout(header_group)
-        header_layout.addWidget(QLabel("Usuario:"), 0, 0)
-        header_layout.addWidget(self.user_edit, 0, 1)
-        header_layout.addWidget(self.troca_check, 0, 2)
-        header_layout.addWidget(QLabel("Rendidos M9:"), 0, 3)
-        header_layout.addWidget(self.rendidos_edit, 0, 4)
-        help_button = QPushButton("Como digitar rota")
-        help_button.clicked.connect(self.show_route_help)
-        header_layout.addWidget(help_button, 0, 5)
+        header_layout = QHBoxLayout(header_group)
+        self.user_edit.setFixedWidth(220)
+        header_layout.addWidget(QLabel("Usuario:"))
+        header_layout.addWidget(self.user_edit)
+        header_layout.addStretch(1)
         layout.addWidget(header_group)
 
         # --- Main Splitter (Vertical: Inputs vs Output) ---
@@ -615,6 +607,12 @@ class VersionEditor(QWidget):
         # Left: Boats
         boats_box = QGroupBox("Embarcacoes disponiveis")
         boats_layout = QVBoxLayout(boats_box)
+        route_hint_section = CollapsibleSection("Como digitar rota", expanded=False)
+        route_hint = QLabel(ROUTE_HELP_TEXT)
+        route_hint.setWordWrap(True)
+        route_hint.setStyleSheet("color: #475569; font-size: 11px;")
+        route_hint_section.add_widget(route_hint)
+        boats_layout.addWidget(route_hint_section)
         self.boats_table.set_append_row_callback(self.add_boat_row)
         self.boats_table.set_block_delete_backspace(True)
         self.boats_table.setColumnCount(3)
@@ -742,8 +740,6 @@ class VersionEditor(QWidget):
             return
         version = bundle.version
         self.user_edit.setText(version.usuario)
-        self.troca_check.setChecked(version.troca_turma)
-        self.rendidos_edit.setText(str(version.rendidos_m9))
         self.boats_table.setRowCount(0)
         self.demand_table.setRowCount(0)
         for boat in version.embarcacoes_disponiveis:
@@ -1199,8 +1195,8 @@ class VersionEditor(QWidget):
             usuario=user_name,
             criado_em=default_operation_version(self.version_name, "").criado_em,
             tipo_origem="csv" if self.imported_csv_path else "formulario",
-            troca_turma=self.troca_check.isChecked(),
-            rendidos_m9=int(self.rendidos_edit.text().strip() or 0),
+            troca_turma=False,
+            rendidos_m9=0,
             embarcacoes_disponiveis=boats,
             demanda=demands,
         )
