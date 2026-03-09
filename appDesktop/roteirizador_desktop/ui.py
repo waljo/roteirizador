@@ -752,7 +752,6 @@ class VersionEditor(QWidget):
         route_hint.setStyleSheet("color: #475569; font-size: 11px;")
         route_hint_section.add_widget(route_hint)
         boats_layout.addWidget(route_hint_section)
-        self.boats_table.set_append_row_callback(self.add_boat_row)
         self.boats_table.set_block_delete_backspace(True)
         self.boats_table.setColumnCount(3)
         self.boats_table.setHorizontalHeaderLabels(["Nome", "Hora saida", "Rota fixa"])
