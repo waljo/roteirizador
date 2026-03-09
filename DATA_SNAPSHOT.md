@@ -1,6 +1,6 @@
 # Data Snapshot
 
-Snapshot date: `2026-02-28`
+Snapshot date: `2026-03-09`
 
 This file records the operational data files required to reconstruct the solver environment exactly as used in the current repository snapshot.
 
@@ -59,7 +59,7 @@ AQUA_HELIX = 20
 ### [`solver_input.xlsx`](/home/ka20/roteirizador/solver_input.xlsx)
 
 - Purpose: live operational scenario currently loaded in the workbook
-- SHA-256: `5af68e8af5658541b208822984aacea90ae11eef2ff97174be41138062e87572`
+- SHA-256: `b419904d627423bad90d771e2d72cd7b25a24bfd91e78ad009f655fef130f66d`
 - Note: this file changes frequently and should be treated as scenario state, not static configuration
 
 ## Code snapshot anchors
@@ -68,7 +68,7 @@ These hashes are not operational data, but they anchor reconstruction of the exa
 
 ### [`solver.py`](/home/ka20/roteirizador/solver.py)
 
-- SHA-256: `75e3fd912b9ff3e55662f7a794025235f16e1ce3e8168d18971ec60e58cb8560`
+- SHA-256: `e6be0096962bc007f662af0fa2235098091b664a55f787af4fb35af2f2afc64b`
 
 ## Reconstruction procedure
 
@@ -86,5 +86,4 @@ venv/bin/python validar_casos.py --details
 
 Expected validation status for the recorded solver snapshot:
 
-- `8/8 OK`
-
+- `13/13 OK`

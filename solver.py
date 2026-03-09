@@ -1816,7 +1816,7 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
 
     def run_optimizer(enforce_all: bool, enforce_distant: bool, require_zero_m9: bool):
         best_routes = None
-        best_distance = float('inf')
+        best_effective_dist = float('inf')
         best_secondary_score = float('inf')
         best_m9_remaining = m9_tmib_demand
         top_n = 5
@@ -1917,17 +1917,19 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
 
                 cluster_weight = 1.0
 
+                priority_cost = total_priority_penalty * PRIORITY_TIME_WEIGHT
+                effective_dist = total_dist + priority_cost
+
                 secondary_score = (
                     penalty
                     + priority_mix_penalty
-                    + (total_priority_penalty * PRIORITY_TIME_WEIGHT)
                     + (total_comfort_cost * COMFORT_PAX_MIN_WEIGHT)
                     + (total_pax_arrival_score * PAX_ARRIVAL_WEIGHT)
                     + (total_cluster_penalty * cluster_weight)
                 )
 
                 scored_dist = (
-                    total_dist
+                    effective_dist
                     + secondary_score
                 )
 
@@ -1935,7 +1937,7 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
                 top_scores.append((
                     remaining_m9,
                     scored_dist,
-                    total_dist,
+                    effective_dist,
                     penalty,
                     total_priority_penalty,
                     total_comfort_cost,
@@ -1951,20 +1953,20 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
 
             # Objetivo lexicografico:
             # 1) minimizar demanda TMIB->M9 nao atendida
-            # 2) entre empates, minimizar distancia total
-            # 3) entre empates de distancia, minimizar penalidades secundarias
+            # 2) entre empates, minimizar distancia efetiva (dist + custo prioridade)
+            # 3) entre empates de dist efetiva, minimizar penalidades secundarias
             if valid:
                 better_on_m9 = remaining_m9 < best_m9_remaining
                 tie_on_m9_better_distance = (
-                    remaining_m9 == best_m9_remaining and total_dist < best_distance
+                    remaining_m9 == best_m9_remaining and effective_dist < best_effective_dist
                 )
                 tie_on_m9_same_distance_better_secondary = (
                     remaining_m9 == best_m9_remaining
-                    and math.isclose(total_dist, best_distance, rel_tol=0.0, abs_tol=1e-9)
+                    and math.isclose(effective_dist, best_effective_dist, rel_tol=0.0, abs_tol=1e-9)
                     and secondary_score < best_secondary_score
                 )
                 if better_on_m9 or tie_on_m9_better_distance or tie_on_m9_same_distance_better_secondary:
-                    best_distance = total_dist
+                    best_effective_dist = effective_dist
                     best_secondary_score = secondary_score
                     best_routes = routes
                     best_m9_remaining = remaining_m9
@@ -2006,7 +2008,7 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
         best_routes, best_m9_remaining, top_scores = run_with_relaxations(require_zero_m9=False)
 
     if top_scores:
-        print("  Top combinacoes (m9_restante | score | dist | penalty | priority | comfort | pax_arrival | cluster):")
+        print("  Top combinacoes (m9_restante | score | eff_dist | penalty | priority | comfort | pax_arrival | cluster):")
         for i, (m9_restante, score, dist, penalty, prio, comfort, pax_arrival, cluster, assignment) in enumerate(top_scores, 1):
             boat_pkgs = {b: [] for b in range(n_boats)}
             for pkg_idx, boat_idx in enumerate(assignment):

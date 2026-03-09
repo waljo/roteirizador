@@ -411,6 +411,145 @@ class RouteBuilderDialog(QDialog):
         return item.text().strip() if item else ""
 
 
+class SavedRoutesDialog(QDialog):
+    def __init__(
+        self,
+        service: AppService,
+        root: str,
+        current_route: str,
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.service = service
+        self.root = root
+        self.current_route = current_route
+        self.selected_route: Optional[str] = None
+        self._routes: List[dict] = []
+        self.setWindowTitle("Rotas fixas salvas")
+        self.resize(620, 420)
+        self._build()
+        self._load_routes()
+
+    def _build(self) -> None:
+        layout = QVBoxLayout(self)
+
+        self.route_list = QListWidget()
+        layout.addWidget(self.route_list)
+
+        action_row = QHBoxLayout()
+        save_btn = QPushButton("Salvar rota atual como preset")
+        save_btn.clicked.connect(self._save_current_as_preset)
+        delete_btn = QPushButton("Excluir selecionada")
+        delete_btn.clicked.connect(self._delete_selected)
+        edit_btn = QPushButton("Editar selecionada")
+        edit_btn.clicked.connect(self._edit_selected)
+        action_row.addWidget(save_btn)
+        action_row.addWidget(edit_btn)
+        action_row.addWidget(delete_btn)
+        layout.addLayout(action_row)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        cancel_btn = QPushButton("Cancelar")
+        cancel_btn.clicked.connect(self.reject)
+        insert_btn = QPushButton("Inserir na linha")
+        insert_btn.clicked.connect(self._insert_selected)
+        button_row.addWidget(cancel_btn)
+        button_row.addWidget(insert_btn)
+        layout.addLayout(button_row)
+
+    def _load_routes(self) -> None:
+        self.route_list.clear()
+        self._routes = self.service.load_saved_routes(self.root)
+        for route in self._routes:
+            item = QListWidgetItem(f"{route['nome']}\n  {route['rota']}")
+            self.route_list.addItem(item)
+
+    def _save_current_as_preset(self) -> None:
+        if not self.current_route.strip():
+            QMessageBox.warning(
+                self,
+                "Rotas salvas",
+                "A rota atual da linha selecionada esta vazia.",
+            )
+            return
+        nome, ok = QInputDialog.getText(
+            self,
+            "Salvar preset",
+            "Nome descritivo para esta rota:",
+        )
+        if not ok or not nome.strip():
+            return
+        self._routes = self.service.add_saved_route(
+            self.root, nome.strip(), self.current_route.strip()
+        )
+        self._load_routes()
+
+    def _edit_selected(self) -> None:
+        row = self.route_list.currentRow()
+        if row < 0 or row >= len(self._routes):
+            QMessageBox.warning(
+                self,
+                "Rotas salvas",
+                "Selecione uma rota para editar.",
+            )
+            return
+        current = self._routes[row]
+        nome, ok = QInputDialog.getText(
+            self,
+            "Editar preset",
+            "Nome:",
+            text=current["nome"],
+        )
+        if not ok or not nome.strip():
+            return
+        rota, ok = QInputDialog.getText(
+            self,
+            "Editar preset",
+            "Rota:",
+            text=current["rota"],
+        )
+        if not ok or not rota.strip():
+            return
+        self._routes = self.service.update_saved_route(
+            self.root, row, nome.strip(), rota.strip()
+        )
+        self._load_routes()
+
+    def _delete_selected(self) -> None:
+        row = self.route_list.currentRow()
+        if row < 0:
+            QMessageBox.warning(
+                self,
+                "Rotas salvas",
+                "Selecione uma rota para excluir.",
+            )
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Excluir preset",
+            f"Excluir a rota '{self._routes[row]['nome']}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        self._routes = self.service.delete_saved_route(self.root, row)
+        self._load_routes()
+
+    def _insert_selected(self) -> None:
+        row = self.route_list.currentRow()
+        if row < 0 or row >= len(self._routes):
+            QMessageBox.warning(
+                self,
+                "Rotas salvas",
+                "Selecione uma rota para inserir.",
+            )
+            return
+        self.selected_route = self._routes[row]["rota"]
+        self.accept()
+
+
 class ConfigTab(QWidget):
     def __init__(self, service: AppService, parent_window: "MainWindow"):
         super().__init__()
@@ -631,9 +770,12 @@ class VersionEditor(QWidget):
         remove_boat.clicked.connect(lambda: self.remove_selected_rows(self.boats_table))
         build_route = QPushButton("Montar rota da linha selecionada")
         build_route.clicked.connect(self._open_route_builder_for_selected_row)
+        saved_routes_btn = QPushButton("Rotas salvas")
+        saved_routes_btn.clicked.connect(self._open_saved_routes_for_selected_row)
         boats_btns.addWidget(add_boat)
         boats_btns.addWidget(remove_boat)
         boats_btns.addWidget(build_route)
+        boats_btns.addWidget(saved_routes_btn)
         boats_layout.addLayout(boats_btns)
         input_splitter.addWidget(boats_box)
 
@@ -795,6 +937,32 @@ class VersionEditor(QWidget):
         if guided_route is None:
             return
         self.boats_table.setItem(row, 2, QTableWidgetItem(guided_route))
+
+    def _open_saved_routes_for_selected_row(self) -> None:
+        row = self.boats_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(
+                self,
+                "Rotas salvas",
+                "Selecione uma linha de embarcacao.",
+            )
+            return
+        if not self.parent_window.current_root:
+            QMessageBox.warning(
+                self,
+                "Rotas salvas",
+                "Pasta compartilhada indisponivel.",
+            )
+            return
+        current_route = self._text(self.boats_table, row, 2)
+        dialog = SavedRoutesDialog(
+            service=self.service,
+            root=self.parent_window.current_root,
+            current_route=current_route,
+            parent=self,
+        )
+        if dialog.exec() == QDialog.Accepted and dialog.selected_route is not None:
+            self.boats_table.setItem(row, 2, QTableWidgetItem(dialog.selected_route))
 
     def _run_guided_route_builder(self, boat_name: str, current_route: str) -> Optional[str]:
         if current_route.strip():

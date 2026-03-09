@@ -109,6 +109,43 @@ class AppService:
                     ],
                 },
             )
+        if not storage.config_path("rotas_fixas_salvas.json").exists():
+            storage.save_json_config(
+                "rotas_fixas_salvas.json",
+                {"version": 1, "rotas": []},
+            )
+
+    def load_saved_routes(self, root: str) -> List[dict]:
+        storage = self.network_storage(root)
+        data = storage.load_json_config("rotas_fixas_salvas.json")
+        return data.get("rotas", [])
+
+    def save_saved_routes(self, root: str, routes: List[dict]) -> None:
+        storage = self.network_storage(root)
+        storage.save_json_config(
+            "rotas_fixas_salvas.json",
+            {"version": 1, "rotas": routes},
+        )
+
+    def add_saved_route(self, root: str, nome: str, rota: str) -> List[dict]:
+        routes = self.load_saved_routes(root)
+        routes.append({"nome": nome, "rota": rota})
+        self.save_saved_routes(root, routes)
+        return routes
+
+    def update_saved_route(self, root: str, index: int, nome: str, rota: str) -> List[dict]:
+        routes = self.load_saved_routes(root)
+        if 0 <= index < len(routes):
+            routes[index] = {"nome": nome, "rota": rota}
+            self.save_saved_routes(root, routes)
+        return routes
+
+    def delete_saved_route(self, root: str, index: int) -> List[dict]:
+        routes = self.load_saved_routes(root)
+        if 0 <= index < len(routes):
+            routes.pop(index)
+            self.save_saved_routes(root, routes)
+        return routes
 
     def load_operational_config(self, root: str) -> OperationalConfig:
         storage = self.network_storage(root)
@@ -353,7 +390,24 @@ class AppService:
             distances_path,
         )
         if automatic["demand"] != manual["demand"]:
-            raise ValueError("Para rodar a comparação as demandas de pax devem ser iguais")
+            diff_lines: list[str] = []
+            all_plats = sorted(set(automatic["demand"]) | set(manual["demand"]))
+            for plat in all_plats:
+                auto_d = automatic["demand"].get(plat, {"tmib": 0, "m9": 0})
+                man_d = manual["demand"].get(plat, {"tmib": 0, "m9": 0})
+                if auto_d == man_d:
+                    continue
+                parts: list[str] = []
+                if auto_d["tmib"] != man_d["tmib"]:
+                    parts.append(f"TMIB auto={auto_d['tmib']} manual={man_d['tmib']}")
+                if auto_d["m9"] != man_d["m9"]:
+                    parts.append(f"M9 auto={auto_d['m9']} manual={man_d['m9']}")
+                diff_lines.append(f"  {plat}: {', '.join(parts)}")
+            details = "\n".join(diff_lines)
+            raise ValueError(
+                "Para rodar a comparacao as demandas de pax devem ser iguais.\n\n"
+                f"Diferencas encontradas:\n{details}"
+            )
 
         platforms = sorted(set(automatic["arrivals"]) | set(manual["arrivals"]))
         return {

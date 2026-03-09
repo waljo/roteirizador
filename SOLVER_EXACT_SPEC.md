@@ -1,8 +1,8 @@
 # Solver Exact Spec
 
-Snapshot date: `2026-02-28`
+Snapshot date: `2026-03-09`
 Primary implementation: [`solver.py`](/home/ka20/roteirizador/solver.py)
-Status at snapshot: current baseline, validated with `venv/bin/python validar_casos.py --details` -> `8/8 OK`
+Status at snapshot: current baseline, validated with `venv/bin/python validar_casos.py --details` -> `13/13 OK`
 
 This document records the solver as it exists now, with enough detail to rebuild the behavior exactly.
 
@@ -11,14 +11,14 @@ This document records the solver as it exists now, with enough detail to rebuild
 The operational objective is:
 
 1. Serve all demand that can be served.
-2. If multiple solutions serve the same demand, prefer the one with fewer nautical miles.
-3. Use priority, comfort, pax-arrival, M9 consolidation, and cluster cohesion only as secondary criteria.
+2. If multiple solutions serve the same demand, prefer the one with lower effective distance.
+3. Use remaining penalties only as tie-breakers after effective distance.
 
-This rule was made explicit on `2026-02-28` by changing the optimizer objective from "minimize total score" to a lexicographic objective:
+This rule is implemented as a lexicographic objective:
 
 1. Minimize remaining `TMIB -> M9` demand.
-2. Minimize `total_dist`.
-3. Break exact distance ties with secondary penalties.
+2. Minimize `effective_dist = total_dist + (total_priority_penalty * PRIORITY_TIME_WEIGHT)`.
+3. Break exact effective-distance ties with secondary penalties.
 
 ## Required files
 
@@ -142,11 +142,11 @@ AQUA_APPROACH_TIME = 25
 MINUTES_PER_PAX = 1
 M9_CONSOLIDATION_PENALTY_NM = 5.0
 ENABLE_DISTANT_CLUSTER_DEDICATION = False
-PRIORITY_TIME_WEIGHT = 0.05
-COMFORT_PAX_MIN_WEIGHT = 0.02
-PAX_ARRIVAL_WEIGHT = 0.1
+PRIORITY_TIME_WEIGHT = 0.01
+COMFORT_PAX_MIN_WEIGHT = 0.005
+PAX_ARRIVAL_WEIGHT = 0.01
 BACKTRACK_PENALTY_NM = 10.0
-SPLIT_PLATFORM_PENALTY_NM = 2.0
+SPLIT_PLATFORM_PENALTY_NM = 5.0
 PRIORITY1_PRECEDENCE_PENALTY_NM = 250.0
 PRIORITY1_PRE_M9_MAX_DETOUR_NM = 1.5
 PRIORITY_MIX_FIT_PENALTY_NM = 120.0
@@ -288,7 +288,7 @@ Logic:
 `estimated_route_cost` is:
 
 - distance TMIB -> pre-M9 sequence -> M9 -> post-M9 sequence
-- plus `2.0 NM` for each platform split across pre and post M9
+- plus `5.0 NM` for each platform split across pre and post M9
 
 Promotion rule for priority 1:
 
@@ -349,7 +349,13 @@ Secondary penalties inside assignment evaluation:
   - and a P2/P3 item is on a different boat from P1,
   - and that P2/P3 item would fit in some existing P1 boat by spare capacity,
   - add `120.0`
-- Cluster penalty is only weighted when `n_boats <= 2`
+- Cluster penalty weight is fixed at `1.0`
+
+Effective distance:
+
+```text
+effective_dist = total_dist + (total_priority_penalty * PRIORITY_TIME_WEIGHT)
+```
 
 Secondary score:
 
@@ -357,17 +363,16 @@ Secondary score:
 secondary_score =
     m9_consolidation_penalty
     + priority_mix_penalty
-    + total_priority_penalty * 0.05
-    + total_comfort_cost * 0.02
-    + total_pax_arrival_score * 0.1
-    + total_cluster_penalty * cluster_weight
+    + total_comfort_cost * 0.005
+    + total_pax_arrival_score * 0.01
+    + total_cluster_penalty * 1.0
 ```
 
 Optimization objective:
 
 1. Minimize `remaining_m9`
-2. Among ties, minimize `total_dist`
-3. Among exact distance ties, minimize `secondary_score`
+2. Among ties, minimize `effective_dist`
+3. Among exact effective-distance ties, minimize `secondary_score`
 
 Relaxation order:
 
@@ -426,19 +431,19 @@ Output header:
 
 ## Verified snapshot result
 
-On the repository state of `2026-02-28`, current input `solver_input.xlsx` produced:
+On the repository state of `2026-03-09`, current input `solver_input.xlsx` produced:
 
 ```text
-SURFER 1931  06:30  TMIB +24/M3 -15/M10 -3/M9 -2 +6/M4 -4 (-6)
-SURFER 1870  07:10  TMIB +24/M9 -5 +3/M5 -8 (-1)/M1 -11/PGA3 (-2)
-SURFER 1930  07:20  TMIB +19/M9 -11 +3/M6 -4/B1 -4 (-3)
+SURFER 1931  06:30  TMIB +24/M9 -10 +5/M4 -3 (-3)/M3 -11 (-2)
+SURFER 1870  07:10  TMIB +18/M9 -9 +9/M6 -1 (-4)/B3 -4 (-4)/B2 -1/B1 -3 (-1)
+SURFER 1930  07:20  TMIB +5/M5 -5
 ```
 
 Aggregate metrics for that input:
 
-- `67 TMIB`
-- `12 M9`
-- `43.511 NM`
+- `47 TMIB`
+- `14 M9`
+- `32.4 NM`
 - `8/8` platforms complete
 - `0` capacity violations
 
@@ -460,5 +465,4 @@ To rebuild this solver exactly:
 8. Preserve final route-string serialization format.
 9. Re-run:
    - `venv/bin/python validar_casos.py --details`
-   - expected snapshot status: `8/8 OK`
-
+   - expected snapshot status: `13/13 OK`
