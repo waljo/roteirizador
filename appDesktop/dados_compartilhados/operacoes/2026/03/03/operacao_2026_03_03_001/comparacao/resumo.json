@@ -1,0 +1,14 @@
+{
+  "operacao_id": "operacao_2026_03_03_001",
+  "programacao_existe": true,
+  "cl_oficial_existe": true,
+  "delta_distancia_nm": -1.246,
+  "delta_total_tmib": 11,
+  "delta_total_m9": 4,
+  "delta_platforms_complete": -1,
+  "delta_service_minutes_complete": -535,
+  "changed_units_count": 9,
+  "priority_units_count": 0,
+  "priority_service_delta_minutes": 0,
+  "generated_at": "2026-03-03T11:37:13"
+}

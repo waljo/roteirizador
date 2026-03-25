@@ -1,0 +1,20 @@
+{
+  "boats_used": 3,
+  "total_tmib": 126,
+  "total_m9": 41,
+  "total_distance_nm": 89.636,
+  "service_minutes_complete": 1560,
+  "service_minutes_partial": 1560,
+  "platforms_complete": 7,
+  "platforms_total": 9,
+  "missing": {
+    "PCM-09": {
+      "tmib": 0,
+      "m9": 17
+    },
+    "TMIB": {
+      "tmib": 0,
+      "m9": 28
+    }
+  }
+}

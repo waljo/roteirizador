@@ -1,0 +1,96 @@
+{
+  "versao": "cl_oficial",
+  "usuario": "OZIEL",
+  "criado_em": "2026-03-05T07:53:07",
+  "tipo_origem": "formulario",
+  "troca_turma": false,
+  "rendidos_m9": 0,
+  "embarcacoes_disponiveis": [
+    {
+      "nome": "SURFER 1870",
+      "hora_saida": "07:10",
+      "rota_fixa": "",
+      "disponivel": true
+    },
+    {
+      "nome": "SURFER 1930",
+      "hora_saida": "07:20",
+      "rota_fixa": "",
+      "disponivel": true
+    },
+    {
+      "nome": "SURFER 1931",
+      "hora_saida": "06:30",
+      "rota_fixa": "",
+      "disponivel": true
+    }
+  ],
+  "demanda": [
+    {
+      "plataforma": "B1",
+      "tmib": 2,
+      "m9": 3,
+      "prioridade": 0
+    },
+    {
+      "plataforma": "B2",
+      "tmib": 5,
+      "m9": 0,
+      "prioridade": 0
+    },
+    {
+      "plataforma": "B3",
+      "tmib": 5,
+      "m9": 0,
+      "prioridade": 0
+    },
+    {
+      "plataforma": "M1",
+      "tmib": 11,
+      "m9": 0,
+      "prioridade": 0
+    },
+    {
+      "plataforma": "M3",
+      "tmib": 10,
+      "m9": 0,
+      "prioridade": 0
+    },
+    {
+      "plataforma": "M5",
+      "tmib": 5,
+      "m9": 0,
+      "prioridade": 0
+    },
+    {
+      "plataforma": "M6",
+      "tmib": 9,
+      "m9": 0,
+      "prioridade": 0
+    },
+    {
+      "plataforma": "M9",
+      "tmib": 17,
+      "m9": 0,
+      "prioridade": 0
+    },
+    {
+      "plataforma": "M10",
+      "tmib": 1,
+      "m9": 0,
+      "prioridade": 0
+    },
+    {
+      "plataforma": "PGA2",
+      "tmib": 3,
+      "m9": 2,
+      "prioridade": 0
+    },
+    {
+      "plataforma": "PGA3",
+      "tmib": 4,
+      "m9": 0,
+      "prioridade": 0
+    }
+  ]
+}

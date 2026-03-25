@@ -5,6 +5,8 @@ This repository now includes a desktop MVP for the distribution workflow in:
 - [`appDesktop/roteirizador_desktop`](/home/ka20/roteirizador/appDesktop/roteirizador_desktop)
 - entrypoint: [`appDesktop/roteirizador_desktop_main.py`](/home/ka20/roteirizador/appDesktop/roteirizador_desktop_main.py)
 
+The desktop app is self-contained under `appDesktop`, including its Windows build resources.
+
 ## Scope
 
 The MVP implements:

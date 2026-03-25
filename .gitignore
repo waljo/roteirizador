@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+python/
+
+# Build artifacts
+build/
+dist/
+dist_*/
+*.spec.bak
+*.log
+*.tmp
+*.bak
+*.pid
+
+# Installer/output
+appDesktop/windows/dist_installer/
+appDesktop/windows/Output/
+appDesktop/windows/*.exe
+appDesktop/windows/*.msi
+
+# Desktop local data
+appDesktop/dados_compartilhados/
+appDesktop/.roteirizador_desktop_config.json
+
+# IDE/OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+*.Zone.Identifier
+*sec.endpointdlp

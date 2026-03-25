@@ -11,13 +11,13 @@ APP_NAME = "RoteirizadorDesktop"
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(getattr(sys, "_MEIPASS"))
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[1]
 
 
 def project_root() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[1]
 
 
 def resource_path(relative_path: str) -> Path:
@@ -33,3 +33,11 @@ def app_config_dir() -> Path:
 
 def app_config_path(filename: str) -> Path:
     return app_config_dir() / filename
+
+
+def shared_app_config_path(filename: str) -> Path:
+    return project_root() / filename
+
+
+def default_storage_root() -> Path:
+    return project_root() / "dados_compartilhados"

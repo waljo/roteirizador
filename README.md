@@ -64,4 +64,3 @@ Para reproduzir exatamente o estado atual do solver:
 1. Consulte [`SOLVER_EXACT_SPEC.md`](/home/ka20/roteirizador/SOLVER_EXACT_SPEC.md).
 2. Consulte [`DATA_SNAPSHOT.md`](/home/ka20/roteirizador/DATA_SNAPSHOT.md).
 3. Preserve os arquivos operacionais com os hashes registrados nesses documentos.
-

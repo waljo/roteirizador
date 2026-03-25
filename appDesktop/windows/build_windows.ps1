@@ -7,8 +7,10 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $ProjectRoot
 
-py -m pip install -r appDesktop/requirements-desktop.txt -r appDesktop/windows/requirements-build.txt
-py -m PyInstaller --noconfirm --clean appDesktop/windows/roteirizador_desktop.spec
+powershell -ExecutionPolicy Bypass -File appDesktop/windows/build_portable.ps1
+if ($LASTEXITCODE -ne 0) {
+    throw "Falha ao gerar build portatil."
+}
 
 if (-not $SkipInstaller) {
     $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"

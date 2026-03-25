@@ -4,7 +4,7 @@ import json
 import shutil
 from datetime import date
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import solver
 
@@ -12,11 +12,9 @@ from .domain import (
     AppConfig,
     ComparisonSummary,
     FleetVessel,
-    normalize_special_code,
     OperationalConfig,
     OperationMetadata,
     OperationVersion,
-    SpecialDemand,
     SolverRunResult,
     VersionBundle,
     VERSION_CL,
@@ -27,8 +25,10 @@ from .runtime import resource_path
 from .solver_integration import (
     export_programacao_planilha,
     import_demands_from_csv,
+    import_demands_from_extrato_pdf,
     parse_distribution_text,
     run_solver,
+    summarize_distribution_for_compare,
 )
 from .storage import LocalConfigStore, NetworkStorage
 from .solver_integration import analyze_distribution
@@ -52,11 +52,11 @@ class AppService:
     def bootstrap_network_config(self, root: str) -> None:
         storage = self.network_storage(root)
         if not storage.config_path("distancias.json").exists():
-            shutil.copy2(resource_path("distplat.json"), storage.config_path("distancias.json"))
+            shutil.copy2(resource_path("resources/distplat.json"), storage.config_path("distancias.json"))
         if not storage.config_path("gangway.json").exists():
-            shutil.copy2(resource_path("gangway.json"), storage.config_path("gangway.json"))
+            shutil.copy2(resource_path("resources/gangway.json"), storage.config_path("gangway.json"))
         if not storage.config_path("frota.json").exists():
-            speeds = solver.load_speeds(str(resource_path("velocidades.txt")))
+            speeds = solver.load_speeds(str(resource_path("resources/velocidades.txt")))
             vessel_names = sorted({
                 "SURFER 1870",
                 "SURFER 1871",
@@ -88,7 +88,7 @@ class AppService:
                     {"version": int(frota_payload.get("version", 1)), "embarcacoes": embarcacoes},
                 )
         if not storage.config_path("unidades.json").exists():
-            dist_data = json.loads(resource_path("distplat.json").read_text(encoding="utf-8"))
+            dist_data = json.loads(resource_path("resources/distplat.json").read_text(encoding="utf-8"))
             units = sorted(
                 {
                     solver.short_plat(solver.norm_plat(key))
@@ -97,22 +97,70 @@ class AppService:
                 }
             )
             storage.save_json_config("unidades.json", {"version": 1, "unidades": units})
-        if not storage.config_path("demandas_especiais.json").exists():
-            storage.save_json_config("demandas_especiais.json", {"version": 1, "demandas_especiais": []})
+        if not storage.config_path("embarcacoes_conves.json").exists():
+            storage.save_json_config(
+                "embarcacoes_conves.json",
+                {
+                    "version": 1,
+                    "embarcacoes_conves": [
+                        "BARU TAURUS",
+                        "C-ITACURUCA",
+                        "COSTA OCEANICA",
+                    ],
+                },
+            )
+        if not storage.config_path("rotas_fixas_salvas.json").exists():
+            storage.save_json_config(
+                "rotas_fixas_salvas.json",
+                {"version": 1, "rotas": []},
+            )
+
+    def load_saved_routes(self, root: str) -> List[dict]:
+        storage = self.network_storage(root)
+        data = storage.load_json_config("rotas_fixas_salvas.json")
+        return data.get("rotas", [])
+
+    def save_saved_routes(self, root: str, routes: List[dict]) -> None:
+        storage = self.network_storage(root)
+        storage.save_json_config(
+            "rotas_fixas_salvas.json",
+            {"version": 1, "rotas": routes},
+        )
+
+    def add_saved_route(self, root: str, nome: str, rota: str) -> List[dict]:
+        routes = self.load_saved_routes(root)
+        routes.append({"nome": nome, "rota": rota})
+        self.save_saved_routes(root, routes)
+        return routes
+
+    def update_saved_route(self, root: str, index: int, nome: str, rota: str) -> List[dict]:
+        routes = self.load_saved_routes(root)
+        if 0 <= index < len(routes):
+            routes[index] = {"nome": nome, "rota": rota}
+            self.save_saved_routes(root, routes)
+        return routes
+
+    def delete_saved_route(self, root: str, index: int) -> List[dict]:
+        routes = self.load_saved_routes(root)
+        if 0 <= index < len(routes):
+            routes.pop(index)
+            self.save_saved_routes(root, routes)
+        return routes
 
     def load_operational_config(self, root: str) -> OperationalConfig:
         storage = self.network_storage(root)
         frota = storage.load_json_config("frota.json")
         unidades = storage.load_json_config("unidades.json")
         gangway = storage.load_json_config("gangway.json")
-        especiais = storage.load_json_config("demandas_especiais.json")
+        conves = storage.load_json_config("embarcacoes_conves.json")
         return OperationalConfig(
             frota=[FleetVessel(**item) for item in frota.get("embarcacoes", [])],
             unidades=unidades.get("unidades", []),
             gangway=gangway.get("plataformas_gangway", []),
-            demandas_especiais=[
-                SpecialDemand(**item) for item in especiais.get("demandas_especiais", [])
-            ],
+            embarcacoes_conves=conves.get(
+                "embarcacoes_conves",
+                ["BARU TAURUS", "C-ITACURUCA", "COSTA OCEANICA"],
+            ),
         )
 
     def save_operational_config(self, root: str, config: OperationalConfig) -> None:
@@ -126,11 +174,8 @@ class AppService:
             "gangway.json", {"version": 1, "plataformas_gangway": config.gangway}
         )
         storage.save_json_config(
-            "demandas_especiais.json",
-            {
-                "version": 1,
-                "demandas_especiais": [item.to_dict() for item in config.demandas_especiais],
-            },
+            "embarcacoes_conves.json",
+            {"version": 1, "embarcacoes_conves": config.embarcacoes_conves},
         )
 
     def create_operation(self, root: str, operation_date: str) -> OperationMetadata:
@@ -143,6 +188,7 @@ class AppService:
             data_operacao=operation_date,
             criada_em=utc_now_iso(),
             status="em_andamento",
+            display_name="",
         )
         storage.save_operation_metadata(metadata)
         return metadata
@@ -154,9 +200,16 @@ class AppService:
         self,
         root: str,
         metadata: OperationMetadata,
-        new_operation_id: str,
+        new_display_name: str,
     ) -> OperationMetadata:
-        return self.network_storage(root).rename_operation(metadata, new_operation_id)
+        updated = OperationMetadata(
+            operacao_id=metadata.operacao_id,
+            data_operacao=metadata.data_operacao,
+            criada_em=metadata.criada_em,
+            status=metadata.status,
+            display_name=new_display_name.strip(),
+        )
+        return self.network_storage(root).update_operation_metadata(updated)
 
     def delete_operation(self, root: str, metadata: OperationMetadata) -> None:
         self.network_storage(root).delete_operation(metadata)
@@ -167,8 +220,11 @@ class AppService:
         metadata: OperationMetadata,
         version: OperationVersion,
         imported_csv_path: Optional[Path] = None,
-    ) -> None:
+    ) -> OperationMetadata:
         self.network_storage(root).save_version(metadata, VersionBundle(version=version), imported_csv_path)
+        updated = self._metadata_with_operation_label(root, metadata)
+        self.network_storage(root).save_operation_metadata(updated)
+        return updated
 
     def load_version(
         self, root: str, metadata: OperationMetadata, version_name: str
@@ -184,13 +240,14 @@ class AppService:
         metadata: OperationMetadata,
         version: OperationVersion,
         imported_csv_path: Optional[Path] = None,
-    ) -> SolverRunResult:
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ) -> tuple[OperationMetadata, SolverRunResult]:
         op_config = self.load_operational_config(root)
-        solver_version = self._filter_special_demands(version, op_config)
         result = run_solver(
-            solver_version,
+            version,
             op_config,
             str(self.network_storage(root).config_path("distancias.json")),
+            progress_callback=progress_callback,
         )
         self.network_storage(root).save_version(
             metadata,
@@ -201,11 +258,39 @@ class AppService:
             ),
             imported_csv_path,
         )
-        self._refresh_comparison(root, metadata)
-        return result
+        updated = self._metadata_with_operation_label(root, metadata)
+        self.network_storage(root).save_operation_metadata(updated)
+        self._refresh_comparison(root, updated)
+        return updated, result
+
+    def _metadata_with_operation_label(
+        self,
+        root: str,
+        metadata: OperationMetadata,
+    ) -> OperationMetadata:
+        storage = self.network_storage(root)
+        programacao_name = ""
+        cl_name = ""
+        programacao = storage.load_version(metadata, VERSION_PROGRAMACAO)
+        cl = storage.load_version(metadata, VERSION_CL)
+        if programacao and programacao.version.usuario.strip():
+            programacao_name = programacao.version.usuario.strip()
+        if cl and cl.version.usuario.strip():
+            cl_name = cl.version.usuario.strip()
+        display_name = " | ".join(part for part in [programacao_name, cl_name] if part)
+        return OperationMetadata(
+            operacao_id=metadata.operacao_id,
+            data_operacao=metadata.data_operacao,
+            criada_em=metadata.criada_em,
+            status=metadata.status,
+            display_name=display_name,
+        )
 
     def import_csv(self, csv_path: Path):
         return import_demands_from_csv(csv_path)
+
+    def import_extrato_pdf(self, pdf_path: Path):
+        return import_demands_from_extrato_pdf(pdf_path)
 
     def export_program_sheet(
         self,
@@ -220,6 +305,7 @@ class AppService:
             config=op_config,
             distances_path=str(storage.config_path("distancias.json")),
             output_path=output_path,
+            embarcacoes_conves=op_config.embarcacoes_conves,
         )
 
     def export_cl_distribution_txt(
@@ -242,11 +328,7 @@ class AppService:
         version: OperationVersion,
         distribution_text: str,
     ) -> str:
-        op_config = self.load_operational_config(root)
-        regular_version = self._filter_special_demands(version, op_config)
         tmib_lines, m9_lines = self._build_tmib_m9_lines(root, distribution_text)
-        m9_lines.extend(self._build_special_execution_lines(version, op_config))
-        m9_lines = list(dict.fromkeys(m9_lines))
         lines = [
             "TABELA DE DEMANDA DE DISTRIBUICAO",
             "=" * 70,
@@ -255,11 +337,8 @@ class AppService:
             f"Versao: {version.versao}",
             f"Usuario: {version.usuario}",
             "",
-            self._format_demand_table(regular_version),
+            self._format_demand_table(version),
         ]
-        special_table = self.format_special_demands_table(version, op_config)
-        if special_table:
-            lines.extend(["", special_table])
         lines.extend(
             [
                 "",
@@ -289,26 +368,106 @@ class AppService:
         lines.append("")
         return "\n".join(lines)
 
-    @staticmethod
-    def _filter_special_demands(version: OperationVersion, config: OperationalConfig) -> OperationVersion:
-        special_map = config.special_demand_map()
-        filtered_demands = [
-            item
-            for item in version.demanda
-            if not special_map.get(normalize_special_code(item.plataforma))
-            or not special_map[normalize_special_code(item.plataforma)].excluir_do_solver
-        ]
-        return OperationVersion(
-            versao=version.versao,
-            usuario=version.usuario,
-            criado_em=version.criado_em,
-            tipo_origem=version.tipo_origem,
-            troca_turma=version.troca_turma,
-            rendidos_m9=version.rendidos_m9,
-            embarcacoes_disponiveis=list(version.embarcacoes_disponiveis),
-            demanda=filtered_demands,
-            execucoes_especiais=list(version.execucoes_especiais),
+    def compare_automatic_vs_manual_routes(
+        self,
+        root: str,
+        automatic_distribution_text: str,
+        manual_distribution_text: str,
+    ) -> Dict[str, Any]:
+        op_config = self.load_operational_config(root)
+        storage = self.network_storage(root)
+        distances_path = str(storage.config_path("distancias.json"))
+        normalized_manual_text = self._normalize_manual_distribution_for_compare(
+            automatic_distribution_text,
+            manual_distribution_text,
         )
+        automatic = summarize_distribution_for_compare(
+            automatic_distribution_text,
+            op_config,
+            distances_path,
+        )
+        manual = summarize_distribution_for_compare(
+            normalized_manual_text,
+            op_config,
+            distances_path,
+        )
+        if automatic["demand"] != manual["demand"]:
+            diff_lines: list[str] = []
+            all_plats = sorted(set(automatic["demand"]) | set(manual["demand"]))
+            for plat in all_plats:
+                auto_d = automatic["demand"].get(plat, {"tmib": 0, "m9": 0})
+                man_d = manual["demand"].get(plat, {"tmib": 0, "m9": 0})
+                if auto_d == man_d:
+                    continue
+                parts: list[str] = []
+                if auto_d["tmib"] != man_d["tmib"]:
+                    parts.append(f"TMIB auto={auto_d['tmib']} manual={man_d['tmib']}")
+                if auto_d["m9"] != man_d["m9"]:
+                    parts.append(f"M9 auto={auto_d['m9']} manual={man_d['m9']}")
+                diff_lines.append(f"  {plat}: {', '.join(parts)}")
+            details = "\n".join(diff_lines)
+            raise ValueError(
+                "Para rodar a comparacao as demandas de pax devem ser iguais.\n\n"
+                f"Diferencas encontradas:\n{details}"
+            )
+
+        platforms = sorted(set(automatic["arrivals"]) | set(manual["arrivals"]))
+        return {
+            "automatic_total_distance_nm": automatic["total_distance_nm"],
+            "manual_total_distance_nm": manual["total_distance_nm"],
+            "platform_rows": [
+                {
+                    "platform": platform,
+                    "automatic_arrival": automatic["arrivals"].get(platform, "-"),
+                    "manual_arrival": manual["arrivals"].get(platform, "-"),
+                }
+                for platform in platforms
+            ],
+        }
+
+    @staticmethod
+    def _normalize_manual_distribution_for_compare(
+        automatic_distribution_text: str,
+        manual_distribution_text: str,
+    ) -> str:
+        auto_routes = parse_distribution_text(automatic_distribution_text)
+        manual_routes = parse_distribution_text(manual_distribution_text)
+        if manual_routes:
+            return manual_distribution_text
+        if not auto_routes:
+            return manual_distribution_text
+
+        departure_by_boat = {boat_name.strip().upper(): departure for boat_name, departure, _ in auto_routes}
+        boat_names = sorted(departure_by_boat.keys(), key=len, reverse=True)
+        normalized_lines: List[str] = []
+        changed = False
+        for raw_line in manual_distribution_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            upper_line = line.upper()
+            matched_boat = None
+            for boat_name in boat_names:
+                prefix = f"{boat_name} "
+                if upper_line == boat_name or upper_line.startswith(prefix):
+                    matched_boat = boat_name
+                    break
+            if not matched_boat:
+                normalized_lines.append(line)
+                continue
+            departure = departure_by_boat.get(matched_boat)
+            if not departure:
+                normalized_lines.append(line)
+                continue
+            route_part = line[len(matched_boat):].strip()
+            if not route_part:
+                normalized_lines.append(line)
+                continue
+            normalized_lines.append(f"{matched_boat}  {departure}  {route_part}")
+            changed = True
+        if not changed:
+            return manual_distribution_text
+        return "\n".join(normalized_lines) + "\n"
 
     @staticmethod
     def _format_demand_table(version: OperationVersion) -> str:
@@ -325,47 +484,6 @@ class AppService:
             rows.append("(sem demanda informada)")
         return "\n".join(rows)
 
-    def format_special_demands_table(self, version: OperationVersion, config: OperationalConfig) -> str:
-        special_map = config.special_demand_map()
-        rows = []
-        row_map = {}
-        header = f"{'CODIGO':<12} {'ORIGEM':<8} {'DESTINO':<8} {'HORARIO':<8} {'QTD':>6}"
-        sep = "-" * len(header)
-        for item in version.demanda:
-            special = special_map.get(normalize_special_code(item.plataforma))
-            if not special:
-                continue
-            qty = int(item.tmib) + int(item.m9)
-            row_map[normalize_special_code(special.codigo)] = (
-                f"{special.codigo:<12} {special.origem:<8} {special.destino:<8} {special.horario:<8} {qty:>6}"
-            )
-        for item in version.execucoes_especiais:
-            special = special_map.get(normalize_special_code(item.codigo))
-            if not special:
-                continue
-            key = normalize_special_code(special.codigo)
-            if key in row_map:
-                continue
-            qty = self._infer_special_execution_qty(item.trajeto)
-            row_map[key] = (
-                f"{special.codigo:<12} {special.origem:<8} {special.destino:<8} {special.horario:<8} {qty:>6}"
-            )
-        rows = [row_map[key] for key in sorted(row_map)]
-        if not rows:
-            return ""
-        return "\n".join(["DEMANDAS ESPECIAIS", "=" * 70, header, sep, *rows])
-
-    @staticmethod
-    def _infer_special_execution_qty(trajeto: str) -> int:
-        first_part = trajeto.strip().split("/", 1)[0].strip()
-        if not first_part:
-            return 0
-        qty = 0
-        for token in first_part.split()[1:]:
-            if token.startswith("+") and token[1:].isdigit():
-                qty += int(token[1:])
-        return qty
-
     def _build_tmib_m9_lines(self, root: str, distribution_text: str) -> tuple[List[str], List[str]]:
         op_config = self.load_operational_config(root)
         vessel_map = op_config.vessel_map()
@@ -377,9 +495,14 @@ class AppService:
             if not parts:
                 continue
             boat_label = self._short_boat_name(boat_name)
-            tmib_route = self._build_tmib_route(parts)
-            if tmib_route:
-                tmib_lines.append(f"{boat_label} {departure} {tmib_route}")
+            for tmib_departure, tmib_route in self._build_tmib_departures(
+                boat_name,
+                departure,
+                parts,
+                vessel_map,
+                distances,
+            ):
+                tmib_lines.append(f"{boat_label} {tmib_departure} {tmib_route}")
             m9_route = self._build_m9_route(parts)
             if m9_route:
                 departure_m9 = self._compute_m9_departure_time(
@@ -392,24 +515,6 @@ class AppService:
                 if departure_m9:
                     m9_lines.append(f"{boat_label} {departure_m9} {m9_route}")
         return tmib_lines, m9_lines
-
-    def _build_special_execution_lines(
-        self,
-        version: OperationVersion,
-        config: OperationalConfig,
-    ) -> List[str]:
-        special_map = config.special_demand_map()
-        lines: List[str] = []
-        for item in version.execucoes_especiais:
-            special = special_map.get(normalize_special_code(item.codigo))
-            trajeto = item.trajeto.strip()
-            horario = item.horario.strip() or (special.horario if special else "")
-            embarcacao = item.embarcacao.strip()
-            if not trajeto:
-                continue
-            boat_label = self._short_boat_name(embarcacao) if embarcacao else item.codigo
-            lines.append(f"{boat_label} {horario} {trajeto}".strip())
-        return lines
 
     @staticmethod
     def _short_boat_name(boat_name: str) -> str:
@@ -451,6 +556,41 @@ class AppService:
                 segments.append(" ".join(tokens))
         return "/".join(segments)
 
+    def _build_tmib_departures(
+        self,
+        boat_name: str,
+        departure: str,
+        parts: List[dict],
+        vessel_map: dict,
+        distances: dict,
+    ) -> List[tuple[str, str]]:
+        tmib_departures: List[tuple[str, str]] = []
+        if not parts:
+            return tmib_departures
+
+        primary_route = self._build_tmib_route(parts)
+        if primary_route:
+            tmib_departures.append((departure, primary_route))
+
+        for idx, part in enumerate(parts[1:], start=1):
+            if part["platform"] != "TMIB" or part["pickup"] <= 0:
+                continue
+            route = self._build_tmib_route(parts[idx:])
+            if not route:
+                continue
+            departure_tmib = self._compute_part_departure_time(
+                boat_name,
+                departure,
+                parts,
+                idx,
+                vessel_map,
+                distances,
+            )
+            if departure_tmib:
+                tmib_departures.append((departure_tmib, route))
+
+        return tmib_departures
+
     @staticmethod
     def _build_m9_route(parts: List[dict]) -> str:
         seen_m9 = False
@@ -476,17 +616,42 @@ class AppService:
         vessel_map: dict,
         distances: dict,
     ) -> Optional[str]:
+        return AppService._compute_part_departure_time(
+            boat_name,
+            departure,
+            parts,
+            next((idx for idx, part in enumerate(parts) if part["platform"] == "M9"), -1),
+            vessel_map,
+            distances,
+            require_pickup=True,
+        )
+
+    @staticmethod
+    def _compute_part_departure_time(
+        boat_name: str,
+        departure: str,
+        parts: List[dict],
+        target_index: int,
+        vessel_map: dict,
+        distances: dict,
+        require_pickup: bool = False,
+    ) -> Optional[str]:
         if not parts:
+            return None
+        if target_index < 0 or target_index >= len(parts):
             return None
         hour, minute = departure.split(":", 1)
         current_time = int(hour) * 60 + int(minute)
         current_pos = parts[0]["platform"]
-        if current_pos == "M9":
+        target_part = parts[target_index]
+        if current_pos == target_part["platform"] and target_index == 0:
+            if require_pickup and target_part["pickup"] <= 0:
+                return None
             return departure
         vessel = vessel_map.get(boat_name)
         speed = float(vessel.velocidade) if vessel else 14.0
         is_aqua = bool(vessel and vessel.tipo.lower() == "aqua")
-        for part in parts[1:]:
+        for idx, part in enumerate(parts[1:], start=1):
             platform = part["platform"]
             dist = solver.get_dist(distances, solver.norm_plat(current_pos), solver.norm_plat(platform))
             current_time += solver.travel_time_minutes(dist, speed)
@@ -494,7 +659,9 @@ class AppService:
                 current_time += solver.AQUA_APPROACH_TIME
             op_minutes = int(part["pickup"]) + int(part["tmib_drop"]) + int(part["m9_drop"])
             current_time += op_minutes
-            if platform == "M9":
+            if idx == target_index:
+                if require_pickup and int(part["pickup"]) <= 0:
+                    return None
                 return f"{current_time // 60:02d}:{current_time % 60:02d}"
             current_pos = platform
         return None
@@ -506,15 +673,13 @@ class AppService:
         if not programacao or not cl or not programacao.metrics or not cl.metrics:
             return
         op_config = self.load_operational_config(root)
-        filtered_programacao = self._filter_special_demands(programacao.version, op_config)
-        filtered_cl = self._filter_special_demands(cl.version, op_config)
         distances_path = str(storage.config_path("distancias.json"))
         prog_analysis = analyze_distribution(
-            filtered_programacao, programacao.distribution_text, op_config, distances_path
+            programacao.version, programacao.distribution_text, op_config, distances_path
         )
-        cl_analysis = analyze_distribution(filtered_cl, cl.distribution_text, op_config, distances_path)
+        cl_analysis = analyze_distribution(cl.version, cl.distribution_text, op_config, distances_path)
         unit_rows, changed_units_count = self._build_unit_rows(
-            filtered_programacao, filtered_cl, prog_analysis["units"], cl_analysis["units"]
+            programacao.version, cl.version, prog_analysis["units"], cl_analysis["units"]
         )
         boat_rows = self._build_boat_rows(
             programacao.version, cl.version, prog_analysis["boats"], cl_analysis["boats"]
@@ -585,8 +750,6 @@ class AppService:
                 [
                     row["delta_tmib"] != 0,
                     row["delta_m9"] != 0,
-                    row["prog_prio"] != row["cl_prio"],
-                    row["delta_service"] != 0,
                 ]
             )
             if row["changed"]:
@@ -634,10 +797,36 @@ class AppService:
         return rows, total_service_delta
 
     @staticmethod
-    def _fmt_service(value):
+    def _fmt_value(value) -> str:
         if value is None:
             return "-"
+        if isinstance(value, float):
+            return f"{value:.3f}".rstrip("0").rstrip(".")
         return str(value)
+
+    @staticmethod
+    def _escape_html(value: object) -> str:
+        text = AppService._fmt_value(value)
+        return (
+            text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+
+    @staticmethod
+    def _html_table(headers: List[str], rows: List[List[object]]) -> str:
+        head = "".join(f"<th>{AppService._escape_html(header)}</th>" for header in headers)
+        body_rows = []
+        for row in rows:
+            cols = "".join(f"<td>{AppService._escape_html(cell)}</td>" for cell in row)
+            body_rows.append(f"<tr>{cols}</tr>")
+        return (
+            "<table class='compare-table'>"
+            f"<thead><tr>{head}</tr></thead>"
+            f"<tbody>{''.join(body_rows)}</tbody>"
+            "</table>"
+        )
 
     def _build_comparison_details(
         self,
@@ -649,59 +838,91 @@ class AppService:
         programacao: VersionBundle,
         cl: VersionBundle,
     ) -> str:
-        lines = []
-        lines.append(f"OPERACAO: {metadata.operacao_id}")
-        lines.append("")
-        lines.append("RESUMO EXECUTIVO")
-        lines.append(f"- Distancia total Programacao: {programacao.metrics['total_distance_nm']} NM")
-        lines.append(f"- Distancia total CL Oficial: {cl.metrics['total_distance_nm']} NM")
-        lines.append(f"- Delta distancia (CL - Programacao): {summary.delta_distancia_nm} NM")
-        lines.append(f"- Delta TMIB: {summary.delta_total_tmib}")
-        lines.append(f"- Delta M9: {summary.delta_total_m9}")
-        lines.append(f"- Delta plataformas completas: {summary.delta_platforms_complete}")
-        lines.append(f"- Delta service minutes complete: {summary.delta_service_minutes_complete}")
-        lines.append(f"- Unidades alteradas: {summary.changed_units_count}")
-        lines.append("")
-        lines.append("IMPACTO EM PRIORIDADES")
+        html_parts = [
+            """
+            <html>
+            <head>
+            <style>
+            body { font-family: Segoe UI, Arial, sans-serif; color: #1f2937; margin: 10px; }
+            h2 { margin: 18px 0 8px; font-size: 18px; color: #0f172a; }
+            .meta { margin-bottom: 14px; font-size: 13px; color: #475569; }
+            .compare-table { border-collapse: collapse; width: 100%; margin: 8px 0 18px; table-layout: fixed; }
+            .compare-table th { background: #e2e8f0; color: #0f172a; font-weight: 600; text-align: left; }
+            .compare-table th, .compare-table td { border: 1px solid #cbd5e1; padding: 8px 10px; vertical-align: top; font-size: 12px; word-wrap: break-word; }
+            .note { font-size: 12px; color: #475569; margin: 6px 0 12px; }
+            </style>
+            </head>
+            <body>
+            """,
+            f"<div class='meta'><strong>Operacao:</strong> {self._escape_html(metadata.operacao_id)}<br>"
+            f"<strong>Data:</strong> {self._escape_html(metadata.data_operacao)}</div>",
+            "<h2>Resumo</h2>",
+            self._html_table(
+                ["INDICADOR", "PROGRAMACAO", "CONTROLADOR", "DIFERENCA"],
+                [
+                    ["Distancia total (NM)", programacao.metrics["total_distance_nm"], cl.metrics["total_distance_nm"], summary.delta_distancia_nm],
+                    ["TMIB total", programacao.metrics["total_tmib"], cl.metrics["total_tmib"], summary.delta_total_tmib],
+                    ["M9 total", programacao.metrics["total_m9"], cl.metrics["total_m9"], summary.delta_total_m9],
+                    ["Plataformas completas", programacao.metrics["platforms_complete"], cl.metrics["platforms_complete"], summary.delta_platforms_complete],
+                ],
+            ),
+            "<h2>Resumo Executivo</h2>",
+            self._html_table(
+                ["INFORMACAO", "PROGRAMACAO", "CONTROLADOR"],
+                [
+                    ["Operacao", metadata.operacao_id, metadata.operacao_id],
+                    ["Data", metadata.data_operacao, metadata.data_operacao],
+                    ["Unidades alteradas", summary.changed_units_count, summary.changed_units_count],
+                    ["Programacao existe", "SIM" if summary.programacao_existe else "NAO", "-"],
+                    ["Controlador existe", "-", "SIM" if summary.cl_oficial_existe else "NAO"],
+                ],
+            ),
+            "<h2>Impacto Em Prioridades</h2>",
+        ]
         if not priority_rows:
-            lines.append("- Nenhuma unidade com prioridade definida nas duas versoes.")
+            html_parts.append("<div class='note'>Nenhuma unidade com prioridade definida nas duas versoes.</div>")
         else:
-            lines.append(f"- Unidades prioritarias avaliadas: {summary.priority_units_count}")
-            lines.append(
-                f"- Delta agregado de service minutes nas prioridades (CL - Programacao): "
-                f"{summary.priority_service_delta_minutes}"
-            )
-            for row in priority_rows:
-                lines.append(
-                    f"- {row['plataforma']}: prio {row['prog_prio']} -> {row['cl_prio']}, "
-                    f"TMIB {row['prog_tmib']} -> {row['cl_tmib']}, "
-                    f"M9 {row['prog_m9']} -> {row['cl_m9']}, "
-                    f"service {self._fmt_service(row['prog_service'])} -> {self._fmt_service(row['cl_service'])}, "
-                    f"delta {row['delta_service']}"
+            html_parts.append(
+                self._html_table(
+                    ["INDICADOR", "PROGRAMACAO", "CONTROLADOR", "DIFERENCA"],
+                    [
+                        ["Unidades prioritarias avaliadas", summary.priority_units_count, summary.priority_units_count, 0],
+                        ["Impacto agregado (min)", "-", "-", summary.priority_service_delta_minutes],
+                    ],
                 )
-        lines.append("")
-        lines.append("DIFERENCAS POR UNIDADE")
-        for row in unit_rows:
-            marker = "*" if row["changed"] else "="
-            lines.append(
-                f"{marker} {row['plataforma']}: "
-                f"TMIB {row['prog_tmib']} -> {row['cl_tmib']} ({row['delta_tmib']:+}), "
-                f"M9 {row['prog_m9']} -> {row['cl_m9']} ({row['delta_m9']:+}), "
-                f"Prio {row['prog_prio']} -> {row['cl_prio']}, "
-                f"Service {self._fmt_service(row['prog_service'])} -> {self._fmt_service(row['cl_service'])} "
-                f"({row['delta_service']:+})"
             )
-        lines.append("")
-        lines.append("DIFERENCAS POR EMBARCACAO")
-        for row in boat_rows:
-            lines.append(
-                f"- {row['embarcacao']}: ativa Prog={row['prog_ativa']} CL={row['cl_ativa']}, "
-                f"dist {row['prog_dist']} -> {row['cl_dist']} ({row['delta_dist']:+})"
-            )
-            if row["prog_route"] or row["cl_route"]:
-                lines.append(f"  Prog: {row['prog_route'] or '-'}")
-                lines.append(f"  CL  : {row['cl_route'] or '-'}")
-        return "\n".join(lines)
+        html_parts.extend(
+            [
+                "<h2>Diferencas Por Unidade</h2>",
+                self._html_table(
+                    ["UNIDADE", "PROGRAMACAO", "CONTROLADOR", "DIFERENCA"],
+                    [
+                        [
+                            row["plataforma"],
+                            f"TMIB {row['prog_tmib']} | M9 {row['prog_m9']}",
+                            f"TMIB {row['cl_tmib']} | M9 {row['cl_m9']}",
+                            f"TMIB {row['delta_tmib']:+} | M9 {row['delta_m9']:+}",
+                        ]
+                        for row in unit_rows
+                    ],
+                ),
+                "<h2>Diferencas Por Embarcacao</h2>",
+                self._html_table(
+                    ["EMBARCACAO", "PROGRAMACAO", "CONTROLADOR", "DIFERENCA"],
+                    [
+                        [
+                            row["embarcacao"],
+                            f"Ativa {'SIM' if row['prog_ativa'] else 'NAO'} | Dist {self._fmt_value(row['prog_dist'])} | {row['prog_route'] or '-'}",
+                            f"Ativa {'SIM' if row['cl_ativa'] else 'NAO'} | Dist {self._fmt_value(row['cl_dist'])} | {row['cl_route'] or '-'}",
+                            f"Dist {row['delta_dist']:+}",
+                        ]
+                        for row in boat_rows
+                    ],
+                ),
+                "</body></html>",
+            ]
+        )
+        return "".join(html_parts)
 
 
 def default_operation_version(version_name: str, user_name: str) -> OperationVersion:

@@ -1,0 +1,27 @@
+# Default: normalize text files to LF in repo.
+* text=auto eol=lf
+
+# Windows scripts keep CRLF in working tree.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Common binary formats (never diff/merge as text).
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.7z binary
+*.exe binary
+*.dll binary
+*.pyd binary
+*.so binary
+*.xlsx binary
+*.xls binary
+*.xlsm binary
+*.docx binary
+*.pptx binary
+*.msg binary

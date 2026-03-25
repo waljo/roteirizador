@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 import csv
 import re
+import unicodedata
 from io import StringIO
 import importlib.util
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import solver
 from openpyxl import Workbook
@@ -13,7 +15,6 @@ from openpyxl import Workbook
 from .domain import (
     AvailableBoat,
     DemandItem,
-    normalize_special_code,
     OperationalConfig,
     OperationVersion,
     SolverRunResult,
@@ -24,14 +25,45 @@ from .runtime import resource_path
 _CRIAR_TABELA6_MODULE = None
 
 
+def _emit_progress(progress_callback: Optional[Callable[[str], None]], message: str) -> None:
+    if progress_callback is None:
+        return
+    text = (message or "").strip()
+    if not text:
+        return
+    try:
+        progress_callback(text)
+    except Exception:
+        pass
+
+
+class _ProgressStream:
+    def __init__(self, progress_callback: Optional[Callable[[str], None]]):
+        self.progress_callback = progress_callback
+        self._buffer = ""
+
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            _emit_progress(self.progress_callback, line)
+        return len(text)
+
+    def flush(self) -> None:
+        _emit_progress(self.progress_callback, self._buffer)
+        self._buffer = ""
+
+
 def _load_criar_tabela6_module():
     global _CRIAR_TABELA6_MODULE
     if _CRIAR_TABELA6_MODULE is not None:
         return _CRIAR_TABELA6_MODULE
-    module_path = resource_path("geradorPlanilhaProgramação/criarTabela6.py")
+    module_path = resource_path("resources/geradorPlanilhaProgramação/criarTabela6.py")
     spec = importlib.util.spec_from_file_location("gerador_planilha_programacao", module_path)
     if spec is None or spec.loader is None:
-        raise RuntimeError("Nao foi possivel carregar geradorPlanilhaProgramação/criarTabela6.py")
+        raise RuntimeError("Nao foi possivel carregar resources/geradorPlanilhaProgramação/criarTabela6.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     _CRIAR_TABELA6_MODULE = module
@@ -84,23 +116,6 @@ def parse_distribution_text(distribution_text: str) -> List[Tuple[str, str, str]
         if boat_name and route_str:
             routes.append((boat_name, departure, route_str))
     return routes
-
-
-def _resolve_special_aliases(route_str: str, config: OperationalConfig) -> str:
-    special_map = config.special_demand_map()
-    resolved_parts: List[str] = []
-    for part in route_str.split("/"):
-        stripped = part.strip()
-        if not stripped:
-            continue
-        tokens = stripped.split(maxsplit=1)
-        platform = tokens[0]
-        special = special_map.get(normalize_special_code(platform))
-        if special and special.destino:
-            platform = special.destino
-        remainder = tokens[1] if len(tokens) > 1 else ""
-        resolved_parts.append(platform if not remainder else f"{platform} {remainder}")
-    return "/".join(resolved_parts)
 
 
 def route_distance(route_str: str, distances: Dict[str, Dict[str, float]]) -> float:
@@ -259,9 +274,14 @@ def build_metrics(
     }
 
 
-def run_solver(operation: OperationVersion, config: OperationalConfig, distances_path: str) -> SolverRunResult:
+def run_solver(
+    operation: OperationVersion,
+    config: OperationalConfig,
+    distances_path: str,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> SolverRunResult:
+    _emit_progress(progress_callback, "Preparando embarcacoes e demanda...")
     vessel_map = config.vessel_map()
-    special_map = config.special_demand_map()
     boats: List[solver.Boat] = []
     for item in operation.embarcacoes_disponiveis:
         vessel = vessel_map.get(item.nome)
@@ -288,17 +308,27 @@ def run_solver(operation: OperationVersion, config: OperationalConfig, distances
         )
         for item in operation.demanda
         if int(item.tmib) or int(item.m9)
-        if not special_map.get(normalize_special_code(item.plataforma))
-        or not special_map[normalize_special_code(item.plataforma)].excluir_do_solver
     ]
 
     config_obj = solver.Config(
         troca_turma=operation.troca_turma,
         rendidos_m9=int(operation.rendidos_m9),
     )
+    _emit_progress(progress_callback, "Carregando matriz de distancias...")
     distances = solver.load_distances(distances_path)
     gangway_platforms = {solver.norm_plat(item) for item in config.gangway}
-    results, warnings, summary = solver.solve(config_obj, boats, demands, distances, gangway_platforms)
+    _emit_progress(progress_callback, "Executando solver...")
+    stream = _ProgressStream(progress_callback)
+    with contextlib.redirect_stdout(stream):
+        results, warnings, summary = solver.solve(
+            config_obj,
+            boats,
+            demands,
+            distances,
+            gangway_platforms,
+        )
+    stream.flush()
+    _emit_progress(progress_callback, "Montando distribuicao final...")
     summary["boats_used"] = len({boat.name for boat, _ in results})
     route_lines = _metric_lines(results)
     distribution_text = build_distribution_text(
@@ -370,11 +400,67 @@ def analyze_distribution(
     return {"boats": by_boat, "units": per_unit}
 
 
+def summarize_distribution_for_compare(
+    distribution_text: str,
+    config: OperationalConfig,
+    distances_path: str,
+) -> Dict[str, Any]:
+    distances = solver.load_distances(distances_path)
+    vessel_map = config.vessel_map()
+    routes = parse_distribution_text(distribution_text)
+    demand: Dict[str, Dict[str, int]] = {}
+    last_delivery: Dict[str, int] = {}
+    total_distance = 0.0
+
+    for boat_name, departure, route_str in routes:
+        vessel = vessel_map.get(boat_name)
+        if vessel is None:
+            continue
+        boat = solver.Boat(
+            name=boat_name,
+            available=True,
+            departure=departure,
+            speed=float(vessel.velocidade),
+            max_capacity=int(vessel.capacidade),
+        )
+        route_last, _ = _simulate_route_times(boat, route_str, distances)
+        total_distance += route_distance(route_str, distances)
+        for plat_norm, value in route_last.items():
+            if value > last_delivery.get(plat_norm, -1):
+                last_delivery[plat_norm] = value
+
+        for part in route_str.split("/"):
+            tokens = part.split()
+            if not tokens:
+                continue
+            platform = solver.short_plat(solver.norm_plat(tokens[0]))
+            demand.setdefault(platform, {"tmib": 0, "m9": 0})
+            for token in tokens[1:]:
+                if token.startswith("(-") and token.endswith(")") and token[2:-1].isdigit():
+                    demand[platform]["m9"] += int(token[2:-1])
+                elif token.startswith("-") and token[1:].isdigit():
+                    demand[platform]["tmib"] += int(token[1:])
+
+    return {
+        "total_distance_nm": round(total_distance, 3),
+        "demand": {
+            platform: values
+            for platform, values in demand.items()
+            if values["tmib"] or values["m9"]
+        },
+        "arrivals": {
+            solver.short_plat(plat_norm): f"{minutes // 60:02d}:{minutes % 60:02d}"
+            for plat_norm, minutes in last_delivery.items()
+        },
+    }
+
+
 def export_programacao_planilha(
     distribution_text: str,
     config: OperationalConfig,
     distances_path: str,
     output_path: Path,
+    embarcacoes_conves: Optional[List[str]] = None,
 ) -> Path:
     mod = _load_criar_tabela6_module()
     dist = mod.load_distances_json(distances_path)
@@ -385,7 +471,7 @@ def export_programacao_planilha(
             mod.TripDef(
                 vessel=boat_name,
                 start_hhmm=departure,
-                route=_resolve_special_aliases(route_str, config),
+                route=route_str,
             )
         )
 
@@ -418,7 +504,11 @@ def export_programacao_planilha(
             rows=rows,
         )
 
-    row_ptr = mod.write_extra_vessels_and_observations(ws, row_ptr)
+    row_ptr = mod.write_extra_vessels_and_observations(
+        ws,
+        row_ptr,
+        embarcacoes_conves=embarcacoes_conves,
+    )
     mod.set_column_widths(ws)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
@@ -426,21 +516,155 @@ def export_programacao_planilha(
 
 
 def import_demands_from_csv(csv_path: Path) -> List[DemandItem]:
-    with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        demands: List[DemandItem] = []
-        for row in reader:
-            normalized = {key.strip().lower(): (value or "").strip() for key, value in row.items()}
-            plataforma = (
-                normalized.get("plataforma")
-                or normalized.get("unidade")
-                or normalized.get("platform")
-                or normalized.get("codigo")
-            )
-            if not plataforma:
-                continue
-            tmib = int(normalized.get("tmib") or 0)
-            m9 = int(normalized.get("m9") or 0)
-            prioridade = int(normalized.get("prioridade") or 99)
-            demands.append(DemandItem(plataforma=plataforma, tmib=tmib, m9=m9, prioridade=prioridade))
+    raw_text = csv_path.read_text(encoding="utf-8-sig")
+    try:
+        dialect = csv.Sniffer().sniff(raw_text[:2048], delimiters=";,")
+    except csv.Error:
+        class _FallbackDialect(csv.excel):
+            delimiter = ";"
+        dialect = _FallbackDialect()
+
+    def normalize_key(value: str) -> str:
+        normalized = unicodedata.normalize("NFKD", value or "")
+        normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+        return normalized.strip().lower()
+
+    def parse_int(value: str, default: int = 0) -> int:
+        cleaned = (value or "").strip()
+        if not cleaned:
+            return default
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+        try:
+            return int(float(cleaned))
+        except ValueError:
+            return default
+
+    plataforma_keys = {"plataforma", "unidade", "platform", "codigo", "cod", "sigla"}
+    tmib_keys = {"tmib", "pax tmib", "qtd tmib", "quant tmib", "qtde tmib"}
+    m9_keys = {"m9", "pax m9", "qtd m9", "quant m9", "qtde m9", "pcm9"}
+    prioridade_keys = {"prioridade", "prio", "priority"}
+
+    reader = csv.DictReader(StringIO(raw_text), dialect=dialect)
+    demands: List[DemandItem] = []
+    for row in reader:
+        normalized = {normalize_key(key): (value or "").strip() for key, value in row.items() if key is not None}
+        plataforma = next((normalized[key] for key in plataforma_keys if key in normalized and normalized[key]), "")
+        if not plataforma:
+            continue
+        tmib = next((parse_int(normalized[key]) for key in tmib_keys if key in normalized), 0)
+        m9 = next((parse_int(normalized[key]) for key in m9_keys if key in normalized), 0)
+        prioridade = next((parse_int(normalized[key], 0) for key in prioridade_keys if key in normalized), 0)
+        demands.append(DemandItem(plataforma=plataforma, tmib=tmib, m9=m9, prioridade=prioridade))
     return demands
+
+
+def import_demands_from_extrato_pdf(pdf_path: Path) -> List[DemandItem]:
+    try:
+        from PySide6.QtCore import QCoreApplication
+        from PySide6.QtPdf import QPdfDocument
+    except Exception as exc:
+        raise RuntimeError("Leitura de PDF indisponivel no ambiente atual (PySide6.QtPdf).") from exc
+
+    app = QCoreApplication.instance()
+    owns_app = False
+    if app is None:
+        app = QCoreApplication([])
+        owns_app = True
+
+    try:
+        doc = QPdfDocument()
+        status = doc.load(str(pdf_path))
+        if status != QPdfDocument.Error.None_:
+            raise ValueError(f"Nao foi possivel abrir o PDF (status={status}).")
+        text_pages: List[str] = []
+        for page in range(doc.pageCount()):
+            selection = doc.getAllText(page)
+            text_pages.append(selection.text() if selection else "")
+        raw_text = "\n".join(text_pages)
+    finally:
+        if owns_app:
+            app.quit()
+
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    if "Plataforma" not in lines:
+        raise ValueError("Formato de extrato nao reconhecido: cabecalho 'Plataforma' nao encontrado.")
+
+    start_idx = lines.index("Plataforma") + 1
+
+    def is_int_token(token: str) -> bool:
+        return bool(re.fullmatch(r"-?\d+", token))
+
+    non_numeric: List[str] = []
+    idx = start_idx
+    while idx < len(lines) and not is_int_token(lines[idx]):
+        non_numeric.append(lines[idx])
+        idx += 1
+    if len(non_numeric) < 2:
+        raise ValueError("Formato de extrato nao reconhecido: blocos de linhas insuficientes.")
+
+    row_labels = non_numeric[:-1]
+    first_origin = non_numeric[-1]
+    n_rows = len(row_labels)
+
+    matrix: Dict[str, List[int]] = {}
+    current_origin = first_origin
+    pos = idx
+    while current_origin:
+        if pos + n_rows > len(lines):
+            break
+        values_tokens = lines[pos : pos + n_rows]
+        if not all(is_int_token(token) for token in values_tokens):
+            break
+        matrix[current_origin] = [int(token) for token in values_tokens]
+        pos += n_rows
+        if pos >= len(lines):
+            break
+        next_token = lines[pos]
+        if is_int_token(next_token):
+            break
+        current_origin = next_token
+        pos += 1
+
+    if not matrix:
+        raise ValueError("Formato de extrato nao reconhecido: nenhuma coluna de origem encontrada.")
+
+    def normalize_origin_label(label: str) -> str:
+        text = (label or "").strip().upper()
+        text = re.sub(r"\s*\((D|N)\)\s*$", "", text)
+        return text
+
+    origin_m9 = None
+    origin_tmib = None
+    for origin in matrix.keys():
+        short = solver.short_plat(solver.norm_plat(normalize_origin_label(origin)))
+        if short == "M9":
+            origin_m9 = origin
+        elif short == "TMIB":
+            origin_tmib = origin
+    if origin_m9 is None or origin_tmib is None:
+        raise ValueError("Extrato sem colunas obrigatorias de origem (PCM-09/M9 e TMIB).")
+
+    m9_values = matrix[origin_m9]
+    tmib_values = matrix[origin_tmib]
+    def normalize_row_platform(label: str) -> str:
+        text = (label or "").strip().upper()
+        sph = re.match(r"^SPH[-\s]?(\d+)$", text)
+        if sph:
+            return f"SPH-{int(sph.group(1)):02d}"
+        pga_shift = re.match(r"^PGA-?(\d{1,2})\s*\((D|N)\)\s*$", text)
+        if pga_shift:
+            return f"PGA{int(pga_shift.group(1))} ({pga_shift.group(2)})"
+        text = re.sub(r"\s*\((D|N)\)\s*$", "", text)
+        return solver.short_plat(solver.norm_plat(text))
+
+    demands: List[DemandItem] = []
+    for row_idx, row_label in enumerate(row_labels):
+        plataforma = normalize_row_platform(row_label)
+        m9 = int(m9_values[row_idx]) if row_idx < len(m9_values) else 0
+        tmib = int(tmib_values[row_idx]) if row_idx < len(tmib_values) else 0
+        if m9 == 0 and tmib == 0:
+            continue
+        if not re.match(r"^(TMIB|NORWIND GALE|M\d+|B\d+|PGA\d+( \([DN]\))?|PDO\d+|PRB\d+|SPH-\d{2})$", plataforma):
+            continue
+        demands.append(DemandItem(plataforma=plataforma, tmib=tmib, m9=m9, prioridade=0))
+    return sorted(demands, key=lambda item: item.plataforma)

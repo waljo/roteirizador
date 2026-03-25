@@ -1,35 +1,48 @@
 # Build Windows
 
 Este app pode ser empacotado para Windows sem qualquer dependencia de WSL ou Python na maquina do usuario final.
+Tudo que o build precisa fica dentro da pasta `appDesktop`.
 
 ## Resultado
 
-O processo gera:
+O processo pode gerar:
 
 - `dist/RoteirizadorDesktop.exe`
-- `dist_installer/RoteirizadorDesktop-Setup.exe`
+- `dist/RoteirizadorDesktop_portable.zip`
+- `dist_installer/RoteirizadorDesktop-Setup.exe` (somente quando gerar instalador)
 
-O instalador final pode ser entregue ao CL para instalacao normal no Windows.
-
-## Pre-requisitos na maquina que vai gerar o instalador
+## Pre-requisitos na maquina que vai gerar o build
 
 - Windows
-- Python instalado e acessivel pelo comando `py`
-- Inno Setup 6 instalado
+- Python 3 instalado
+- Inno Setup 6 (apenas para instalador)
 
 Observacao:
 
 - A maquina do usuario final nao precisa ter Python nem WSL.
 
-## Gerar o instalador
+## Fluxo padrao (sem instalador)
 
 No PowerShell, a partir da raiz do projeto:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File appDesktop/windows/build_portable.ps1
+```
+
+Esse script:
+
+- valida sintaxe do `ui.py`;
+- valida baseline de layout (`windows/validate_layout_spec.py`);
+- gera `dist/RoteirizadorDesktop.exe`;
+- gera `dist/RoteirizadorDesktop_portable.zip`.
+
+## Fluxo com instalador
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File appDesktop/windows/build_windows.ps1
 ```
 
-Se quiser gerar apenas o `.exe` sem o instalador:
+Para pular instalador e manter so o `.exe`:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File appDesktop/windows/build_windows.ps1 -SkipInstaller
@@ -39,11 +52,11 @@ powershell -ExecutionPolicy Bypass -File appDesktop/windows/build_windows.ps1 -S
 
 O build embute os recursos necessarios ao app:
 
-- `distplat.json`
-- `gangway.json`
-- `velocidades.txt`
-- `geradorPlanilhaProgramação/criarTabela6.py`
-- `solver.py`
+- `appDesktop/solver.py`
+- `appDesktop/resources/distplat.json`
+- `appDesktop/resources/gangway.json`
+- `appDesktop/resources/velocidades.txt`
+- `appDesktop/resources/geradorPlanilhaProgramaÃ§Ã£o/criarTabela6.py`
 
 ## Configuracao local do usuario
 
