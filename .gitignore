@@ -8,11 +8,16 @@ __pycache__/
 venv/
 env/
 python/
+**/python/
 
 # Build artifacts
 build/
+build_alt/
 dist/
 dist_*/
+*.toc
+*.pyz
+*.pkg
 *.spec.bak
 *.log
 *.tmp
@@ -21,9 +26,16 @@ dist_*/
 
 # Installer/output
 appDesktop/windows/dist_installer/
+appDesktop/windows/dist_portable/
 appDesktop/windows/Output/
 appDesktop/windows/*.exe
 appDesktop/windows/*.msi
+
+# Bundled local toolchains
+tools/InnoSetup/
+geradorPlanilhaPrograma*/python/
+geradorPlanilhaPrograma*/__pycache__/
+appDesktop/resources/geradorPlanilhaPrograma*/__pycache__/
 
 # Desktop local data
 appDesktop/dados_compartilhados/
@@ -36,4 +48,6 @@ appDesktop/.roteirizador_desktop_config.json
 Thumbs.db
 .DS_Store
 *.Zone.Identifier
+*:Zone.Identifier
+*Zone.Identifier
 *sec.endpointdlp
