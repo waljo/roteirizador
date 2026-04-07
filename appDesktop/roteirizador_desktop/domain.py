@@ -142,6 +142,38 @@ class SolverRunResult:
 
 
 @dataclass
+class PickupDemand:
+    plataforma: str
+    origem: str
+    quantidade: int
+    prioridade: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class PickupBoatState:
+    nome: str
+    localizacao: str = "TMIB"
+    hora_disponivel: str = "00:00"
+    disponivel: bool = True
+    viagens_maximas: int = 2
+    rota_fixa: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class PickupPlanResult:
+    plan_text: str
+    warnings: List[str]
+    demand_summary_text: str
+    boat_states: List[PickupBoatState]
+
+
+@dataclass
 class VersionBundle:
     version: OperationVersion
     distribution_text: str = ""

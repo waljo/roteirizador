@@ -12,6 +12,8 @@ import os
 import re
 import math
 import time
+from functools import reduce
+from operator import mul
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple, Optional
 from copy import deepcopy
@@ -44,6 +46,8 @@ CROSS_CLUSTER_JUMP_PENALTY_PER_NM = 4.0  # penalidade por NM de salto entre clus
 CROSS_CLUSTER_JUMP_FREE_NM = 1.5  # folga sem penalidade para transicoes pequenas
 MAX_EXACT_ASSIGNMENTS = 2_000_000  # acima disso troca para busca guiada
 ASSIGNMENT_BEAM_WIDTH = 160  # largura do beam search quando o espaco explode
+ASSIGNMENT_MAX_BOATS_PER_PACKAGE = 3  # limita opcoes por pacote em cenarios grandes
+ASSIGNMENT_FORCE_BEAM_ABOVE = 250_000  # acima disso evita busca exaustiva mesmo com poda
 OPTIMIZER_TIME_LIMIT_SEC = 90  # limite por rodada do otimizador combinatorio
 OPTIMIZER_PROGRESS_EVERY = 20_000  # imprimir progresso a cada N combinacoes
 
@@ -1571,6 +1575,68 @@ def is_distant_cluster(cluster: str) -> bool:
     return cluster in ["PDO", "PGA", "PRB"]
 
 
+def rank_boats_for_package(package: List[Demand], boats: List[Boat], distances: Dict) -> List[int]:
+    """
+    Ordena barcos por afinidade heuristica com um pacote.
+    A ideia aqui nao e resolver o problema inteiro, e sim reduzir o espaco
+    de busca preservando os candidatos mais promissores.
+    """
+    package_total = sum(d.total() for d in package)
+    has_m9 = any(d.m9 > 0 for d in package)
+    has_priority1 = any(d.priority == 1 for d in package)
+    clusters = [get_geo_cluster(d.platform_norm) for d in package]
+    dominant_cluster = max(set(clusters), key=clusters.count) if clusters else "OTHER"
+    avg_tmib_dist = (
+        sum(get_dist(distances, "TMIB", d.platform_norm) for d in package) / max(1, len(package))
+    )
+    avg_m9_dist = (
+        sum(get_dist(distances, norm_plat("M9"), d.platform_norm) for d in package) / max(1, len(package))
+    )
+    prefer_early = (
+        has_priority1
+        or has_m9
+        or is_distant_cluster(dominant_cluster)
+        or dominant_cluster in {"M9_NEAR", "M2M3", "M6_AREA", "B_CLUSTER"}
+        or avg_m9_dist <= avg_tmib_dist
+    )
+
+    def boat_key(boat_idx: int):
+        boat = boats[boat_idx]
+        departure = boat.departure_minutes()
+        slack = max(0, boat.max_capacity - package_total)
+        aqua_penalty = 1 if (is_aqua_helix(boat.name) and has_m9) else 0
+        if prefer_early:
+            time_component = departure
+        else:
+            time_component = -departure
+        return (
+            aqua_penalty,
+            time_component,
+            slack,
+            boat_idx,
+        )
+
+    return sorted(range(len(boats)), key=boat_key)
+
+
+def reduce_boat_choices_for_packages(
+    packages: List[List[Demand]],
+    boats: List[Boat],
+    distances: Dict,
+    max_boats_per_package: int,
+) -> List[List[int]]:
+    reduced: List[List[int]] = []
+    for package in packages:
+        package_total = sum(d.total() for d in package)
+        eligible = [boat_idx for boat_idx, boat in enumerate(boats) if package_total <= boat.max_capacity]
+        if not eligible:
+            reduced.append([])
+            continue
+        ranked = [boat_idx for boat_idx in rank_boats_for_package(package, boats, distances) if boat_idx in eligible]
+        reduced.append(ranked[:max_boats_per_package] if len(ranked) > max_boats_per_package else ranked)
+    return reduced
+
+
 def build_cluster_route(boat: Boat, cluster_demands: List[Demand],
                         m9_tmib_demand: int, distances: Dict,
                         needs_m9_stop: bool) -> Optional[Route]:
@@ -1698,6 +1764,134 @@ def form_demand_packages(demands: List[Demand], boats: List[Boat]) -> List[List[
         packages.append([d])
 
     return packages
+
+
+def _package_cluster(package: List[Demand]) -> str:
+    clusters = [get_geo_cluster(d.platform_norm) for d in package if d.total() > 0]
+    return max(set(clusters), key=clusters.count) if clusters else "OTHER"
+
+
+def _package_totals(package: List[Demand]) -> Tuple[int, int]:
+    return sum(d.tmib for d in package), sum(d.m9 for d in package)
+
+
+def build_greedy_package_routes(
+    packages: List[List[Demand]],
+    boats: List[Boat],
+    distances: Dict,
+    m9_tmib_demand: int,
+    gangway_platforms: Set[str],
+    m9_priority: int = 99,
+) -> Tuple[List[Route], int, Set[int]]:
+    """
+    Construcao inicial gulosa para cenarios grandes.
+    Monta uma primeira atribuicao barco->pacotes em tempo muito menor do que
+    a busca combinatoria, e deixa o refinamento pesado apenas para o residual.
+    """
+    remaining_pkg_indices: Set[int] = set(range(len(packages)))
+    remaining_m9 = m9_tmib_demand
+    routes: List[Route] = []
+    consumed_pkg_indices: Set[int] = set()
+
+    for boat in boats:
+        selected_indices: List[int] = []
+        selected_demands: List[Demand] = []
+        tmib_total = 0
+        m9_total = 0
+        current_cluster: Optional[str] = None
+        current_anchor = norm_plat("M9")
+
+        while remaining_pkg_indices:
+            candidates = []
+            for pkg_idx in sorted(remaining_pkg_indices):
+                package = packages[pkg_idx]
+                pkg_tmib, pkg_m9 = _package_totals(package)
+                if tmib_total + pkg_tmib > boat.max_capacity:
+                    continue
+                if m9_total + pkg_m9 > boat.max_capacity:
+                    continue
+
+                pkg_cluster = _package_cluster(package)
+                compat_penalty = 0.0
+                if current_cluster and pkg_cluster != current_cluster:
+                    if are_clusters_compatible(current_cluster, pkg_cluster):
+                        compat_penalty = 2.0
+                    else:
+                        compat_penalty = 25.0
+
+                first_stop_dist = min(
+                    get_dist(distances, current_anchor, d.platform_norm)
+                    for d in package
+                    if d.total() > 0
+                )
+                priority = min((d.priority for d in package if d.total() > 0), default=99)
+                has_m9 = any(d.m9 > 0 for d in package)
+                score = (
+                    0 if priority == 1 else priority * 5,
+                    0 if has_m9 else 1,
+                    compat_penalty,
+                    first_stop_dist,
+                    -sum(d.total() for d in package),
+                    pkg_idx,
+                )
+                candidates.append((score, pkg_idx, package, pkg_cluster))
+
+            if not candidates:
+                break
+
+            _, pkg_idx, package, pkg_cluster = min(candidates, key=lambda item: item[0])
+            selected_indices.append(pkg_idx)
+            selected_demands.extend(d.copy() for d in package)
+            pkg_tmib, pkg_m9 = _package_totals(package)
+            tmib_total += pkg_tmib
+            m9_total += pkg_m9
+            current_cluster = pkg_cluster
+            current_anchor = min(
+                (d.platform_norm for d in package if d.total() > 0),
+                key=lambda plat: get_dist(distances, current_anchor, plat),
+            )
+            remaining_pkg_indices.remove(pkg_idx)
+
+            if tmib_total >= boat.max_capacity:
+                break
+
+        if not selected_demands:
+            continue
+
+        route, dist, m9_used, *_ = evaluate_boat_route(
+            selected_demands,
+            boat,
+            distances,
+            remaining_m9,
+            gangway_platforms,
+            m9_priority,
+        )
+        while selected_indices and (route is None or dist == float("inf")):
+            last_idx = selected_indices.pop()
+            remaining_pkg_indices.add(last_idx)
+            selected_demands = []
+            for keep_idx in selected_indices:
+                selected_demands.extend(d.copy() for d in packages[keep_idx])
+            if not selected_demands:
+                route = None
+                break
+            route, dist, m9_used, *_ = evaluate_boat_route(
+                selected_demands,
+                boat,
+                distances,
+                remaining_m9,
+                gangway_platforms,
+                m9_priority,
+            )
+
+        if route and dist != float("inf"):
+            routes.append(route)
+            remaining_m9 = max(0, remaining_m9 - m9_used)
+            consumed_pkg_indices.update(selected_indices)
+        else:
+            remaining_pkg_indices.update(selected_indices)
+
+    return routes, remaining_m9, consumed_pkg_indices
 
 
 def evaluate_boat_route(boat_demands: List[Demand], boat: Boat,
@@ -1833,8 +2027,34 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
     if n_pkgs == 0 or n_boats == 0:
         return [], m9_tmib_demand
 
-    total_combinations = n_boats ** n_pkgs
-    use_beam_search = total_combinations > MAX_EXACT_ASSIGNMENTS
+    raw_eligible_boats_per_pkg: List[List[int]] = []
+    for package in packages:
+        package_total = sum(d.total() for d in package)
+        eligible = [boat_idx for boat_idx, boat in enumerate(boats) if package_total <= boat.max_capacity]
+        if not eligible:
+            return [], m9_tmib_demand
+        raw_eligible_boats_per_pkg.append(eligible)
+
+    raw_total_combinations = reduce(mul, (len(options) for options in raw_eligible_boats_per_pkg), 1)
+    eligible_boats_per_pkg = raw_eligible_boats_per_pkg
+    reduced_search_active = False
+    if raw_total_combinations > ASSIGNMENT_FORCE_BEAM_ABOVE:
+        reduced_choices = reduce_boat_choices_for_packages(
+            packages,
+            boats,
+            distances,
+            max_boats_per_package=min(ASSIGNMENT_MAX_BOATS_PER_PACKAGE, n_boats),
+        )
+        if all(reduced_choices):
+            eligible_boats_per_pkg = reduced_choices
+            reduced_search_active = True
+
+    total_combinations = reduce(mul, (len(options) for options in eligible_boats_per_pkg), 1)
+    use_beam_search = (
+        total_combinations > MAX_EXACT_ASSIGNMENTS
+        or raw_total_combinations > ASSIGNMENT_FORCE_BEAM_ABOVE
+    )
+    force_beam_search = False
     route_eval_cache: Dict[
         Tuple[int, int, Tuple[Tuple[str, int, int, int], ...]],
         Tuple[Optional[Route], float, int, float, float, float, float],
@@ -1994,7 +2214,7 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
 
         if not use_beam_search:
             print(f"  Otimizador: busca completa em {total_combinations} combinacoes.")
-            for idx, assignment in enumerate(iter_product(range(n_boats), repeat=n_pkgs), start=1):
+            for idx, assignment in enumerate(iter_product(*eligible_boats_per_pkg), start=1):
                 elapsed = time.monotonic() - start_time
                 if idx % OPTIMIZER_PROGRESS_EVERY == 0:
                     print(f"    progresso: {idx} combinacoes avaliadas em {elapsed:.1f}s")
@@ -2020,9 +2240,13 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
                 f"  Otimizador: beam search em espaco {total_combinations} "
                 f"(largura {ASSIGNMENT_BEAM_WIDTH})."
             )
-            indexed_packages = list(enumerate(packages))
+            indexed_packages = [
+                (idx, packages[idx], eligible_boats_per_pkg[idx])
+                for idx in range(n_pkgs)
+            ]
             indexed_packages.sort(
                 key=lambda item: (
+                    len(item[2]),
                     -max((d.priority == 1) for d in item[1]),
                     -max((d.priority <= 3) for d in item[1]),
                     -sum(d.m9 for d in item[1]),
@@ -2031,7 +2255,12 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
             )
 
             beam = [(tuple(), {i: [] for i in range(n_boats)})]
-            for step_idx, (pkg_idx, package) in enumerate(indexed_packages, start=1):
+            beam_width = ASSIGNMENT_BEAM_WIDTH
+            if total_combinations > 50_000_000:
+                beam_width = min(beam_width, 96)
+            elif total_combinations > 10_000_000:
+                beam_width = min(beam_width, 128)
+            for step_idx, (pkg_idx, package, eligible_boats) in enumerate(indexed_packages, start=1):
                 elapsed = time.monotonic() - start_time
                 if elapsed > OPTIMIZER_TIME_LIMIT_SEC:
                     print(
@@ -2043,7 +2272,7 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
                 remaining_pkgs_after = n_pkgs - step_idx
                 candidates = []
                 for assignment_prefix, boat_demands_map in beam:
-                    for boat_idx in range(n_boats):
+                    for boat_idx in eligible_boats:
                         new_assignment = assignment_prefix + ((pkg_idx, boat_idx),)
                         new_map = {i: list(boat_demands_map[i]) for i in range(n_boats)}
                         new_map[boat_idx].extend(package)
@@ -2070,7 +2299,7 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
                     break
 
                 candidates.sort(key=lambda item: (item[0], item[1], item[2]))
-                beam = [(item[3], item[4]) for item in candidates[:ASSIGNMENT_BEAM_WIDTH]]
+                beam = [(item[3], item[4]) for item in candidates[:beam_width]]
 
                 if step_idx % max(1, min(4, n_pkgs)) == 0 or step_idx == n_pkgs:
                     print(
@@ -2126,6 +2355,22 @@ def optimize_hub_assignments(packages: List[List[Demand]], boats: List[Boat],
         best_routes, best_m9_remaining, top_scores = strict_routes, strict_m9_remaining, strict_top_scores
     else:
         best_routes, best_m9_remaining, top_scores = run_with_relaxations(require_zero_m9=False)
+
+    if reduced_search_active and (not best_routes or best_m9_remaining > 0):
+        print(
+            "  AVISO: poda heuristica descartou alternativas demais; "
+            "reexecutando com espaco completo em modo guiado."
+        )
+        eligible_boats_per_pkg = raw_eligible_boats_per_pkg
+        total_combinations = raw_total_combinations
+        force_beam_search = True
+        use_beam_search = True
+
+        strict_routes, strict_m9_remaining, strict_top_scores = run_with_relaxations(require_zero_m9=True)
+        if strict_routes:
+            best_routes, best_m9_remaining, top_scores = strict_routes, strict_m9_remaining, strict_top_scores
+        else:
+            best_routes, best_m9_remaining, top_scores = run_with_relaxations(require_zero_m9=False)
 
     if use_beam_search:
         print(f"  Cache de rotas reutilizadas: {len(route_eval_cache)}")
@@ -2332,33 +2577,50 @@ def solve(config: Config, boats: List[Boat], demands: List[Demand],
 
     if remaining_demands and remaining_boats:
         packages = form_demand_packages(remaining_demands, remaining_boats)
+        raw_eligible_counts = []
+        for package in packages:
+            package_total = sum(d.total() for d in package)
+            raw_eligible_counts.append(sum(1 for boat in remaining_boats if package_total <= boat.max_capacity))
+        raw_space = reduce(mul, raw_eligible_counts, 1) if raw_eligible_counts else 0
+
+        if raw_space > ASSIGNMENT_FORCE_BEAM_ABOVE:
+            eligible_boats = reduce_boat_choices_for_packages(
+                packages,
+                remaining_boats,
+                distances,
+                max_boats_per_package=min(ASSIGNMENT_MAX_BOATS_PER_PACKAGE, len(remaining_boats)),
+            )
+            reduced_space = reduce(mul, (len(opts) for opts in eligible_boats), 1) if eligible_boats else 0
+        else:
+            reduced_space = raw_space
 
         print(f"  Otimizador: {len(packages)} pacotes, {len(remaining_boats)} barcos, "
-              f"{len(remaining_boats) ** len(packages)} combinacoes")
+              f"{reduced_space} combinacoes")
 
-        hub_routes, remaining_m9_tmib = optimize_hub_assignments(
-            packages, remaining_boats, distances, remaining_m9_tmib, gangway_platforms,
-            m9_priority=m9_tmib_priority,
-            distant_boats_already=distant_boats_already, max_distant_boats=1
-        )
-        assigned_routes.extend(hub_routes)
+        if packages:
+            hub_routes, remaining_m9_tmib = optimize_hub_assignments(
+                packages, remaining_boats, distances, remaining_m9_tmib, gangway_platforms,
+                m9_priority=m9_tmib_priority,
+                distant_boats_already=distant_boats_already, max_distant_boats=1
+            )
+            assigned_routes.extend(hub_routes)
 
-        # Atualizar remaining_demands
-        for route in hub_routes:
-            for stop in route.pre_m9_stops + route.stops:
-                for d in remaining_demands[:]:
-                    if d.platform_norm == stop[0]:
-                        d.tmib = max(0, d.tmib - stop[1])
-                        d.m9 = max(0, d.m9 - stop[2])
-                        if d.total() <= 0:
-                            remaining_demands.remove(d)
-                        break
+            # Atualizar remaining_demands
+            for route in hub_routes:
+                for stop in route.pre_m9_stops + route.stops:
+                    for d in remaining_demands[:]:
+                        if d.platform_norm == stop[0]:
+                            d.tmib = max(0, d.tmib - stop[1])
+                            d.m9 = max(0, d.m9 - stop[2])
+                            if d.total() <= 0:
+                                remaining_demands.remove(d)
+                            break
 
-            # Remover barco da lista
-            if route.boat in surfers:
-                surfers.remove(route.boat)
-            elif route.boat in aquas:
-                aquas.remove(route.boat)
+                # Remover barco da lista
+                if route.boat in surfers:
+                    surfers.remove(route.boat)
+                elif route.boat in aquas:
+                    aquas.remove(route.boat)
 
     # â”€â”€ Phase 5: Fit remaining â”€â”€
     # Encaixar demandas restantes em rotas existentes com espaÃ§o

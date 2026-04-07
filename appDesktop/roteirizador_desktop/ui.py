@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from datetime import datetime
 import json
 from pathlib import Path
 import re
@@ -15,6 +16,7 @@ from .domain import (
     OperationalConfig,
     OperationMetadata,
     OperationVersion,
+    PickupBoatState,
     SolverRunResult,
     VersionBundle,
     VERSION_CL,
@@ -2030,6 +2032,361 @@ class ComparisonTab(QWidget):
             self.summary_text.setPlainText(details)
 
 
+class PickupBoatPositionsDialog(QDialog):
+    def __init__(self, boat_states: List[PickupBoatState], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Alterar posicao das lanchas")
+        self.resize(520, 420)
+        self.table = QTableWidget(0, 2)
+        self._build(boat_states)
+
+    def _build(self, boat_states: List[PickupBoatState]) -> None:
+        layout = QVBoxLayout(self)
+        info = QLabel(
+            "Informe a plataforma atual de cada lancha. A tela abre com a posicao inferida ao fim da entrega inicial."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #475569;")
+        layout.addWidget(info)
+
+        self.table.setHorizontalHeaderLabels(["Embarcacao", "Posicao atual"])
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        layout.addWidget(self.table, 1)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel_btn = QPushButton("Cancelar")
+        cancel_btn.clicked.connect(self.reject)
+        apply_btn = QPushButton("Aplicar")
+        apply_btn.clicked.connect(self.accept)
+        buttons.addWidget(cancel_btn)
+        buttons.addWidget(apply_btn)
+        layout.addLayout(buttons)
+
+        self.table.setRowCount(0)
+        for state in boat_states:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            boat_item = QTableWidgetItem(state.nome)
+            boat_item.setFlags(boat_item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, 0, boat_item)
+            self.table.setItem(row, 1, QTableWidgetItem(state.localizacao or "TMIB"))
+
+    def positions(self) -> Dict[str, str]:
+        result: Dict[str, str] = {}
+        for row in range(self.table.rowCount()):
+            nome = VersionEditor._text(self.table, row, 0)
+            if not nome:
+                continue
+            result[nome] = VersionEditor._text(self.table, row, 1) or "TMIB"
+        return result
+
+
+class PickupTab(QWidget):
+    def __init__(self, service: AppService, parent_window: "MainWindow"):
+        super().__init__()
+        self.service = service
+        self.parent_window = parent_window
+        self.version_combo = QComboBox()
+        self.surfer_cutoff_edit = QLineEdit("17:40")
+        self.boats_table = QTableWidget(0, 4)
+        self.demand_text = QTextEdit()
+        self.output_text = QTextEdit()
+        self._loaded_boat_states: List[PickupBoatState] = []
+        self._loaded_version: Optional[OperationVersion] = None
+        self._build()
+
+    def _build(self) -> None:
+        layout = QVBoxLayout(self)
+
+        controls = QGroupBox("Parametros do Recolhimento")
+        controls_layout = QGridLayout(controls)
+        self.version_combo.addItem("Programacao", VERSION_PROGRAMACAO)
+        self.version_combo.addItem("CL Oficial", VERSION_CL)
+        load_btn = QPushButton("Carregar operacao")
+        load_btn.clicked.connect(self.load_current_version)
+        edit_positions_btn = QPushButton("Alterar posicao das lanchas")
+        edit_positions_btn.clicked.connect(self.edit_boat_positions)
+        add_boat_btn = QPushButton("Incluir embarcacao")
+        add_boat_btn.clicked.connect(self.add_boat_row)
+        remove_boat_btn = QPushButton("Excluir embarcacao")
+        remove_boat_btn.clicked.connect(self.remove_boat_row)
+        plan_btn = QPushButton("Planejar recolhimento")
+        plan_btn.clicked.connect(self.plan_pickup)
+        start_now_btn = QPushButton("Iniciar recolhimento agora")
+        start_now_btn.clicked.connect(self.start_pickup_now)
+        controls_layout.addWidget(QLabel("Versao base:"), 0, 0)
+        controls_layout.addWidget(self.version_combo, 0, 1)
+        controls_layout.addWidget(QLabel("Chegada ao TMIB:"), 0, 2)
+        controls_layout.addWidget(self.surfer_cutoff_edit, 0, 3)
+        controls_layout.addWidget(load_btn, 0, 4)
+        controls_layout.addWidget(edit_positions_btn, 0, 5)
+        controls_layout.addWidget(add_boat_btn, 0, 6)
+        controls_layout.addWidget(remove_boat_btn, 0, 7)
+        controls_layout.addWidget(plan_btn, 0, 8)
+        controls_layout.addWidget(start_now_btn, 0, 9)
+        layout.addWidget(controls)
+
+        info = QLabel(
+            "O estado padrao considera as lanchas na posicao em que terminaram a entrega inicial. "
+            "Use o botao de alteracao de posicao se elas tiverem sido usadas em outras missoes durante o dia."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #475569;")
+        layout.addWidget(info)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(USE_COLLAPSIBLE_SPLITTERS)
+
+        boats_group = QGroupBox("Estado Atual da Frota")
+        boats_layout = QVBoxLayout(boats_group)
+        self.boats_table.setHorizontalHeaderLabels(
+            ["Disponivel", "Embarcacao", "Localizacao", "Rota fixa recolh."]
+        )
+        boats_header = self.boats_table.horizontalHeader()
+        boats_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        boats_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        boats_header.setSectionResizeMode(2, QHeaderView.Stretch)
+        boats_header.setSectionResizeMode(3, QHeaderView.Stretch)
+        boats_layout.addWidget(self.boats_table)
+        splitter.addWidget(boats_group)
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        demand_group = QGroupBox("Demanda de Recolhimento")
+        demand_layout = QVBoxLayout(demand_group)
+        self.demand_text.setReadOnly(True)
+        demand_layout.addWidget(self.demand_text)
+        right_layout.addWidget(demand_group)
+        output_group = QGroupBox("Plano Gerado")
+        output_layout = QVBoxLayout(output_group)
+        self.output_text.setReadOnly(True)
+        output_layout.addWidget(self.output_text)
+        right_layout.addWidget(output_group)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        layout.addWidget(splitter, 1)
+
+    def clear(self, message: str = "") -> None:
+        self._loaded_boat_states = []
+        self._loaded_version = None
+        self.boats_table.setRowCount(0)
+        self.demand_text.setPlainText("")
+        self.output_text.setPlainText(message)
+
+    def set_operation(self) -> None:
+        if not self.parent_window.current_operation or not self.parent_window.current_root:
+            self.clear("Selecione uma operacao para planejar o recolhimento.")
+            return
+        self.load_current_version()
+
+    def load_current_version(self) -> None:
+        if not self.parent_window.current_operation or not self.parent_window.current_root:
+            self.clear("Selecione uma operacao para planejar o recolhimento.")
+            return
+        version_name = self.version_combo.currentData()
+        try:
+            bundle, boat_states, demand_summary = self.service.load_pickup_context(
+                self.parent_window.current_root,
+                self.parent_window.current_operation,
+                version_name,
+            )
+        except Exception as exc:
+            self.clear(f"Nao foi possivel carregar o recolhimento:\n{exc}")
+            return
+        self.demand_text.setPlainText(demand_summary)
+        if bundle is None:
+            self._loaded_boat_states = []
+            self._loaded_version = None
+            self.boats_table.setRowCount(0)
+            self.output_text.setPlainText("Versao ainda nao salva.")
+            return
+        self._loaded_version = bundle.version
+        self._loaded_boat_states = [
+            PickupBoatState(
+                nome=item.nome,
+                localizacao=item.localizacao,
+                hora_disponivel=item.hora_disponivel,
+                disponivel=item.disponivel,
+                viagens_maximas=item.viagens_maximas,
+                rota_fixa=item.rota_fixa,
+            )
+            for item in boat_states
+        ]
+        self._populate_boat_table(boat_states)
+        if not bundle.distribution_text.strip():
+            self.output_text.setPlainText(
+                "Versao carregada, mas ainda sem distribuicao. Gere a distribuicao antes de planejar o recolhimento."
+            )
+            return
+        self.output_text.setPlainText(
+            "Estado da frota carregado a partir da distribuicao atual.\n"
+            "Se as lanchas foram usadas ao longo do dia, ajuste a posicao atual antes de planejar o recolhimento."
+        )
+
+    def _populate_boat_table(self, boat_states: List[PickupBoatState]) -> None:
+        self.boats_table.setRowCount(0)
+        for state in boat_states:
+            row = self.boats_table.rowCount()
+            self.boats_table.insertRow(row)
+            values = [
+                "SIM" if state.disponivel else "NAO",
+                state.nome,
+                state.localizacao,
+                state.rota_fixa,
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if col == 0:
+                    item.setTextAlignment(Qt.AlignCenter)
+                self.boats_table.setItem(row, col, item)
+
+    def _read_boat_states(self) -> List[PickupBoatState]:
+        result: List[PickupBoatState] = []
+        loaded_map = {item.nome: item for item in self._loaded_boat_states}
+        for row in range(self.boats_table.rowCount()):
+            nome = VersionEditor._text(self.boats_table, row, 1)
+            if not nome:
+                continue
+            localizacao = VersionEditor._text(self.boats_table, row, 2) or "TMIB"
+            base_state = loaded_map.get(nome)
+            hora_disponivel = (base_state.hora_disponivel if base_state else "00:00") or "00:00"
+            viagens = int(base_state.viagens_maximas if base_state else 1)
+            rota_fixa = VersionEditor._text(self.boats_table, row, 3).strip()
+            result.append(
+                PickupBoatState(
+                    nome=nome,
+                    localizacao=localizacao,
+                    hora_disponivel=hora_disponivel,
+                    disponivel=VersionEditor._text(self.boats_table, row, 0).strip().upper() != "NAO",
+                    viagens_maximas=max(0, viagens),
+                    rota_fixa=rota_fixa,
+                )
+            )
+        return result
+
+    def add_boat_row(self) -> None:
+        available_names: List[str] = []
+        if self.parent_window.current_op_config:
+            current_names = {VersionEditor._text(self.boats_table, row, 1) for row in range(self.boats_table.rowCount())}
+            available_names = [
+                item.nome
+                for item in self.parent_window.current_op_config.frota
+                if item.nome not in current_names
+            ]
+        if not available_names:
+            QMessageBox.information(self, "Recolhimento", "Nao ha embarcacoes adicionais para incluir.")
+            return
+        nome, ok = QInputDialog.getItem(self, "Incluir embarcacao", "Embarcacao:", available_names, 0, False)
+        if not ok or not nome:
+            return
+        row = self.boats_table.rowCount()
+        self.boats_table.insertRow(row)
+        defaults = ["SIM", nome, "TMIB", ""]
+        for col, value in enumerate(defaults):
+            item = QTableWidgetItem(value)
+            if col == 0:
+                item.setTextAlignment(Qt.AlignCenter)
+            self.boats_table.setItem(row, col, item)
+
+    def remove_boat_row(self) -> None:
+        row = self.boats_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "Recolhimento", "Selecione uma embarcacao para excluir.")
+            return
+        self.boats_table.removeRow(row)
+
+    def edit_boat_positions(self) -> None:
+        if self.boats_table.rowCount() == 0:
+            QMessageBox.warning(self, "Recolhimento", "Carregue uma operacao antes de alterar a posicao das lanchas.")
+            return
+        base_states = self._read_boat_states()
+        dialog = PickupBoatPositionsDialog(base_states, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        positions = dialog.positions()
+        for row in range(self.boats_table.rowCount()):
+            nome = VersionEditor._text(self.boats_table, row, 1)
+            if not nome or nome not in positions:
+                continue
+            item = QTableWidgetItem(positions[nome])
+            self.boats_table.setItem(row, 2, item)
+
+    def plan_pickup(self) -> None:
+        if not self.parent_window.current_operation or not self.parent_window.current_root:
+            QMessageBox.warning(self, "Recolhimento", "Selecione uma operacao.")
+            return
+        cutoff = self.surfer_cutoff_edit.text().strip()
+        if not re.match(r"^\d{2}:\d{2}$", cutoff):
+            QMessageBox.warning(self, "Recolhimento", "Informe o limite Surfer no formato HH:MM.")
+            return
+        try:
+            boat_states = self._read_boat_states()
+            result = self.service.plan_pickup(
+                self.parent_window.current_root,
+                self.parent_window.current_operation,
+                self.version_combo.currentData(),
+                boat_states,
+                cutoff,
+                execution_mode="plan",
+                now_hhmm=datetime.now().strftime("%H:%M"),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Recolhimento", str(exc))
+            return
+        self.output_text.setPlainText(result.plan_text)
+
+    def start_pickup_now(self) -> None:
+        if not self.parent_window.current_operation or not self.parent_window.current_root:
+            QMessageBox.warning(self, "Recolhimento", "Selecione uma operacao.")
+            return
+        cutoff = self.surfer_cutoff_edit.text().strip()
+        if not re.match(r"^\d{2}:\d{2}$", cutoff):
+            QMessageBox.warning(self, "Recolhimento", "Informe o limite Surfer no formato HH:MM.")
+            return
+        now_hhmm = datetime.now().strftime("%H:%M")
+        include_late_fixed_routes: Optional[bool] = None
+        if self._loaded_version is not None:
+            now_minutes = int(now_hhmm[:2]) * 60 + int(now_hhmm[3:])
+            has_late_fixed = any(
+                bool((item.rota_fixa or "").strip())
+                and bool((item.hora_saida or "").strip())
+                and (int(item.hora_saida[:2]) * 60 + int(item.hora_saida[3:])) <= now_minutes
+                for item in self._loaded_version.embarcacoes_disponiveis
+                if re.match(r"^\d{2}:\d{2}$", (item.hora_saida or "").strip())
+            )
+            if has_late_fixed:
+                response = QMessageBox.question(
+                    self,
+                    "Iniciar recolhimento agora",
+                    "Existem rotas fixas com horario ja passado. Deseja considera-las mesmo assim?",
+                    QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                    QMessageBox.Yes,
+                )
+                if response == QMessageBox.Cancel:
+                    return
+                include_late_fixed_routes = response == QMessageBox.Yes
+        try:
+            boat_states = self._read_boat_states()
+            result = self.service.plan_pickup(
+                self.parent_window.current_root,
+                self.parent_window.current_operation,
+                self.version_combo.currentData(),
+                boat_states,
+                cutoff,
+                execution_mode="start_now",
+                now_hhmm=now_hhmm,
+                include_late_fixed_routes=include_late_fixed_routes,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Recolhimento", str(exc))
+            return
+        self.output_text.setPlainText(result.plan_text)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2067,10 +2424,12 @@ class MainWindow(QMainWindow):
         self.config_tab = ConfigTab(self.service, self)
         self.programacao_tab = VersionEditor(self.service, self, VERSION_PROGRAMACAO)
         self.cl_tab = VersionEditor(self.service, self, VERSION_CL)
+        self.pickup_tab = PickupTab(self.service, self)
         self.comparison_tab = ComparisonTab(self.service, self)
         right.addTab(self.config_tab, "Configuracoes")
         right.addTab(self.programacao_tab, "Programacao")
         right.addTab(self.cl_tab, "CL Oficial")
+        right.addTab(self.pickup_tab, "Recolhimento")
         right.addTab(self.comparison_tab, "Comparacao")
 
         splitter = QSplitter()
@@ -2273,8 +2632,16 @@ class MainWindow(QMainWindow):
             self.current_op_config,
         )
         if self.current_operation and self.current_root:
+            cl_bundle = self.service.load_version(self.current_root, self.current_operation, VERSION_CL)
+            prog_bundle = self.service.load_version(self.current_root, self.current_operation, VERSION_PROGRAMACAO)
+            preferred = VERSION_CL if cl_bundle and cl_bundle.distribution_text.strip() else VERSION_PROGRAMACAO
+            self.pickup_tab.version_combo.setCurrentIndex(
+                1 if preferred == VERSION_CL else 0
+            )
+            self.pickup_tab.set_operation()
             self.comparison_tab.load(self.service.load_comparison(self.current_root, self.current_operation))
         else:
+            self.pickup_tab.clear("Selecione uma operacao para planejar o recolhimento.")
             self.comparison_tab.load(None)
 
 

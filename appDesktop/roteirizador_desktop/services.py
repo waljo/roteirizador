@@ -15,11 +15,20 @@ from .domain import (
     OperationalConfig,
     OperationMetadata,
     OperationVersion,
+    PickupBoatState,
+    PickupPlanResult,
     SolverRunResult,
     VersionBundle,
     VERSION_CL,
     VERSION_PROGRAMACAO,
+    VERSION_TYPES,
     utc_now_iso,
+)
+from .pickup_planner import (
+    build_pickup_demands,
+    format_pickup_demand_summary,
+    infer_pickup_boat_states,
+    plan_pickup,
 )
 from .runtime import resource_path
 from .solver_integration import (
@@ -233,6 +242,60 @@ class AppService:
 
     def load_comparison(self, root: str, metadata: OperationMetadata):
         return self.network_storage(root).load_comparison(metadata)
+
+    def load_pickup_context(
+        self,
+        root: str,
+        metadata: OperationMetadata,
+        version_name: str,
+    ) -> tuple[Optional[VersionBundle], List[PickupBoatState], str]:
+        if version_name not in VERSION_TYPES:
+            raise ValueError("Versao invalida para recolhimento.")
+        bundle = self.load_version(root, metadata, version_name)
+        if bundle is None:
+            return None, [], "Versao ainda nao salva."
+        op_config = self.load_operational_config(root)
+        boat_states = infer_pickup_boat_states(
+            bundle.version,
+            bundle.distribution_text,
+            op_config,
+            str(self.network_storage(root).config_path("distancias.json")),
+            initial_only=True,
+        )
+        return bundle, boat_states, format_pickup_demand_summary(
+            build_pickup_demands(bundle.version, bundle.distribution_text)
+        )
+
+    def plan_pickup(
+        self,
+        root: str,
+        metadata: OperationMetadata,
+        version_name: str,
+        boat_states: List[PickupBoatState],
+        surfer_cutoff_hhmm: str,
+        execution_mode: str = "plan",
+        now_hhmm: str = "00:00",
+        include_late_fixed_routes: Optional[bool] = None,
+    ) -> PickupPlanResult:
+        if version_name not in VERSION_TYPES:
+            raise ValueError("Versao invalida para recolhimento.")
+        bundle = self.load_version(root, metadata, version_name)
+        if bundle is None:
+            raise ValueError("Versao selecionada ainda nao foi salva.")
+        if not bundle.distribution_text.strip():
+            raise ValueError("Gere ou carregue uma distribuicao antes de planejar o recolhimento.")
+        op_config = self.load_operational_config(root)
+        return plan_pickup(
+            bundle.version,
+            bundle.distribution_text,
+            op_config,
+            str(self.network_storage(root).config_path("distancias.json")),
+            boat_states,
+            surfer_cutoff_hhmm=surfer_cutoff_hhmm,
+            execution_mode=execution_mode,
+            now_hhmm=now_hhmm,
+            include_late_fixed_routes=include_late_fixed_routes,
+        )
 
     def run_version(
         self,
