@@ -17,6 +17,7 @@ _M9_DROP_RE = re.compile(r"\(-\s*(\d+)\)")
 _SIMPLE_DROP_RE = re.compile(r"(?<![\w{(])-+\s*(\d+)")
 _SIMPLE_PICKUP_RE = re.compile(r"(?<![\w{:])\+\s*(\d+)")
 DEFAULT_INITIAL_DELIVERY_CUTOFF = "12:00"
+DEFAULT_PICKUP_FIXED_IMPORT_CUTOFF = "12:00"
 KNOWN_ORIGIN_HUBS = {"TMIB", "M9", "M1"}
 PREFERRED_PICKUP_SWEEPS: Tuple[Tuple[str, ...], ...] = (
     ("B3", "B1", "M8", "M6"),
@@ -91,6 +92,15 @@ class _RoutePart:
         )
 
 
+def _clone_route_part(part: _RoutePart) -> _RoutePart:
+    return _RoutePart(
+        plataforma=part.plataforma,
+        generic_pickup=int(part.generic_pickup),
+        pickups_to=dict(part.pickups_to),
+        deliveries=dict(part.deliveries),
+    )
+
+
 def _parse_route_part(part: str) -> Optional[_RoutePart]:
     text = (part or "").strip()
     if not text:
@@ -139,6 +149,105 @@ def _parse_route_parts(route_str: str) -> List[_RoutePart]:
         if part is not None:
             parts.append(part)
     return parts
+
+
+def _render_route_part(part: _RoutePart) -> str:
+    tokens: List[str] = [part.plataforma]
+    if int(part.generic_pickup) > 0:
+        tokens.append(f"+{int(part.generic_pickup)}")
+    for target, qty in sorted(part.pickups_to.items()):
+        if int(qty) > 0:
+            tokens.append(f"{{{_short_platform(target)}:+{int(qty)}}}")
+    tmib_drop = int(part.deliveries.get("TMIB", 0))
+    if tmib_drop > 0:
+        tokens.append(f"-{tmib_drop}")
+    m9_drop = int(part.deliveries.get("M9", 0))
+    if m9_drop > 0:
+        tokens.append(f"(-{m9_drop})")
+    for origem, qty in sorted(part.deliveries.items()):
+        short = _short_platform(origem)
+        if short in {"TMIB", "M9"} or int(qty) <= 0:
+            continue
+        tokens.append(f"{{{short}:-{int(qty)}}}")
+    return " ".join(tokens)
+
+
+def _render_route_parts(parts: List[_RoutePart]) -> str:
+    return "/".join(_render_route_part(part) for part in parts if part is not None)
+
+
+def _pickup_activity(part: _RoutePart) -> int:
+    return int(part.generic_pickup) + sum(int(qty) for qty in part.pickups_to.values() if int(qty) > 0)
+
+
+def _delivered_to_non_hub_platforms(parts: List[_RoutePart]) -> Dict[str, int]:
+    delivered: Dict[str, int] = defaultdict(int)
+    for part in parts:
+        platform = _short_platform(part.plataforma)
+        if platform in KNOWN_ORIGIN_HUBS:
+            continue
+        for origem, quantidade in part.deliveries.items():
+            if int(quantidade) <= 0:
+                continue
+            if _is_origin_hub(origem):
+                delivered[platform] += int(quantidade)
+    return delivered
+
+
+def _extract_importable_pickup_prefix(
+    route_str: str,
+    prior_distributed: Dict[str, int],
+) -> Optional[str]:
+    parts = _parse_route_parts(route_str)
+    if not parts:
+        return None
+    if _short_platform(parts[0].plataforma) in KNOWN_ORIGIN_HUBS:
+        return None
+
+    collected_platforms: List[str] = []
+    trimmed: List[_RoutePart] = []
+    for part in parts:
+        platform = _short_platform(part.plataforma)
+        trimmed_part = _clone_route_part(part)
+        if platform in KNOWN_ORIGIN_HUBS:
+            if not collected_platforms:
+                return None
+            trimmed_part.generic_pickup = 0
+            trimmed_part.pickups_to = {}
+            trimmed.append(trimmed_part)
+            if all(int(prior_distributed.get(item, 0)) > 0 for item in collected_platforms):
+                return _render_route_parts(trimmed)
+            return None
+        if _pickup_activity(part) > 0:
+            collected_platforms.append(platform)
+        trimmed.append(trimmed_part)
+    return None
+
+
+def infer_importable_pickup_routes(
+    distribution_text: str,
+    min_departure_hhmm: str = DEFAULT_PICKUP_FIXED_IMPORT_CUTOFF,
+) -> Dict[str, Tuple[str, str]]:
+    prior_distributed: Dict[str, int] = defaultdict(int)
+    imported: Dict[str, Tuple[str, str]] = {}
+    min_departure = _hhmm_to_minutes(min_departure_hhmm)
+    routes = sorted(
+        parse_distribution_text(distribution_text),
+        key=lambda item: (_hhmm_to_minutes(item[1]), item[0]),
+    )
+    for boat_name, departure, route_str in routes:
+        if _hhmm_to_minutes(departure) < min_departure:
+            for platform, qty in _delivered_to_non_hub_platforms(_parse_route_parts(route_str)).items():
+                prior_distributed[platform] += int(qty)
+            continue
+        importable = _extract_importable_pickup_prefix(route_str, prior_distributed)
+        if importable:
+            current = imported.get(boat_name)
+            if current is None or _hhmm_to_minutes(departure) >= _hhmm_to_minutes(current[0]):
+                imported[boat_name] = (departure, importable)
+        for platform, qty in _delivered_to_non_hub_platforms(_parse_route_parts(route_str)).items():
+            prior_distributed[platform] += int(qty)
+    return imported
 
 
 def _infer_generic_pickup_targets(parts: List[_RoutePart]) -> List[Optional[str]]:
@@ -451,6 +560,7 @@ def infer_pickup_boat_states(
             hora_disponivel=item.hora_saida or "00:00",
             disponivel=True,
             viagens_maximas=2,
+            rota_fixa=(item.rota_fixa or "").strip(),
         )
 
     if distribution_text.strip():
@@ -3508,6 +3618,7 @@ def plan_pickup(
     config: OperationalConfig,
     distances_path: str,
     boat_states: List[PickupBoatState],
+    custom_demands: Optional[List[PickupDemand]] = None,
     surfer_cutoff_hhmm: str = "17:40",
     execution_mode: str = "plan",
     now_hhmm: str = "00:00",
@@ -3520,11 +3631,23 @@ def plan_pickup(
         execution_mode,
         include_late_fixed_routes,
     )
-    source_demands = build_pickup_demands(
-        version,
-        distribution_text,
-        excluded_fixed_signatures=excluded_fixed_signatures,
-    )
+    if custom_demands is not None:
+        source_demands = [
+            PickupDemand(
+                plataforma=_short_platform(item.plataforma),
+                origem=_short_platform(item.origem),
+                quantidade=max(0, int(item.quantidade)),
+                prioridade=max(0, int(item.prioridade)),
+            )
+            for item in custom_demands
+            if (item.plataforma or "").strip() and (item.origem or "").strip() and int(item.quantidade) > 0
+        ]
+    else:
+        source_demands = build_pickup_demands(
+            version,
+            distribution_text,
+            excluded_fixed_signatures=excluded_fixed_signatures,
+        )
     demand_summary = format_pickup_demand_summary(source_demands)
     pending: List[_PendingDemand] = [
         _PendingDemand(

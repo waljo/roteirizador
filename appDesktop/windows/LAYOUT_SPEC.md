@@ -1,6 +1,6 @@
 # Layout Spec (Desktop UI)
 
-- Spec version: `1.1.0`
+- Spec version: `1.4.0`
 - Target file: `appDesktop/roteirizador_desktop/ui.py`
 - Platform scope: Windows/Linux
 
@@ -8,7 +8,7 @@
 
 These constants must stay synchronized with this document:
 
-- `LAYOUT_SPEC_VERSION = "1.1.0"`
+- `LAYOUT_SPEC_VERSION = "1.4.0"`
 - `HELP_SECTION_MAX_HEIGHT = 220`
 - `BUTTON_GRID_SPACING = 6`
 - `USE_COLLAPSIBLE_SPLITTERS = False`
@@ -58,8 +58,35 @@ Rules:
   - `Add linha`
   - `Exc. linha`
   - `Imp. csv`
-  - `Imp. Extrato pdf`
-  - `Exp. csv`
+- `Imp. Extrato pdf`
+- `Exp. csv`
+
+### Pickup tab (`Recolhimento`)
+
+Rules:
+
+- `Parametros do Recolhimento` must include a motor selector combo with options:
+  - `Legado (v2 atual)`
+  - `PD V1 (novo teste)`
+- `Estado Atual da Frota` must use a table with columns:
+  - `Disponivel`
+  - `Embarcacao`
+  - `Localizacao`
+  - `Rota fixa recolh.`
+- Buttons related to fleet state must stay below the fleet table in a dedicated horizontal action row.
+- `Demanda de Recolhimento` must use a table with columns:
+  - `Plataforma`
+  - `TMIB`
+  - `M9`
+  - `M1`
+  - `Prio`
+- Buttons related to pickup demand must stay below the demand table in a dedicated horizontal action row.
+- The demand action row must include:
+  - `Incluir plataforma`
+  - `Excluir plataforma`
+  - `Exportar CSV`
+  - `Planejar recolhimento`
+  - `Iniciar recolhimento agora`
 
 ## Build guardrail
 

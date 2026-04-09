@@ -9,7 +9,7 @@ def check_patterns(source: str) -> list[str]:
     errors: list[str] = []
 
     required_literals = [
-        'LAYOUT_SPEC_VERSION = "1.1.0"',
+        'LAYOUT_SPEC_VERSION = "1.4.0"',
         "HELP_SECTION_MAX_HEIGHT = 220",
         "BUTTON_GRID_SPACING = 6",
         "USE_COLLAPSIBLE_SPLITTERS = False",
@@ -26,6 +26,20 @@ def check_patterns(source: str) -> list[str]:
         'import_csv = QPushButton("Imp. csv")',
         'import_pdf = QPushButton("Imp. Extrato pdf")',
         'export_csv = QPushButton("Exp. csv")',
+        'self.boats_table.setHorizontalHeaderLabels(',
+        '["Disponivel", "Embarcacao", "Localizacao", "Rota fixa recolh."]',
+        'boats_btns = QHBoxLayout()',
+        'self.pickup_engine_combo = QComboBox()',
+        'self.pickup_engine_combo.addItem("Legado (v2 atual)", "legacy_v2")',
+        'self.pickup_engine_combo.addItem("PD V1 (novo teste)", "pd_v1")',
+        'controls_layout.addWidget(QLabel("Motor:"), 0, 2)',
+        'self.demand_table.setHorizontalHeaderLabels(["Plataforma", "TMIB", "M9", "M1", "Prio"])',
+        'demand_btns = QHBoxLayout()',
+        'add_demand_btn = QPushButton("Incluir plataforma")',
+        'remove_demand_btn = QPushButton("Excluir plataforma")',
+        'export_demand_btn = QPushButton("Exportar CSV")',
+        'plan_btn = QPushButton("Planejar recolhimento")',
+        'start_now_btn = QPushButton("Iniciar recolhimento agora")',
     ]
     for literal in required_literals:
         if literal not in source:

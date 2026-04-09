@@ -16,6 +16,7 @@ from .domain import (
     OperationMetadata,
     OperationVersion,
     PickupBoatState,
+    PickupDemand,
     PickupPlanResult,
     SolverRunResult,
     VersionBundle,
@@ -27,8 +28,20 @@ from .domain import (
 from .pickup_planner import (
     build_pickup_demands,
     format_pickup_demand_summary,
+    infer_importable_pickup_routes,
     infer_pickup_boat_states,
-    plan_pickup,
+)
+from .pickup_planner_v2 import plan_pickup as plan_pickup_v2
+from .offshore_pd import (
+    AliasResolver,
+    Boat,
+    Request,
+    SolverParameters,
+    check_solution,
+    format_operational_text,
+    load_distance_matrix,
+    solution_to_json_dict,
+    solve_pickup_delivery,
 )
 from .runtime import resource_path
 from .solver_integration import (
@@ -248,12 +261,12 @@ class AppService:
         root: str,
         metadata: OperationMetadata,
         version_name: str,
-    ) -> tuple[Optional[VersionBundle], List[PickupBoatState], str]:
+    ) -> tuple[Optional[VersionBundle], List[PickupBoatState], List[PickupDemand]]:
         if version_name not in VERSION_TYPES:
             raise ValueError("Versao invalida para recolhimento.")
         bundle = self.load_version(root, metadata, version_name)
         if bundle is None:
-            return None, [], "Versao ainda nao salva."
+            return None, [], []
         op_config = self.load_operational_config(root)
         boat_states = infer_pickup_boat_states(
             bundle.version,
@@ -262,9 +275,32 @@ class AppService:
             str(self.network_storage(root).config_path("distancias.json")),
             initial_only=True,
         )
-        return bundle, boat_states, format_pickup_demand_summary(
-            build_pickup_demands(bundle.version, bundle.distribution_text)
-        )
+        for item in boat_states:
+            item.rota_fixa = ""
+        cl_bundle = self.load_version(root, metadata, VERSION_CL)
+        if cl_bundle is not None:
+            state_map = {item.nome: item for item in boat_states}
+            for nome, (departure, route_text) in infer_importable_pickup_routes(
+                cl_bundle.distribution_text
+            ).items():
+                current = state_map.get(nome)
+                if current is None:
+                    current = PickupBoatState(
+                        nome=nome,
+                        localizacao="TMIB",
+                        hora_disponivel=departure or "00:00",
+                        disponivel=True,
+                        viagens_maximas=2,
+                        rota_fixa=(route_text or "").strip(),
+                    )
+                    boat_states.append(current)
+                    state_map[nome] = current
+                else:
+                    current.rota_fixa = (route_text or "").strip()
+                    if departure:
+                        current.hora_disponivel = departure
+        boat_states = sorted(boat_states, key=lambda item: (item.hora_disponivel, item.nome))
+        return bundle, boat_states, build_pickup_demands(bundle.version, bundle.distribution_text)
 
     def plan_pickup(
         self,
@@ -272,10 +308,12 @@ class AppService:
         metadata: OperationMetadata,
         version_name: str,
         boat_states: List[PickupBoatState],
+        custom_demands: Optional[List[PickupDemand]],
         surfer_cutoff_hhmm: str,
         execution_mode: str = "plan",
         now_hhmm: str = "00:00",
         include_late_fixed_routes: Optional[bool] = None,
+        pickup_engine: str = "legacy_v2",
     ) -> PickupPlanResult:
         if version_name not in VERSION_TYPES:
             raise ValueError("Versao invalida para recolhimento.")
@@ -285,16 +323,144 @@ class AppService:
         if not bundle.distribution_text.strip():
             raise ValueError("Gere ou carregue uma distribuicao antes de planejar o recolhimento.")
         op_config = self.load_operational_config(root)
-        return plan_pickup(
+        distances_path = str(self.network_storage(root).config_path("distancias.json"))
+        if pickup_engine == "pd_v1":
+            return self._plan_pickup_pd_v1(
+                op_config=op_config,
+                boat_states=boat_states,
+                custom_demands=custom_demands,
+                distances_path=distances_path,
+                execution_mode=execution_mode,
+                surfer_cutoff_hhmm=surfer_cutoff_hhmm,
+            )
+
+        return plan_pickup_v2(
             bundle.version,
             bundle.distribution_text,
             op_config,
-            str(self.network_storage(root).config_path("distancias.json")),
+            distances_path,
             boat_states,
+            custom_demands=custom_demands,
             surfer_cutoff_hhmm=surfer_cutoff_hhmm,
             execution_mode=execution_mode,
             now_hhmm=now_hhmm,
             include_late_fixed_routes=include_late_fixed_routes,
+        )
+
+    def _plan_pickup_pd_v1(
+        self,
+        op_config: OperationalConfig,
+        boat_states: List[PickupBoatState],
+        custom_demands: Optional[List[PickupDemand]],
+        distances_path: str,
+        execution_mode: str,
+        surfer_cutoff_hhmm: str,
+    ) -> PickupPlanResult:
+        resolver = AliasResolver()
+        distances = load_distance_matrix(distances_path, resolver=resolver)
+        vessel_map = op_config.vessel_map()
+
+        source_demands: List[PickupDemand] = []
+        for item in custom_demands or []:
+            if int(item.quantidade) <= 0:
+                continue
+            if not (item.plataforma or "").strip() or not (item.origem or "").strip():
+                continue
+            source_demands.append(
+                PickupDemand(
+                    plataforma=item.plataforma.strip(),
+                    origem=item.origem.strip(),
+                    quantidade=int(item.quantidade),
+                    prioridade=max(0, int(item.prioridade)),
+                )
+            )
+        if not source_demands:
+            raise ValueError("Demanda de recolhimento vazia para o motor PD V1.")
+
+        requests: List[Request] = []
+        for idx, item in enumerate(source_demands, start=1):
+            requests.append(
+                Request(
+                    request_id=f"REQ-{idx:04d}",
+                    pickup=item.plataforma,
+                    delivery=item.origem,
+                    pax=int(item.quantidade),
+                    priority=max(0, int(item.prioridade)),
+                )
+            )
+
+        boats: List[Boat] = []
+        warnings: List[str] = []
+        has_fixed_routes = False
+        for state in boat_states:
+            if not state.disponivel or int(state.viagens_maximas) <= 0:
+                continue
+            vessel = vessel_map.get(state.nome)
+            if vessel is None:
+                continue
+            if (state.rota_fixa or "").strip():
+                has_fixed_routes = True
+            boats.append(
+                Boat(
+                    name=state.nome,
+                    start=(state.localizacao or "TMIB"),
+                    capacity=int(vessel.capacidade),
+                    end="TMIB",
+                )
+            )
+        if not boats:
+            raise ValueError("Nao ha embarcacoes disponiveis para o motor PD V1.")
+
+        if has_fixed_routes:
+            warnings.append("Motor PD V1 ignora rotas fixas nesta versao de teste.")
+        if execution_mode != "plan":
+            warnings.append(
+                f"Motor PD V1 executado em modo '{execution_mode}', mas sem logica especifica de janela/fixa."
+            )
+
+        solution = solve_pickup_delivery(
+            requests=requests,
+            boats=boats,
+            distances=distances,
+            params=SolverParameters(
+                engine="python",
+                time_limit_sec=20,
+                max_lns_iterations=30,
+                allow_split_requests=True,
+                allow_unserved=False,
+            ),
+            resolver=resolver,
+        )
+        errors = check_solution(solution, requests, boats, distances, resolver=resolver)
+        if errors:
+            raise ValueError("Solucao PD V1 invalida:\n" + "\n".join(errors))
+
+        plan_text = (
+            "PLANO DE RECOLHIMENTO\n"
+            + "=" * 70
+            + "\n"
+            + f"Motor recolhimento: pd_v1\n"
+            + f"Horario de chegada ao TMIB (referencia): {surfer_cutoff_hhmm}\n\n"
+            + format_operational_text(solution, resolver=resolver).strip()
+            + (
+                "\n\nAVISOS\n"
+                + "-" * 70
+                + "\n"
+                + "\n".join(f"- {item}" for item in warnings)
+                if warnings
+                else ""
+            )
+            + "\n\nJSON RESUMO\n"
+            + "-" * 70
+            + "\n"
+            + json.dumps(solution_to_json_dict(solution, resolver=resolver), ensure_ascii=False, indent=2)
+            + "\n"
+        )
+        return PickupPlanResult(
+            plan_text=plan_text,
+            warnings=warnings,
+            demand_summary_text=format_pickup_demand_summary(source_demands),
+            boat_states=boat_states,
         )
 
     def run_version(
