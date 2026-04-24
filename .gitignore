@@ -40,6 +40,15 @@ appDesktop/resources/geradorPlanilhaPrograma*/__pycache__/
 # Desktop local data
 appDesktop/dados_compartilhados/
 appDesktop/.roteirizador_desktop_config.json
+appDesktopV2/dados_compartilhados/
+appDesktopV2/.roteirizador_desktop_config.json
+appDesktopV2/windows/dist_installer/
+appDesktopV2/windows/dist_portable/
+appDesktopV2/windows/Output/
+appDesktopV2/windows/*.exe
+appDesktopV2/windows/*.msi
+appDesktopV2/operacao_*.csv
+appDesktopV2/conversa_*.txt
 
 # IDE/OS
 .vscode/
