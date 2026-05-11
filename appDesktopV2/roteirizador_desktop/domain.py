@@ -20,10 +20,32 @@ class FleetVessel:
     tipo: str
     capacidade: int
     velocidade: float
+    tempo_aproximacao_min: float = 0.0
+    tempo_travessia_pax_min: float = 1.0
     ativa: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "FleetVessel":
+        nome = str(data.get("nome", "")).strip()
+        tipo = str(data.get("tipo", "") or "surfer").strip()
+        is_aqua = tipo.lower() == "aqua" or ("AQUA" in nome.upper() and "HELIX" in nome.upper())
+        default_approach = 25.0 if is_aqua else 0.0
+        return cls(
+            nome=nome,
+            tipo=tipo,
+            capacidade=int(data.get("capacidade", 24) or 24),
+            velocidade=float(data.get("velocidade", 14.0) or 14.0),
+            tempo_aproximacao_min=float(
+                data.get("tempo_aproximacao_min", default_approach) or 0.0
+            ),
+            tempo_travessia_pax_min=float(
+                data.get("tempo_travessia_pax_min", data.get("minutos_por_pax", 1.0)) or 1.0
+            ),
+            ativa=bool(data.get("ativa", True)),
+        )
 
 
 @dataclass
@@ -32,10 +54,43 @@ class DemandItem:
     tmib: int = 0
     m9: int = 0
     m1: int = 0
+    origens_extras: Dict[str, int] = field(default_factory=dict)
     prioridade: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data["origens_extras"] = {
+            str(origin).strip().upper(): int(qty)
+            for origin, qty in self.origens_extras.items()
+            if str(origin).strip() and int(qty) != 0
+        }
+        return data
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "DemandItem":
+        extras = {
+            str(origin).strip().upper(): int(qty)
+            for origin, qty in data.get("origens_extras", {}).items()
+            if str(origin).strip() and int(qty) != 0
+        }
+        return cls(
+            plataforma=str(data.get("plataforma", "")).strip(),
+            tmib=int(data.get("tmib", 0) or 0),
+            m9=int(data.get("m9", 0) or 0),
+            m1=int(data.get("m1", 0) or 0),
+            origens_extras=extras,
+            prioridade=int(data.get("prioridade", 0) or 0),
+        )
+
+    def quantidade_origem(self, origem: str) -> int:
+        code = (origem or "").strip().upper()
+        if code == "TMIB":
+            return int(self.tmib)
+        if code == "M9":
+            return int(self.m9)
+        if code == "M1":
+            return int(self.m1)
+        return int(self.origens_extras.get(code, 0))
 
 
 @dataclass
@@ -84,7 +139,7 @@ class OperationVersion:
             embarcacoes_disponiveis=[
                 AvailableBoat(**item) for item in data.get("embarcacoes_disponiveis", [])
             ],
-            demanda=[DemandItem(**item) for item in data.get("demanda", [])],
+            demanda=[DemandItem.from_dict(item) for item in data.get("demanda", [])],
         )
 
 

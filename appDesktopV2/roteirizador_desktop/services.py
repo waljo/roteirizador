@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 from datetime import date
 from pathlib import Path
@@ -104,6 +105,8 @@ class AppService:
                         tipo="aqua" if solver.is_aqua_helix(name) else "surfer",
                         capacidade=solver.get_max_capacity(name),
                         velocidade=float(solver.get_speed(speeds, name)),
+                        tempo_aproximacao_min=25.0 if solver.is_aqua_helix(name) else 0.0,
+                        tempo_travessia_pax_min=1.0,
                         ativa=True,
                     ).to_dict()
                 )
@@ -208,7 +211,7 @@ class AppService:
             for item in origens_extrato_payload.get("origens", [])
         ] or default_extrato_origins()
         return OperationalConfig(
-            frota=[FleetVessel(**item) for item in frota.get("embarcacoes", [])],
+            frota=[FleetVessel.from_dict(item) for item in frota.get("embarcacoes", [])],
             unidades=unidades.get("unidades", []),
             gangway=gangway.get("plataformas_gangway", []),
             embarcacoes_conves=conves.get(
@@ -760,19 +763,38 @@ class AppService:
 
     @staticmethod
     def _format_demand_table(version: OperationVersion) -> str:
-        header = f"{'PLATAFORMA':<14} {'TMIB':>6} {'M9':>6} {'M1':>6} {'PRIO':>6}"
+        extra_origins: List[str] = []
+        if any(int(getattr(item, "m1", 0) or 0) for item in version.demanda):
+            extra_origins.append("M1")
+        for item in version.demanda:
+            for origin, qty in getattr(item, "origens_extras", {}).items():
+                origin_up = (origin or "").strip().upper()
+                if origin_up and origin_up not in {"TMIB", "M9", "M1"} and int(qty) != 0:
+                    if origin_up not in extra_origins:
+                        extra_origins.append(origin_up)
+        header = f"{'PLATAFORMA':<14} {'TMIB':>6} {'M9':>6}"
+        for origin in extra_origins:
+            header += f" {origin:>6}"
+        header += f" {'PRIO':>6}"
         sep = "-" * len(header)
         rows = [header, sep]
         demands = [
             item
             for item in version.demanda
-            if int(item.tmib) or int(item.m9) or int(getattr(item, "m1", 0))
+            if int(item.tmib)
+            or int(item.m9)
+            or int(getattr(item, "m1", 0))
+            or any(int(qty) != 0 for qty in getattr(item, "origens_extras", {}).values())
         ]
         for item in sorted(demands, key=lambda d: solver.short_plat(solver.norm_plat(d.plataforma))):
-            rows.append(
+            row_text = (
                 f"{solver.short_plat(solver.norm_plat(item.plataforma)):<14} "
-                f"{int(item.tmib):>6} {int(item.m9):>6} {int(getattr(item, 'm1', 0)):>6} {int(item.prioridade):>6}"
+                f"{int(item.tmib):>6} {int(item.m9):>6}"
             )
+            for origin in extra_origins:
+                row_text += f" {int(item.quantidade_origem(origin)):>6}"
+            row_text += f" {int(item.prioridade):>6}"
+            rows.append(row_text)
         if len(rows) == 2:
             rows.append("(sem demanda informada)")
         return "\n".join(rows)
@@ -909,15 +931,16 @@ class AppService:
             return departure
         vessel = vessel_map.get(boat_name)
         speed = float(vessel.velocidade) if vessel else 14.0
-        is_aqua = bool(vessel and vessel.tipo.lower() == "aqua")
+        approach_minutes = float(vessel.tempo_aproximacao_min) if vessel else 0.0
+        minutes_per_pax = float(vessel.tempo_travessia_pax_min) if vessel else 1.0
         for idx, part in enumerate(parts[1:], start=1):
             platform = part["platform"]
             dist = solver.get_dist(distances, solver.norm_plat(current_pos), solver.norm_plat(platform))
             current_time += solver.travel_time_minutes(dist, speed)
-            if is_aqua and platform != "TMIB":
-                current_time += solver.AQUA_APPROACH_TIME
+            if approach_minutes > 0 and platform != "TMIB":
+                current_time += int(math.ceil(approach_minutes))
             op_minutes = int(part["pickup"]) + int(part.get("total_drop", 0))
-            current_time += op_minutes
+            current_time += int(math.ceil(op_minutes * minutes_per_pax))
             if idx == target_index:
                 if require_pickup and int(part["pickup"]) <= 0:
                     return None

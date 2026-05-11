@@ -46,6 +46,26 @@ def _emit_progress(progress_callback: Optional[Callable[[str], None]], message: 
         pass
 
 
+def _boat_from_vessel(
+    name: str,
+    vessel: Any,
+    *,
+    available: bool = True,
+    departure: str = "",
+    fixed_route: str = "",
+) -> solver.Boat:
+    return solver.Boat(
+        name=name,
+        available=available,
+        departure=departure,
+        fixed_route=fixed_route,
+        speed=float(getattr(vessel, "velocidade", solver.DEFAULT_SPEED_KN)),
+        max_capacity=int(getattr(vessel, "capacidade", solver.get_max_capacity(name))),
+        approach_minutes=float(getattr(vessel, "tempo_aproximacao_min", 0.0)),
+        minutes_per_pax=float(getattr(vessel, "tempo_travessia_pax_min", solver.MINUTES_PER_PAX)),
+    )
+
+
 class _ProgressStream:
     def __init__(self, progress_callback: Optional[Callable[[str], None]]):
         self.progress_callback = progress_callback
@@ -131,7 +151,7 @@ def _simulate_route_times(
     last_delivery: Dict[str, int] = {}
     current_time = boat.departure_minutes()
     current_pos = "TMIB"
-    is_aqua = solver.is_aqua_helix(boat.name)
+    approach_minutes = int(math.ceil(solver.boat_approach_minutes(boat)))
     load = 0
     max_load = 0
 
@@ -142,9 +162,8 @@ def _simulate_route_times(
             continue
         dist = solver.get_dist(distances, solver.norm_plat(current_pos), solver.norm_plat(platform))
         current_time += solver.travel_time_minutes(dist, boat.speed)
-        if is_aqua:
-            current_time += solver.AQUA_APPROACH_TIME
-        op_minutes = (pickup + total_drop) * solver.MINUTES_PER_PAX
+        current_time += approach_minutes
+        op_minutes = solver.boat_operation_minutes(boat, pickup + total_drop)
         finish_time = current_time + op_minutes
         if tmib_drop + m9_drop > 0:
             plat_norm = solver.norm_plat(platform)
@@ -187,7 +206,7 @@ def _simulate_route_stop_events(
     events: List[Dict[str, Any]] = []
     current_time = boat.departure_minutes()
     current_pos = "TMIB"
-    is_aqua = solver.is_aqua_helix(boat.name)
+    approach_minutes = int(math.ceil(solver.boat_approach_minutes(boat)))
 
     for index, part in enumerate(parse_route_text(route_str)):
         platform = (part.platform or "").strip().upper()
@@ -198,14 +217,14 @@ def _simulate_route_stop_events(
         if not starts_at_platform:
             dist = solver.get_dist(distances, solver.norm_plat(current_pos), platform_norm)
             current_time += solver.travel_time_minutes(dist, boat.speed)
-            if is_aqua and solver.norm_plat(current_pos) != platform_norm:
-                current_time += solver.AQUA_APPROACH_TIME
+            if solver.norm_plat(current_pos) != platform_norm:
+                current_time += approach_minutes
         arrival_time = current_time
         pickup_qty = int(part.pickup_qty)
         tmib_drop = int(part.tmib_drop)
         m9_drop = int(part.m9_drop)
         total_drop = int(part.total_drop)
-        finish_time = arrival_time + (pickup_qty + total_drop) * solver.MINUTES_PER_PAX
+        finish_time = arrival_time + solver.boat_operation_minutes(boat, pickup_qty + total_drop)
         events.append(
             {
                 "platform": solver.short_plat(platform_norm),
@@ -406,13 +425,7 @@ def analyze_tide_alerts(
         vessel = vessel_map.get(boat_name)
         if vessel is None:
             continue
-        boat = solver.Boat(
-            name=boat_name,
-            available=True,
-            departure=departure,
-            speed=float(vessel.velocidade),
-            max_capacity=int(vessel.capacidade),
-        )
+        boat = _boat_from_vessel(boat_name, vessel, departure=departure)
         route_events = _simulate_route_stop_events(boat, route_str, distances)
         service_events = [
             event
@@ -592,12 +605,21 @@ def _remaining_unsupported_origin_demands(
 ) -> Dict[str, Dict[str, int]]:
     remaining: Dict[str, Dict[str, int]] = {}
     for item in operation.demanda:
-        m1 = int(getattr(item, "m1", 0) or 0)
-        if m1 <= 0:
-            continue
         plat_norm = solver.norm_plat(item.plataforma)
-        bucket = remaining.setdefault(plat_norm, {"M1": 0})
-        bucket["M1"] += m1
+        by_origin: Dict[str, int] = {}
+        m1 = int(getattr(item, "m1", 0) or 0)
+        if m1 > 0:
+            by_origin["M1"] = m1
+        for origin, qty in getattr(item, "origens_extras", {}).items():
+            origin_up = (origin or "").strip().upper()
+            if origin_up in {"", "TMIB", "M9", "M1"} or int(qty) <= 0:
+                continue
+            by_origin[origin_up] = by_origin.get(origin_up, 0) + int(qty)
+        if not by_origin:
+            continue
+        bucket = remaining.setdefault(plat_norm, {})
+        for origin, qty in by_origin.items():
+            bucket[origin] = int(bucket.get(origin, 0)) + int(qty)
 
     if not remaining:
         return {}
@@ -607,13 +629,12 @@ def _remaining_unsupported_origin_demands(
         vessel = vessel_map.get(item.nome)
         if vessel is None or not item.disponivel or not item.rota_fixa.strip():
             continue
-        boat = solver.Boat(
-            name=item.nome,
+        boat = _boat_from_vessel(
+            item.nome,
+            vessel,
             available=item.disponivel,
             departure=item.hora_saida,
             fixed_route=item.rota_fixa,
-            speed=float(vessel.velocidade),
-            max_capacity=int(vessel.capacidade),
         )
         if not solver.fixed_route_abates_demand(boat):
             continue
@@ -650,13 +671,12 @@ def run_solver(
         if not vessel:
             continue
         boats.append(
-            solver.Boat(
-                name=item.nome,
+            _boat_from_vessel(
+                item.nome,
+                vessel,
                 available=item.disponivel,
                 departure=item.hora_saida,
                 fixed_route=item.rota_fixa,
-                speed=float(vessel.velocidade),
-                max_capacity=int(vessel.capacidade),
             )
         )
 
@@ -668,8 +688,8 @@ def run_solver(
             for plat_norm, values in sorted(unsupported_demands.items())
         )
         raise ValueError(
-            "O solver automatico ainda nao suporta demanda residual com origem M1. "
-            "Cadastre essas entregas em rotas fixas ou zere a coluna M1 antes de gerar a distribuicao. "
+            "O solver automatico ainda nao suporta demanda residual com origem diferente de TMIB/M9. "
+            "Cadastre essas entregas em rotas fixas ou zere as colunas dessas origens antes de gerar a distribuicao. "
             f"Pendencias: {details}."
         )
 
@@ -739,13 +759,7 @@ def analyze_distribution(
         vessel = vessel_map.get(boat_name)
         if vessel is None:
             continue
-        boat = solver.Boat(
-            name=boat_name,
-            available=True,
-            departure=departure,
-            speed=float(vessel.velocidade),
-            max_capacity=int(vessel.capacidade),
-        )
+        boat = _boat_from_vessel(boat_name, vessel, departure=departure)
         route_last, max_load = _simulate_route_times(boat, route_str, distances)
         by_boat[boat_name] = {
             "departure": departure,
@@ -791,13 +805,7 @@ def summarize_distribution_for_compare(
         vessel = vessel_map.get(boat_name)
         if vessel is None:
             continue
-        boat = solver.Boat(
-            name=boat_name,
-            available=True,
-            departure=departure,
-            speed=float(vessel.velocidade),
-            max_capacity=int(vessel.capacidade),
-        )
+        boat = _boat_from_vessel(boat_name, vessel, departure=departure)
         route_last, _ = _simulate_route_times(boat, route_str, distances)
         total_distance += route_distance(route_str, distances)
         for plat_norm, value in route_last.items():
@@ -818,7 +826,7 @@ def summarize_distribution_for_compare(
             if values["tmib"] or values["m9"]
         },
         "arrivals": {
-            solver.short_plat(plat_norm): f"{minutes // 60:02d}:{minutes % 60:02d}"
+            solver.short_plat(plat_norm): _minutes_to_hhmm(minutes)
             for plat_norm, minutes in last_delivery.items()
         },
     }
@@ -834,6 +842,14 @@ def export_programacao_planilha(
     mod = _load_criar_tabela6_module()
     dist = mod.load_distances_json(distances_path)
     speeds = {item.nome.upper(): float(item.velocidade) for item in config.frota}
+    minutes_per_pax_by_vessel = {
+        item.nome.upper(): float(item.tempo_travessia_pax_min)
+        for item in config.frota
+    }
+    approach_minutes_by_vessel = {
+        item.nome.upper(): float(item.tempo_aproximacao_min)
+        for item in config.frota
+    }
     trips = []
     for boat_name, departure, route_str in parse_distribution_text(distribution_text):
         trips.append(
@@ -862,7 +878,8 @@ def export_programacao_planilha(
             start_hhmm=trip.start_hhmm,
             stops=stops,
             speed_kn=speed_kn,
-            minutes_per_pax=mod.MINUTES_PER_PAX,
+            minutes_per_pax=minutes_per_pax_by_vessel.get(trip.vessel.upper(), mod.MINUTES_PER_PAX),
+            approach_minutes=approach_minutes_by_vessel.get(trip.vessel.upper(), 0.0),
         )
         summary_compact = summary.replace(" > ", ">")
         row_ptr = mod.write_trip_block(
@@ -925,6 +942,7 @@ def import_demands_from_csv(csv_path: Path) -> List[DemandItem]:
         "pcm1(d)",
     }
     prioridade_keys = {"prioridade", "prio", "priority"}
+    reserved_keys = plataforma_keys | tmib_keys | m9_keys | m1_keys | prioridade_keys
 
     reader = csv.DictReader(StringIO(raw_text), dialect=dialect)
     demands: List[DemandItem] = []
@@ -937,7 +955,26 @@ def import_demands_from_csv(csv_path: Path) -> List[DemandItem]:
         m9 = next((parse_int(normalized[key]) for key in m9_keys if key in normalized), 0)
         m1 = next((parse_int(normalized[key]) for key in m1_keys if key in normalized), 0)
         prioridade = next((parse_int(normalized[key], 0) for key in prioridade_keys if key in normalized), 0)
-        demands.append(DemandItem(plataforma=plataforma, tmib=tmib, m9=m9, m1=m1, prioridade=prioridade))
+        extras: Dict[str, int] = {}
+        for key, value in normalized.items():
+            if key in reserved_keys:
+                continue
+            origin = solver.short_plat(solver.norm_plat(key.upper()))
+            if origin in {"TMIB", "M9", "M1"}:
+                continue
+            qty = parse_int(value)
+            if qty:
+                extras[origin] = qty
+        demands.append(
+            DemandItem(
+                plataforma=plataforma,
+                tmib=tmib,
+                m9=m9,
+                m1=m1,
+                origens_extras=extras,
+                prioridade=prioridade,
+            )
+        )
     return demands
 
 
@@ -1064,7 +1101,6 @@ def import_demands_from_extrato_pdf(
 
     tmib_values = aggregated_matrix.get("TMIB")
     m9_values = aggregated_matrix.get("M9")
-    m1_values = aggregated_matrix.get("M1")
     if tmib_values is None or m9_values is None:
         raise ValueError("Extrato sem colunas obrigatorias de origem (PCM-09/M9 e TMIB).")
 
@@ -1084,10 +1120,27 @@ def import_demands_from_extrato_pdf(
         plataforma = normalize_row_platform(row_label)
         m9 = int(m9_values[row_idx]) if row_idx < len(m9_values) else 0
         tmib = int(tmib_values[row_idx]) if row_idx < len(tmib_values) else 0
+        m1_values = aggregated_matrix.get("M1")
         m1 = int(m1_values[row_idx]) if m1_values is not None and row_idx < len(m1_values) else 0
-        if m9 == 0 and tmib == 0 and m1 == 0:
+        extras = {
+            origin: int(values[row_idx])
+            for origin, values in aggregated_matrix.items()
+            if origin not in {"TMIB", "M9", "M1"}
+            and row_idx < len(values)
+            and int(values[row_idx]) != 0
+        }
+        if m9 == 0 and tmib == 0 and m1 == 0 and not extras:
             continue
         if not re.match(r"^(TMIB|NORWIND GALE|M\d+|B\d+|PGA\d+( \([DN]\))?|PDO\d+|PRB\d+|SPH-\d{2})$", plataforma):
             continue
-        demands.append(DemandItem(plataforma=plataforma, tmib=tmib, m9=m9, m1=m1, prioridade=0))
+        demands.append(
+            DemandItem(
+                plataforma=plataforma,
+                tmib=tmib,
+                m9=m9,
+                m1=m1,
+                origens_extras=extras,
+                prioridade=0,
+            )
+        )
     return sorted(demands, key=lambda item: item.plataforma)

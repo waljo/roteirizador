@@ -776,7 +776,7 @@ class ConfigTab(QWidget):
         super().__init__()
         self.service = service
         self.parent_window = parent_window
-        self.fleet_table = AutoAppendTableWidget(0, 5)
+        self.fleet_table = AutoAppendTableWidget(0, 7)
         self.gangway_table = AutoAppendTableWidget(0, 1)
         self.conves_table = AutoAppendTableWidget(0, 1)
         self.extrato_origins_table = AutoAppendTableWidget(0, 4)
@@ -825,7 +825,7 @@ class ConfigTab(QWidget):
         self.fleet_table.set_block_delete_backspace(True)
         self.fleet_table.setMinimumHeight(110)
         self.fleet_table.setHorizontalHeaderLabels(
-            ["Nome", "Tipo", "Capacidade", "Velocidade", "Ativa"]
+            ["Nome", "Tipo", "Capacidade", "Velocidade", "Aprox. min", "Min/pax", "Ativa"]
         )
         fleet_layout.addWidget(self.fleet_table)
         fleet_btns = QHBoxLayout()
@@ -973,6 +973,8 @@ class ConfigTab(QWidget):
             vessel.tipo if vessel else "surfer",
             str(vessel.capacidade if vessel else 24),
             str(vessel.velocidade if vessel else 14.0),
+            self._format_decimal(vessel.tempo_aproximacao_min if vessel else 0.0),
+            self._format_decimal(vessel.tempo_travessia_pax_min if vessel else 1.0),
             "SIM" if vessel is None or vessel.ativa else "NAO",
         ]
         for col, value in enumerate(values):
@@ -1093,19 +1095,33 @@ class ConfigTab(QWidget):
             )
             return
         vessels: List[FleetVessel] = []
-        for row in range(self.fleet_table.rowCount()):
-            nome = self._text(self.fleet_table, row, 0)
-            if not nome:
-                continue
-            vessels.append(
-                FleetVessel(
-                    nome=nome,
-                    tipo=self._text(self.fleet_table, row, 1) or "surfer",
-                    capacidade=int(self._text(self.fleet_table, row, 2) or 24),
-                    velocidade=float(self._text(self.fleet_table, row, 3) or 14.0),
-                    ativa=(self._text(self.fleet_table, row, 4).upper() == "SIM"),
+        try:
+            for row in range(self.fleet_table.rowCount()):
+                nome = self._text(self.fleet_table, row, 0)
+                if not nome:
+                    continue
+                vessels.append(
+                    FleetVessel(
+                        nome=nome,
+                        tipo=self._text(self.fleet_table, row, 1) or "surfer",
+                        capacidade=int(self._text(self.fleet_table, row, 2) or 24),
+                        velocidade=self._parse_decimal(self._text(self.fleet_table, row, 3) or "14"),
+                        tempo_aproximacao_min=self._parse_decimal(
+                            self._text(self.fleet_table, row, 4) or "0"
+                        ),
+                        tempo_travessia_pax_min=self._parse_decimal(
+                            self._text(self.fleet_table, row, 5) or "1"
+                        ),
+                        ativa=(self._text(self.fleet_table, row, 6).upper() == "SIM"),
+                    )
                 )
+        except ValueError:
+            QMessageBox.warning(
+                self,
+                "Configuracao",
+                "Revise os numeros da frota. Use valores como 24, 14, 25 ou 1,5.",
             )
+            return
         gangway = [
             self._text(self.gangway_table, row, 0)
             for row in range(self.gangway_table.rowCount())
@@ -1167,6 +1183,7 @@ class VersionEditor(QWidget):
         self.user_edit = QLineEdit()
         self.boats_table = AutoAppendTableWidget(0, 3)
         self.demand_table = AutoAppendTableWidget(0, 5)
+        self._extra_origin_columns: List[str] = ["M1"]
         self.output_text = QTextEdit()
         self.manual_route_text = QTextEdit()
         self.export_program_button = QPushButton("Exportar planilha")
@@ -1320,7 +1337,7 @@ class VersionEditor(QWidget):
         demand_layout.addWidget(demand_hint_section)
         self.demand_table.set_append_row_callback(self.add_demand_row)
         self.demand_table.set_block_delete_backspace(True)
-        self.demand_table.setHorizontalHeaderLabels(["Plataforma", "TMIB", "M9", "M1", "Prioridade"])
+        self._configure_demand_table_columns(None)
         self.demand_table.setMinimumHeight(0)
         demand_layout.addWidget(self.demand_table)
 
@@ -1420,6 +1437,7 @@ class VersionEditor(QWidget):
     def reset_for_operation(self, default_user: str, op_config: Optional[OperationalConfig]) -> None:
         self.user_edit.setText("")
         self.boats_table.setRowCount(0)
+        self._configure_demand_table_columns(op_config)
         self.demand_table.setRowCount(0)
         self.output_text.clear()
         self.manual_route_text.clear()
@@ -2003,11 +2021,33 @@ class VersionEditor(QWidget):
             demand.plataforma if demand else "",
             str(demand.tmib if demand else 0),
             str(demand.m9 if demand else 0),
-            str(getattr(demand, "m1", 0) if demand else 0),
-            str(demand.prioridade if demand else 0),
         ]
+        for origin in self._extra_origin_columns:
+            values.append(str(demand.quantidade_origem(origin) if demand else 0))
+        values.append(str(demand.prioridade if demand else 0))
         for col, value in enumerate(values):
             self.demand_table.setItem(row, col, QTableWidgetItem(value))
+
+    def _configure_demand_table_columns(self, op_config: Optional[OperationalConfig]) -> None:
+        origins: List[str] = []
+        if op_config is not None:
+            for item in op_config.origens_extrato:
+                if not item.ativa:
+                    continue
+                code = (item.codigo or "").strip().upper()
+                if not code or code in {"TMIB", "M9"} or code in origins:
+                    continue
+                origins.append(code)
+        if not origins:
+            origins = ["M1"]
+        self._extra_origin_columns = origins
+        self.demand_table.setColumnCount(4 + len(self._extra_origin_columns))
+        self.demand_table.setHorizontalHeaderLabels(
+            ["Plataforma", "TMIB", "M9", *self._extra_origin_columns, "Prioridade"]
+        )
+
+    def _priority_column(self) -> int:
+        return 3 + len(self._extra_origin_columns)
 
     @staticmethod
     def remove_selected_rows(table: QTableWidget) -> None:
@@ -2044,13 +2084,23 @@ class VersionEditor(QWidget):
             plataforma = self._text(self.demand_table, row, 0)
             if not plataforma:
                 continue
+            extras = {
+                origin: int(self._text(self.demand_table, row, 3 + idx) or 0)
+                for idx, origin in enumerate(self._extra_origin_columns)
+                if origin != "M1"
+            }
+            m1 = 0
+            if "M1" in self._extra_origin_columns:
+                m1_col = 3 + self._extra_origin_columns.index("M1")
+                m1 = int(self._text(self.demand_table, row, m1_col) or 0)
             demands.append(
                 DemandItem(
                     plataforma=plataforma,
                     tmib=int(self._text(self.demand_table, row, 1) or 0),
                     m9=int(self._text(self.demand_table, row, 2) or 0),
-                    m1=int(self._text(self.demand_table, row, 3) or 0),
-                    prioridade=int(self._text(self.demand_table, row, 4) or 0),
+                    m1=m1,
+                    origens_extras=extras,
+                    prioridade=int(self._text(self.demand_table, row, self._priority_column()) or 0),
                 )
             )
         return OperationVersion(
@@ -2115,15 +2165,15 @@ class VersionEditor(QWidget):
             plataforma = self._text(self.demand_table, row, 0)
             if not plataforma:
                 continue
-            rows.append(
-                {
-                    "PLATAFORMA": plataforma,
-                    "TMIB": self._text(self.demand_table, row, 1) or "0",
-                    "M9": self._text(self.demand_table, row, 2) or "0",
-                    "M1": self._text(self.demand_table, row, 3) or "0",
-                    "PRIORIDADE": self._text(self.demand_table, row, 4) or "0",
-                }
-            )
+            row_data = {
+                "PLATAFORMA": plataforma,
+                "TMIB": self._text(self.demand_table, row, 1) or "0",
+                "M9": self._text(self.demand_table, row, 2) or "0",
+                "PRIORIDADE": self._text(self.demand_table, row, self._priority_column()) or "0",
+            }
+            for idx, origin in enumerate(self._extra_origin_columns):
+                row_data[origin] = self._text(self.demand_table, row, 3 + idx) or "0"
+            rows.append(row_data)
         if not rows:
             QMessageBox.warning(
                 self,
@@ -2150,9 +2200,10 @@ class VersionEditor(QWidget):
         output_path = Path(file_name)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open("w", encoding="utf-8", newline="") as handle:
+            fieldnames = ["PLATAFORMA", "TMIB", "M9", *self._extra_origin_columns, "PRIORIDADE"]
             writer = csv.DictWriter(
                 handle,
-                fieldnames=["PLATAFORMA", "TMIB", "M9", "M1", "PRIORIDADE"],
+                fieldnames=fieldnames,
                 delimiter=";",
             )
             writer.writeheader()

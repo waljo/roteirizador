@@ -26,11 +26,40 @@ LOCAL_CONFIG_PATH = app_config_path(".roteirizador_desktop_config.json")
 SHARED_CONFIG_PATH = shared_app_config_path(".roteirizador_desktop_shared_config.json")
 
 
+class StorageFileInUseError(RuntimeError):
+    pass
+
+
+def _is_file_in_use_error(exc: OSError) -> bool:
+    return getattr(exc, "winerror", None) == 32
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return os.path.normcase(os.path.abspath(str(left))) == os.path.normcase(os.path.abspath(str(right)))
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(path)
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        if _is_file_in_use_error(exc):
+            raise StorageFileInUseError(
+                "O arquivo da operacao esta aberto ou bloqueado por outro processo. "
+                "Feche planilhas, TXT, visualizadores ou outra janela do aplicativo que esteja usando "
+                f"este arquivo e tente novamente: {path}"
+            ) from exc
+        raise
 
 
 def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
@@ -191,7 +220,19 @@ class NetworkStorage:
         if bundle.distribution_text:
             _atomic_write_text(version_dir / "distribuicao.txt", bundle.distribution_text)
         if imported_csv_path and imported_csv_path.exists():
-            shutil.copy2(imported_csv_path, version_dir / imported_csv_path.name)
+            destination_csv_path = version_dir / imported_csv_path.name
+            if _same_path(imported_csv_path, destination_csv_path):
+                return
+            try:
+                shutil.copy2(imported_csv_path, destination_csv_path)
+            except OSError as exc:
+                if _is_file_in_use_error(exc):
+                    raise StorageFileInUseError(
+                        "O arquivo importado esta aberto ou bloqueado por outro processo. "
+                        "Feche o CSV/planilha original e tente novamente: "
+                        f"{imported_csv_path}"
+                    ) from exc
+                raise
 
     def load_version(self, metadata: OperationMetadata, version_name: str) -> Optional[VersionBundle]:
         version_dir = self.operation_dir(metadata.operacao_id, metadata.data_operacao) / version_name

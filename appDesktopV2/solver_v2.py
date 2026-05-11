@@ -32,7 +32,7 @@ DEFAULT_SPEED_KN = 14.0
 AQUA_APPROACH_TIME = 25  # minutos por parada
 MINUTES_PER_PAX = 1  # minuto por pax embarcado/desembarcado
 M9_CONSOLIDATION_PENALTY_NM = 5.0  # penalidade por espalhar embarques M9 em varios barcos
-ENABLE_DISTANT_CLUSTER_DEDICATION = False  # evita reservar barco e reduzir capacidade total
+ENABLE_DISTANT_CLUSTER_DEDICATION = True  # testa reservar primeiro barco para clusters distantes
 PRIORITY_TIME_WEIGHT = 0.01  # peso (NM-equivalente por minuto) para antecipar prioridades
 COMFORT_PAX_MIN_WEIGHT = 0.005  # peso (NM-equivalente por pax-minuto) para conforto
 PAX_ARRIVAL_WEIGHT = 0.01  # peso (NM-equivalente por pax-minuto) para priorizar grandes entregas cedo
@@ -184,6 +184,8 @@ class Boat:
     fixed_route: str = ""
     speed: float = DEFAULT_SPEED_KN
     max_capacity: int = 24
+    approach_minutes: Optional[float] = None
+    minutes_per_pax: float = MINUTES_PER_PAX
 
     def departure_minutes(self) -> int:
         if not self.departure or ":" not in self.departure:
@@ -304,6 +306,22 @@ def is_aqua_helix(name) -> bool:
     return "AQUA" in up and "HELIX" in up
 
 
+def boat_approach_minutes(boat: Boat) -> float:
+    value = getattr(boat, "approach_minutes", None)
+    if value is None:
+        return float(AQUA_APPROACH_TIME if is_aqua_helix(boat.name) else 0.0)
+    return float(value or 0.0)
+
+
+def boat_minutes_per_pax(boat: Boat) -> float:
+    value = float(getattr(boat, "minutes_per_pax", MINUTES_PER_PAX) or MINUTES_PER_PAX)
+    return max(0.0, value)
+
+
+def boat_operation_minutes(boat: Boat, pax: int) -> int:
+    return int(math.ceil(max(0, int(pax)) * boat_minutes_per_pax(boat)))
+
+
 def load_gangway(path: str) -> Set[str]:
     if not os.path.exists(path):
         return set()
@@ -348,36 +366,33 @@ def calc_arrival_times(route: Route, distances: Dict) -> List[Tuple[str, int]]:
     arrivals = []
     current_time = route.boat.departure_minutes()
     current_pos = "TMIB"
-    is_aqua = is_aqua_helix(route.boat.name)
+    approach_minutes = int(math.ceil(boat_approach_minutes(route.boat)))
 
     if route.uses_m9_hub:
         for stop in route.pre_m9_stops:
             dist = get_dist(distances, current_pos, stop[0])
             current_time += travel_time_minutes(dist, route.boat.speed)
-            if is_aqua:
-                current_time += AQUA_APPROACH_TIME
+            current_time += approach_minutes
             arrivals.append((stop[0], current_time))
-            current_time += (stop[1] + stop[2]) * MINUTES_PER_PAX
+            current_time += boat_operation_minutes(route.boat, stop[1] + stop[2])
             current_pos = stop[0]
 
         m9 = norm_plat("M9")
         dist = get_dist(distances, current_pos, m9)
         current_time += travel_time_minutes(dist, route.boat.speed)
-        if is_aqua:
-            current_time += AQUA_APPROACH_TIME
+        current_time += approach_minutes
         # OperaÃ§Ã£o em M9
-        current_time += (route.tmib_to_m9 + route.m9_pickup) * MINUTES_PER_PAX
+        current_time += boat_operation_minutes(route.boat, route.tmib_to_m9 + route.m9_pickup)
         arrivals.append((m9, current_time))
         current_pos = m9
 
     for stop in route.stops:
         dist = get_dist(distances, current_pos, stop[0])
         current_time += travel_time_minutes(dist, route.boat.speed)
-        if is_aqua:
-            current_time += AQUA_APPROACH_TIME
+        current_time += approach_minutes
         arrivals.append((stop[0], current_time))
         # OperaÃ§Ã£o
-        current_time += (stop[1] + stop[2]) * MINUTES_PER_PAX
+        current_time += boat_operation_minutes(route.boat, stop[1] + stop[2])
         current_pos = stop[0]
 
     return arrivals
@@ -455,7 +470,7 @@ def calc_comfort_pax_minutes(route: Route, distances: Dict) -> float:
     m9_onboard = 0
     total = 0.0
     current = "TMIB"
-    is_aqua = is_aqua_helix(route.boat.name)
+    approach_minutes = int(math.ceil(boat_approach_minutes(route.boat)))
 
     def add_segment_time(minutes: int):
         nonlocal total
@@ -465,13 +480,12 @@ def calc_comfort_pax_minutes(route: Route, distances: Dict) -> float:
         dist = get_dist(distances, current, dest)
         travel = travel_time_minutes(dist, route.boat.speed)
         add_segment_time(travel)
-        if is_aqua:
-            add_segment_time(AQUA_APPROACH_TIME)
+        add_segment_time(approach_minutes)
         return travel
 
     def operate(tmib_drop: int, m9_drop: int, m9_pick: int):
         nonlocal tmib_onboard, m9_onboard
-        ops = (tmib_drop + m9_drop + m9_pick) * MINUTES_PER_PAX
+        ops = boat_operation_minutes(route.boat, tmib_drop + m9_drop + m9_pick)
         add_segment_time(ops)
         tmib_onboard -= tmib_drop
         m9_onboard -= m9_drop
@@ -553,7 +567,7 @@ def order_stops_with_priority(stops: List[Tuple[str, int, int]],
         ordered = optimal_order_from(stop_demands, distances, start)
         return [(d.platform_norm, d.tmib, d.m9) for d in ordered]
 
-    is_aqua = is_aqua_helix(boat.name)
+    approach_minutes = int(math.ceil(boat_approach_minutes(boat)))
 
     def weight(priority: int) -> int:
         if priority == 1:
@@ -589,7 +603,7 @@ def order_stops_with_priority(stops: List[Tuple[str, int, int]],
             dist_total += dist
 
             travel = travel_time_minutes(dist, boat.speed)
-            segment = travel + (AQUA_APPROACH_TIME if is_aqua else 0)
+            segment = travel + approach_minutes
             comfort += onboard * segment
             time += segment
 
@@ -597,7 +611,7 @@ def order_stops_with_priority(stops: List[Tuple[str, int, int]],
             score_pax += time * pax
             score_priority += time * weight(p)
 
-            ops = pax * MINUTES_PER_PAX
+            ops = boat_operation_minutes(boat, pax)
             comfort += onboard * ops
             time += ops
             onboard -= pax
@@ -1483,11 +1497,6 @@ def build_m9_hub_route(boat: Boat, demands: List[Demand], m9_tmib_demand: int,
             total_m9_pickup += d.m9
             current_cluster = d_cluster
 
-    # Preencher com TMIB para M9 se houver espaÃ§o (nÃ£o afeta carga pÃ³s-M9)
-    space_for_m9 = cap - total_tmib
-    if space_for_m9 > 0 and m9_tmib_demand > 0:
-        tmib_to_m9 = min(space_for_m9, m9_tmib_demand)
-
     # Adicionar plataformas TMIB-only do MESMO cluster se couber
     for d in tmib_only_platforms:
         d_cluster = get_geo_cluster(d.platform_norm)
@@ -1500,6 +1509,12 @@ def build_m9_hub_route(boat: Boat, demands: List[Demand], m9_tmib_demand: int,
         if total_tmib + d.tmib <= cap:
             stops.append((d.platform_norm, d.tmib, 0))
             total_tmib += d.tmib
+
+    # Preencher com TMIB para M9 somente depois das demais entregas TMIB
+    # para preservar a carga inicial maxima da embarcacao.
+    space_for_m9 = cap - total_tmib
+    if space_for_m9 > 0 and m9_tmib_demand > 0:
+        tmib_to_m9 = min(space_for_m9, m9_tmib_demand)
 
     if not stops and tmib_to_m9 == 0:
         return None
@@ -1530,6 +1545,8 @@ def build_m9_hub_route(boat: Boat, demands: List[Demand], m9_tmib_demand: int,
         priority_map=priority_map,
     )
     route.total_distance = calc_route_distance(route, distances)
+    if route.max_load() > cap:
+        return None
 
     return route
 

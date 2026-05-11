@@ -3,6 +3,7 @@
 # Gera uma planilha no layout "antigo" da PROGRAMACAO DE DISTRIBUICAO DE PAX
 
 import json
+import math
 import os
 import re
 import textwrap
@@ -301,7 +302,8 @@ def simulate_trip(
     start_hhmm: str,
     stops: List[StopOps],
     speed_kn: float,
-    minutes_per_pax: int = 1,
+    minutes_per_pax: float = 1,
+    approach_minutes: float = 0,
 ) -> Tuple[List[Dict], int, str, float]:
     if len(stops) < 2:
         raise ValueError("Rota precisa ter pelo menos 2 plataformas")
@@ -341,6 +343,8 @@ def simulate_trip(
         d_nm = get_distance_nm(dist, orig.plat, dest.plat)
         travel_min = travel_minutes(d_nm, speed_kn)
         arrive_time = depart_time + timedelta(minutes=travel_min)
+        if dest_short != "TMIB" and orig_short != dest_short:
+            arrive_time += timedelta(minutes=int(math.ceil(float(approach_minutes or 0))))
 
         dis_tmib = dest.disemb_tmib
         dis_m9 = dest.disemb_m9
@@ -392,7 +396,8 @@ def simulate_trip(
         moved_ops = (dis_tmib + dis_m9 + sum(dis_other.values())) + (board_tmib + board_m9 + sum(board_other.values()))
         total_pax_moved += (dis_tmib + dis_m9 + sum(dis_other.values()))
 
-        current_time = arrive_time + timedelta(minutes=moved_ops * minutes_per_pax)
+        operation_minutes = int(math.ceil(moved_ops * float(minutes_per_pax or 1)))
+        current_time = arrive_time + timedelta(minutes=operation_minutes)
 
         pax_after_ops = onboard_tmib + onboard_m9 + sum(onboard_other.values())
         if pax_after_ops > max_capacity:
