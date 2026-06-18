@@ -24,6 +24,19 @@ from .domain import (
     VERSION_PROGRAMACAO,
 )
 from .services import AppService, default_operation_version, today_iso
+from .passenger_manifest import (
+    AssignmentIssue,
+    DeliveryRecord,
+    PassengerAssignment,
+    PickupListResult,
+    TransferRecord,
+    build_passenger_pickup_list,
+    export_assignments_csv,
+    format_assignments_text,
+    parse_cl_itinerary_text,
+    read_petrobras_delivery_pdf,
+    read_petrobras_transfer_pdf,
+)
 
 LAYOUT_SPEC_VERSION = "1.4.0"
 HELP_SECTION_MAX_HEIGHT = 220
@@ -2551,6 +2564,208 @@ class PickupTab(QWidget):
         self.output_text.setPlainText(result.plan_text)
 
 
+class PassengerManifestTab(QWidget):
+    def __init__(self, service: AppService, parent_window: "MainWindow"):
+        super().__init__()
+        self.service = service
+        self.parent_window = parent_window
+        self.pdf_dir_edit = QLineEdit()
+        self.route_text = QTextEdit()
+        self.result_table = QTableWidget(0, 6)
+        self.issues_text = QTextEdit()
+        self.summary_text = QTextEdit()
+        self._latest_result: Optional[PickupListResult] = None
+        self._build()
+
+    def _build(self) -> None:
+        layout = QVBoxLayout(self)
+
+        intro = QLabel(
+            "Abra a pasta com os PDFs de entrega e transbordo, cole ou carregue o roteiro CL, e clique em Gerar lista."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #475569;")
+        layout.addWidget(intro)
+
+        folder_box = QGroupBox("Arquivos de entrada")
+        folder_layout = QGridLayout(folder_box)
+        self.pdf_dir_edit.setPlaceholderText("Pasta com os PDFs")
+        browse_btn = QPushButton("Procurar pasta")
+        browse_btn.clicked.connect(self._choose_pdf_folder)
+        load_route_btn = QPushButton("Carregar roteiro CL")
+        load_route_btn.clicked.connect(self._load_route_file)
+        folder_layout.addWidget(QLabel("Pasta dos PDFs:"), 0, 0)
+        folder_layout.addWidget(self.pdf_dir_edit, 0, 1)
+        folder_layout.addWidget(browse_btn, 0, 2)
+        folder_layout.addWidget(QLabel("Roteiro CL:"), 1, 0)
+        folder_layout.addWidget(load_route_btn, 1, 2)
+        layout.addWidget(folder_box)
+
+        self.route_text.setPlaceholderText(
+            "Cole aqui o roteiro CL, por exemplo:\n15:05 SURFER 1931: M10 > M9 > M5 > TMIB"
+        )
+        self.route_text.setMinimumHeight(110)
+        route_box = QGroupBox("Roteiro de recolhimento")
+        route_layout = QVBoxLayout(route_box)
+        route_layout.addWidget(self.route_text)
+        layout.addWidget(route_box)
+
+        action_row = QHBoxLayout()
+        generate_btn = QPushButton("Gerar lista")
+        generate_btn.clicked.connect(self.generate_manifest_list)
+        export_btn = QPushButton("Exportar CSV")
+        export_btn.clicked.connect(self.export_csv)
+        clear_btn = QPushButton("Limpar")
+        clear_btn.clicked.connect(self.clear_output)
+        action_row.addWidget(generate_btn)
+        action_row.addWidget(export_btn)
+        action_row.addWidget(clear_btn)
+        action_row.addStretch(1)
+        layout.addLayout(action_row)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(USE_COLLAPSIBLE_SPLITTERS)
+
+        table_box = QGroupBox("Lista por embarcacao")
+        table_layout = QVBoxLayout(table_box)
+        self.result_table.setHorizontalHeaderLabels(
+            ["Embarcacao", "Plataforma", "Destino", "Passageiro", "Documento", "Fontes"]
+        )
+        header = self.result_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.Stretch)
+        table_layout.addWidget(self.result_table)
+        splitter.addWidget(table_box)
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        summary_box = QGroupBox("Resumo")
+        summary_layout = QVBoxLayout(summary_box)
+        self.summary_text.setReadOnly(True)
+        summary_layout.addWidget(self.summary_text)
+        right_layout.addWidget(summary_box)
+
+        issues_box = QGroupBox("Pendencias e alertas")
+        issues_layout = QVBoxLayout(issues_box)
+        self.issues_text.setReadOnly(True)
+        issues_layout.addWidget(self.issues_text)
+        right_layout.addWidget(issues_box)
+
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
+        layout.addWidget(splitter, 1)
+
+    def _choose_pdf_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Selecionar pasta dos PDFs")
+        if folder:
+            self.pdf_dir_edit.setText(folder)
+
+    def _load_route_file(self) -> None:
+        file_name, _ = QFileDialog.getOpenFileName(self, "Selecionar roteiro CL", filter="TXT (*.txt);;Todos (*.*)")
+        if not file_name:
+            return
+        try:
+            text = Path(file_name).read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            text = Path(file_name).read_text(encoding="latin1")
+        self.route_text.setPlainText(text)
+
+    def clear_output(self) -> None:
+        self._latest_result = None
+        self.result_table.setRowCount(0)
+        self.summary_text.clear()
+        self.issues_text.clear()
+
+    def generate_manifest_list(self) -> None:
+        pdf_dir = Path(self.pdf_dir_edit.text().strip())
+        if not pdf_dir.exists() or not pdf_dir.is_dir():
+            QMessageBox.warning(self, "Manifestos", "Informe uma pasta valida com os PDFs.")
+            return
+        roteiro_text = self.route_text.toPlainText().strip()
+        if not roteiro_text:
+            QMessageBox.warning(self, "Manifestos", "Cole ou carregue o roteiro CL.")
+            return
+
+        deliveries: List[DeliveryRecord] = []
+        transfers: List[TransferRecord] = []
+        errors: List[str] = []
+        for pdf_path in sorted(pdf_dir.glob("*.pdf")):
+            try:
+                if "TRANSBORDO" in pdf_path.name.upper():
+                    transfers.extend(read_petrobras_transfer_pdf(pdf_path))
+                else:
+                    deliveries.extend(read_petrobras_delivery_pdf(pdf_path))
+            except Exception as exc:
+                errors.append(f"{pdf_path.name}: {exc}")
+
+        if not deliveries and not transfers:
+            QMessageBox.warning(self, "Manifestos", "Nenhum registro foi lido dos PDFs informados.")
+            return
+
+        itineraries = parse_cl_itinerary_text(roteiro_text)
+        if not itineraries:
+            QMessageBox.warning(self, "Manifestos", "Nao foi possivel identificar embarcacoes no roteiro.")
+            return
+
+        result = build_passenger_pickup_list(deliveries, transfers, itineraries)
+        self._latest_result = result
+        self._populate_result_table(result.assignments)
+        self.summary_text.setPlainText(
+            f"Entregas lidas: {len(deliveries)}\n"
+            f"Transbordos lidos: {len(transfers)}\n"
+            f"Passageiros alocados: {len(result.assignments)}\n"
+            f"Pendencias: {len(result.issues)}\n"
+            + ("\nErros de leitura:\n- " + "\n- ".join(errors) if errors else "")
+        )
+        self.issues_text.setPlainText(self._issues_text(result.issues))
+
+    def _populate_result_table(self, assignments: List[PassengerAssignment]) -> None:
+        self.result_table.setRowCount(0)
+        for item in assignments:
+            row = self.result_table.rowCount()
+            self.result_table.insertRow(row)
+            values = [
+                item.vessel,
+                item.pickup_platform,
+                item.return_destination,
+                item.passenger_name,
+                item.passenger_id,
+                " | ".join(item.sources),
+            ]
+            for col, value in enumerate(values):
+                self.result_table.setItem(row, col, QTableWidgetItem(value))
+
+    @staticmethod
+    def _issues_text(issues: List[AssignmentIssue]) -> str:
+        if not issues:
+            return "Sem pendencias."
+        lines: List[str] = []
+        for issue in issues:
+            who = issue.passenger_name or issue.passenger_id or issue.platform
+            lines.append(f"[{issue.severity.upper()}] {issue.code}: {who} - {issue.message}")
+        return "\n".join(lines)
+
+    def export_csv(self) -> None:
+        if self._latest_result is None:
+            QMessageBox.warning(self, "Manifestos", "Gere a lista antes de exportar.")
+            return
+        file_name, _ = QFileDialog.getSaveFileName(
+            self,
+            "Salvar lista por embarcacao em CSV",
+            "lista_passageiros_recolhimento.csv",
+            "CSV (*.csv)",
+        )
+        if not file_name:
+            return
+        export_assignments_csv(self._latest_result, Path(file_name))
+        QMessageBox.information(self, "Manifestos", f"Arquivo salvo em:\n{file_name}")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2589,11 +2804,13 @@ class MainWindow(QMainWindow):
         self.programacao_tab = VersionEditor(self.service, self, VERSION_PROGRAMACAO)
         self.cl_tab = VersionEditor(self.service, self, VERSION_CL)
         self.pickup_tab = PickupTab(self.service, self)
+        self.manifest_tab = PassengerManifestTab(self.service, self)
         self.comparison_tab = ComparisonTab(self.service, self)
         right.addTab(self.config_tab, "Configuracoes")
         right.addTab(self.programacao_tab, "Programacao")
         right.addTab(self.cl_tab, "CL Oficial")
         right.addTab(self.pickup_tab, "Recolhimento")
+        right.addTab(self.manifest_tab, "Manifestos")
         right.addTab(self.comparison_tab, "Comparacao")
 
         splitter = QSplitter()
