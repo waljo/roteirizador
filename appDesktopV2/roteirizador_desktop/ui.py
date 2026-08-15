@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import csv
 from datetime import date, datetime
+from itertools import combinations
 import json
 from pathlib import Path
 import re
 import time
+import unicodedata
 from typing import List, Optional
 
 from .domain import (
@@ -28,6 +30,22 @@ from .domain import (
 )
 from .route_syntax import parse_route_text
 from .services import AppService, default_operation_version, today_iso
+from .offshore_pd.aliases import AliasResolver
+from .passenger_manifest import (
+    AssignmentIssue,
+    DeliveryRecord,
+    PassengerAssignment,
+    PickupListResult,
+    TransferRecord,
+    VesselItinerary,
+    build_passenger_pickup_list,
+    build_passenger_positions,
+    export_assignments_csv,
+    format_assignments_text,
+    parse_cl_itinerary_text,
+    read_petrobras_delivery_pdf,
+    read_petrobras_transfer_pdf,
+)
 
 LAYOUT_SPEC_VERSION = "1.4.0"
 HELP_SECTION_MAX_HEIGHT = 220
@@ -80,11 +98,12 @@ Em caso de duvida, verifique operacoes de dias anteriores.
 """
 
 try:
-    from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
+    from PySide6.QtCore import QEvent, QObject, QThread, QTimer, Qt, Signal
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QHeaderView,
         QApplication,
+        QCheckBox,
         QComboBox,
         QScrollArea,
         QFileDialog,
@@ -102,6 +121,7 @@ try:
         QProgressBar,
         QSizePolicy,
         QDialog,
+        QDialogButtonBox,
         QSplitter,
         QTableWidget,
         QTableWidgetItem,
@@ -123,6 +143,7 @@ except ImportError as exc:  # pragma: no cover
     def Signal(*_args, **_kwargs):  # type: ignore
         return None
 
+    QEvent = object
     QObject = object
     QThread = object
     QTimer = object
@@ -130,6 +151,7 @@ except ImportError as exc:  # pragma: no cover
     QHeaderView = object
     Qt = _QtFallback()
     QApplication = None
+    QCheckBox = object
     QComboBox = object
     QScrollArea = object
     QFileDialog = object
@@ -147,6 +169,7 @@ except ImportError as exc:  # pragma: no cover
     QProgressBar = object
     QSizePolicy = object
     QDialog = object
+    QDialogButtonBox = object
     QSplitter = object
     QTableWidget = object
     QTableWidgetItem = object
@@ -3154,6 +3177,1451 @@ class PickupTab(QWidget):
         self.output_text.setPlainText(result.plan_text)
 
 
+class PaxSelectionDialog(QDialog):
+    """Dialog to manually select which passengers board at a given stop."""
+
+    def __init__(
+        self,
+        vessel: str,
+        platform: str,
+        destination: str,
+        all_pax: list,
+        pre_selected_names: set,
+        locked_pax: "dict[str, str] | None" = None,
+        max_at_stop: int = 9999,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(f"{platform} → {destination}   [{vessel}]")
+        self.setMinimumWidth(500)
+        self.setMinimumHeight(420)
+        self._max_at_stop = max_at_stop
+        self._checkboxes: "dict[str, QCheckBox]" = {}
+
+        layout = QVBoxLayout(self)
+
+        header = QLabel(
+            f"Passageiros em <b>{platform}</b> com destino <b>{destination}</b>."
+        )
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        self._counter_label = QLabel()
+        self._counter_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self._counter_label)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        vbox = QVBoxLayout(container)
+        vbox.setSpacing(4)
+
+        locked = locked_pax or {}
+
+        for entry in sorted(all_pax, key=lambda e: e.passenger_name.upper()):
+            label_text = (
+                f"{entry.passenger_name}  [{entry.passenger_id}]"
+                if entry.passenger_id
+                else entry.passenger_name
+            )
+            cb = QCheckBox(label_text)
+            cb.setChecked(entry.passenger_name in pre_selected_names)
+            cb.stateChanged.connect(self._on_check_changed)
+            self._checkboxes[entry.passenger_name] = cb
+            vbox.addWidget(cb)
+
+        if locked:
+            sep = QLabel("<hr><small><i>Em outra embarcação (somente leitura):</i></small>")
+            sep.setWordWrap(True)
+            vbox.addWidget(sep)
+            for name in sorted(locked.keys()):
+                other_vessel = locked[name]
+                cb = QCheckBox(f"{name}  → {other_vessel}")
+                cb.setEnabled(False)
+                cb.setStyleSheet("color: gray;")
+                vbox.addWidget(cb)
+
+        vbox.addStretch()
+        container.setLayout(vbox)
+        scroll.setWidget(container)
+        layout.addWidget(scroll)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._update_counter()
+
+    def _on_check_changed(self) -> None:
+        selected = sum(1 for cb in self._checkboxes.values() if cb.isChecked())
+        at_limit = selected >= self._max_at_stop
+        for cb in self._checkboxes.values():
+            if not cb.isChecked():
+                cb.setEnabled(not at_limit)
+        self._update_counter()
+
+    def _update_counter(self) -> None:
+        selected = sum(1 for cb in self._checkboxes.values() if cb.isChecked())
+        if self._max_at_stop < 9999:
+            remaining = self._max_at_stop - selected
+            color = "red" if remaining == 0 else "green" if remaining > 0 else "red"
+            self._counter_label.setText(
+                f'Selecionados: <span style="color:{color}"><b>{selected}</b></span>'
+                f" / Máximo: <b>{self._max_at_stop}</b>"
+                f" &nbsp; (vagas restantes: {max(0, remaining)})"
+            )
+        else:
+            self._counter_label.setText(f"Selecionados: <b>{selected}</b>")
+
+    def selected_names(self) -> set:
+        return {name for name, cb in self._checkboxes.items() if cb.isChecked()}
+
+class _AddPaxChooser(QDialog):
+    """Small dialog to pick vessel + platform + destination before opening PaxSelectionDialog."""
+
+    def __init__(self, vessels: list, platforms_dests: "dict[str, list[str]]", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Incluir passageiro")
+        self.setMinimumWidth(340)
+        self._platforms_dests = platforms_dests
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Selecione a embarcacao, plataforma e destino:"))
+
+        form_layout = QHBoxLayout()
+
+        self._vessel_combo = QComboBox()
+        self._vessel_combo.addItems(vessels)
+
+        self._platform_combo = QComboBox()
+        self._platform_combo.addItems(sorted(platforms_dests.keys()))
+        self._platform_combo.currentTextChanged.connect(self._update_dests)
+
+        self._dest_combo = QComboBox()
+        self._update_dests(self._platform_combo.currentText())
+
+        for label_text, combo in [
+            ("Embarcacao:", self._vessel_combo),
+            ("Plataforma:", self._platform_combo),
+            ("Destino:", self._dest_combo),
+        ]:
+            col = QVBoxLayout()
+            col.addWidget(QLabel(label_text))
+            col.addWidget(combo)
+            form_layout.addLayout(col)
+
+        layout.addLayout(form_layout)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _update_dests(self, platform: str) -> None:
+        self._dest_combo.clear()
+        self._dest_combo.addItems(self._platforms_dests.get(platform, []))
+
+    @property
+    def vessel(self) -> str:
+        return self._vessel_combo.currentText()
+
+    @property
+    def platform(self) -> str:
+        return self._platform_combo.currentText()
+
+    @property
+    def destination(self) -> str:
+        return self._dest_combo.currentText()
+
+
+class PassengerManifestTab(QWidget):
+    def __init__(self, service: AppService, parent_window: "MainWindow"):
+        super().__init__()
+        self.service = service
+        self.parent_window = parent_window
+        self.pdf_dir_edit = QLineEdit()
+        self.route_table = QTableWidget(0, 6)
+        self._pax_snapshot: dict[str, dict[str, int]] = {}
+        self._user_overridden_limits: set[int] = set()
+        self._updating_route_calc = False
+        self.transfers_table = QTableWidget(0, 6)
+        self.result_table = QTableWidget(0, 6)
+        self.vessel_filter_combo = QComboBox()
+        self.issues_text = QTextEdit()
+        self.summary_text = QTextEdit()
+        self._loaded_deliveries: List[DeliveryRecord] = []
+        self._loaded_transfers: List[TransferRecord] = []
+        self._read_errors: List[str] = []
+        self._latest_result: Optional[PickupListResult] = None
+        self._current_assignments: Optional[List[PassengerAssignment]] = None
+        self._updating_manifest_tables = False
+        self._build()
+
+    def _build(self) -> None:
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        outer_layout.addWidget(scroll)
+
+        content = QWidget()
+        scroll.setWidget(content)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(14)
+
+        intro = QLabel(
+            "Abra a pasta com os PDFs, confirme os transbordos realizados e monte o roteiro de recolhimento por parada."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #475569;")
+        layout.addWidget(intro)
+
+        folder_box = QGroupBox("Arquivos de entrada")
+        folder_layout = QGridLayout(folder_box)
+        self.pdf_dir_edit.setPlaceholderText("Pasta com os PDFs")
+        browse_btn = QPushButton("Procurar pasta")
+        browse_btn.clicked.connect(self._choose_pdf_folder)
+        read_pdfs_btn = QPushButton("Ler PDFs")
+        read_pdfs_btn.clicked.connect(self.load_pdf_records)
+        folder_layout.addWidget(QLabel("Pasta dos PDFs:"), 0, 0)
+        folder_layout.addWidget(self.pdf_dir_edit, 0, 1)
+        folder_layout.addWidget(browse_btn, 0, 2)
+        folder_layout.addWidget(read_pdfs_btn, 0, 3)
+        layout.addWidget(folder_box)
+
+        route_box = QGroupBox("Roteiro de recolhimento")
+        route_layout = QVBoxLayout(route_box)
+        route_help = QLabel(
+            "Uma linha por parada. Em 'Destinos a recolher', use TODOS ou informe TMIB, M9, M1 separados por virgula. "
+            "Ex.: B1/TMIB para uma lancha e B1/M9 para outra."
+        )
+        route_help.setWordWrap(True)
+        route_help.setStyleSheet("color: #475569;")
+        route_layout.addWidget(route_help)
+        self.route_table.setHorizontalHeaderLabels(
+            ["Embarcacao", "Parada", "Destinos a recolher", "Pax", "A recolher", "Bordo"]
+        )
+        self.route_table.setMinimumHeight(190)
+        self.route_table.installEventFilter(self)
+        self.route_table.itemChanged.connect(self._on_route_table_item_changed)
+        route_header = self.route_table.horizontalHeader()
+        route_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        route_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        route_header.setSectionResizeMode(2, QHeaderView.Stretch)
+        route_header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        route_header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        route_header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        route_layout.addWidget(self.route_table)
+        route_buttons = QHBoxLayout()
+        add_stop_btn = QPushButton("Adicionar parada")
+        add_stop_btn.clicked.connect(self.add_route_stop)
+        remove_stop_btn = QPushButton("Excluir parada")
+        remove_stop_btn.clicked.connect(self.remove_selected_route_stop)
+        up_btn = QPushButton("Subir")
+        up_btn.clicked.connect(lambda: self.move_selected_route_stop(-1))
+        down_btn = QPushButton("Descer")
+        down_btn.clicked.connect(lambda: self.move_selected_route_stop(1))
+        import_route_btn = QPushButton("Importar roteiro TXT")
+        import_route_btn.clicked.connect(self._load_route_file)
+        route_buttons.addWidget(add_stop_btn)
+        route_buttons.addWidget(remove_stop_btn)
+        route_buttons.addWidget(up_btn)
+        route_buttons.addWidget(down_btn)
+        route_buttons.addWidget(import_route_btn)
+        route_buttons.addStretch(1)
+        route_layout.addLayout(route_buttons)
+        layout.addWidget(route_box)
+
+        transfers_box = QGroupBox("Transbordos lidos dos PDFs")
+        transfers_layout = QVBoxLayout(transfers_box)
+        transfers_help = QLabel(
+            "Marque SIM para aplicar o transbordo no razao de passageiros. Troque para NAO se o transbordo planejado nao aconteceu."
+        )
+        transfers_help.setWordWrap(True)
+        transfers_help.setStyleSheet("color: #475569;")
+        transfers_layout.addWidget(transfers_help)
+        self.transfers_table.setHorizontalHeaderLabels(["Realizado", "Passageiro", "De", "Para", "Horario", "Arquivo"])
+        self.transfers_table.setMinimumHeight(170)
+        self.transfers_table.itemChanged.connect(self._on_transfer_confirmation_changed)
+        transfer_header = self.transfers_table.horizontalHeader()
+        transfer_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        transfer_header.setSectionResizeMode(1, QHeaderView.Stretch)
+        transfer_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        transfer_header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        transfer_header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        transfer_header.setSectionResizeMode(5, QHeaderView.Stretch)
+        transfers_layout.addWidget(self.transfers_table)
+        layout.addWidget(transfers_box)
+
+        action_row = QHBoxLayout()
+        generate_btn = QPushButton("Gerar lista")
+        generate_btn.clicked.connect(self.generate_manifest_list)
+        export_btn = QPushButton("Exportar CSV")
+        export_btn.clicked.connect(self.export_csv)
+        print_btn = QPushButton("Gerar impressao")
+        print_btn.clicked.connect(self.export_printable_manifest)
+        clear_btn = QPushButton("Limpar")
+        clear_btn.clicked.connect(self.clear_output)
+        action_row.addWidget(generate_btn)
+        action_row.addWidget(export_btn)
+        action_row.addWidget(print_btn)
+        action_row.addWidget(clear_btn)
+        action_row.addStretch(1)
+        layout.addLayout(action_row)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(USE_COLLAPSIBLE_SPLITTERS)
+        splitter.setMinimumHeight(420)
+
+        table_box = QGroupBox("Lista por embarcacao")
+        table_layout = QVBoxLayout(table_box)
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Filtrar embarcacao:"))
+        self.vessel_filter_combo.addItem("TODAS")
+        self.vessel_filter_combo.currentTextChanged.connect(self._apply_result_filter)
+        filter_row.addWidget(self.vessel_filter_combo)
+        add_pax_btn = QPushButton("+ Incluir pax")
+        add_pax_btn.setToolTip("Adicionar passageiro manualmente a uma embarcacao")
+        add_pax_btn.clicked.connect(self._on_add_pax_clicked)
+        filter_row.addWidget(add_pax_btn)
+        filter_row.addStretch(1)
+        table_layout.addLayout(filter_row)
+        self.result_table.setHorizontalHeaderLabels(
+            ["Embarcacao", "Plataforma", "Destino", "Passageiro", "Documento", "Fontes"]
+        )
+        self.result_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.result_table.cellClicked.connect(self._on_result_pax_cell_clicked)
+        self.result_table.setMinimumHeight(320)
+        header = self.result_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.Stretch)
+        table_layout.addWidget(self.result_table)
+        splitter.addWidget(table_box)
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        summary_box = QGroupBox("Resumo")
+        summary_layout = QVBoxLayout(summary_box)
+        self.summary_text.setReadOnly(True)
+        self.summary_text.setMinimumHeight(130)
+        summary_layout.addWidget(self.summary_text)
+        right_layout.addWidget(summary_box)
+
+        issues_box = QGroupBox("Pendencias e alertas")
+        issues_layout = QVBoxLayout(issues_box)
+        self.issues_text.setReadOnly(True)
+        self.issues_text.setMinimumHeight(160)
+        issues_layout.addWidget(self.issues_text)
+        right_layout.addWidget(issues_box)
+
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
+        layout.addWidget(splitter)
+
+    def _choose_pdf_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Selecionar pasta dos PDFs")
+        if folder:
+            self.pdf_dir_edit.setText(folder)
+
+    def _load_route_file(self) -> None:
+        file_name, _ = QFileDialog.getOpenFileName(self, "Selecionar roteiro CL", filter="TXT (*.txt);;Todos (*.*)")
+        if not file_name:
+            return
+        try:
+            text = Path(file_name).read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            text = Path(file_name).read_text(encoding="latin1")
+        itineraries = parse_cl_itinerary_text(text)
+        if not itineraries:
+            itineraries = self._parse_compact_manifest_routes(text)
+        if not itineraries:
+            QMessageBox.warning(self, "Manifestos", "Nao foi possivel identificar embarcacoes no roteiro.")
+            return
+        self.route_table.setRowCount(0)
+        for itinerary in itineraries:
+            for stop in itinerary.stops:
+                destinations = itinerary.pickup_filters.get(stop, ["TODOS"])
+                limit = itinerary.pickup_limits.get(stop)
+                self._append_route_stop(
+                    itinerary.vessel,
+                    stop,
+                    ",".join(destinations) if destinations else "TODOS",
+                    str(limit) if limit is not None else "",
+                )
+
+    @staticmethod
+    def _parse_compact_manifest_routes(text: str) -> List[VesselItinerary]:
+        itineraries: List[VesselItinerary] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or ">" not in line:
+                continue
+
+            match = re.match(r"^(?P<vessel>(?:SURFER\s*)?\d{4}|[A-Z][A-Z0-9 ]*?)\s+(?P<route>.+)$", line, re.IGNORECASE)
+            if not match:
+                continue
+            vessel = re.sub(r"\s+", " ", match.group("vessel").strip().upper())
+            if re.fullmatch(r"\d{4}", vessel):
+                vessel = f"SURFER {vessel}"
+            route_text = match.group("route").strip()
+
+            stops: List[str] = []
+            filters: dict[str, List[str]] = {}
+            limits: dict[str, int] = {}
+            for token in route_text.split(">"):
+                token = token.strip()
+                if not token:
+                    continue
+                stop_match = re.match(r"^(?P<stop>[A-Z0-9\-]+)\s*(?:\((?P<destinations>[^)]*)\))?$", token, re.IGNORECASE)
+                if not stop_match:
+                    continue
+                stop = stop_match.group("stop").strip().upper()
+                destinations_text = (stop_match.group("destinations") or "").strip()
+                stops.append(stop)
+                if destinations_text:
+                    destinations = []
+                    stop_limit: int | None = None
+                    for item in re.split(r"[,;/\s]+", destinations_text):
+                        item = item.strip().upper()
+                        if not item:
+                            continue
+                        # support DEST:N notation (e.g. TMIB:8)
+                        if ":" in item:
+                            dest_part, _, limit_part = item.partition(":")
+                            destinations.append(dest_part)
+                            try:
+                                parsed = int(limit_part)
+                                if parsed > 0:
+                                    stop_limit = parsed
+                            except ValueError:
+                                pass
+                        else:
+                            destinations.append(item)
+                    if destinations:
+                        filters[stop] = destinations
+                    if stop_limit is not None:
+                        limits[stop] = stop_limit
+            if stops:
+                itineraries.append(VesselItinerary(vessel=vessel, stops=stops, pickup_filters=filters, pickup_limits=limits))
+        return itineraries
+
+    def add_route_stop(self) -> None:
+        selected = self.route_table.currentRow()
+        vessel = ""
+        if selected >= 0:
+            vessel = self._route_vessel_at_row(selected)
+        self._append_route_stop(vessel, "", "TODOS")
+
+    def _append_route_stop(self, vessel: str, stop: str, destinations: str, limit: str = "") -> None:
+        row = self.route_table.rowCount()
+        self._insert_route_stop(row, vessel, stop, destinations, limit)
+
+    def _insert_route_stop(self, row: int, vessel: str, stop: str, destinations: str, limit: str = "") -> None:
+        self._updating_route_calc = True
+        try:
+            self.route_table.insertRow(row)
+            self._set_route_vessel_cell(row, vessel)
+            self._set_route_stop_cell(row, stop)
+            self._set_route_destinations_cell(row, destinations or "TODOS")
+            pax_item = QTableWidgetItem("")
+            pax_item.setFlags(pax_item.flags() & ~Qt.ItemIsEditable)
+            pax_item.setTextAlignment(Qt.AlignCenter)
+            self.route_table.setItem(row, 3, pax_item)
+            a_recolher_item = QTableWidgetItem(limit)
+            a_recolher_item.setTextAlignment(Qt.AlignCenter)
+            self.route_table.setItem(row, 4, a_recolher_item)
+            bordo_item = QTableWidgetItem("")
+            bordo_item.setFlags(bordo_item.flags() & ~Qt.ItemIsEditable)
+            bordo_item.setTextAlignment(Qt.AlignCenter)
+            self.route_table.setItem(row, 5, bordo_item)
+            self.route_table.setCurrentCell(row, 1)
+        finally:
+            self._updating_route_calc = False
+        if limit:
+            self._user_overridden_limits.add(row)
+        self._recalculate_route_rows_from(row)
+
+    def _available_manifest_vessels(self) -> List[str]:
+        op_config = self.parent_window.current_op_config
+        if not op_config:
+            return []
+        return [vessel.nome for vessel in op_config.frota if vessel.ativa]
+
+    def _set_route_vessel_cell(self, row: int, selected_vessel: str = "") -> None:
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.installEventFilter(self)
+        vessels = self._available_manifest_vessels()
+        if selected_vessel and selected_vessel not in vessels:
+            vessels = [selected_vessel] + vessels
+        combo.addItems(vessels)
+        if selected_vessel:
+            index = combo.findText(selected_vessel)
+            if index >= 0:
+                combo.setCurrentIndex(index)
+        if combo.lineEdit():
+            combo.lineEdit().installEventFilter(self)
+        combo.currentTextChanged.connect(self._on_vessel_combo_changed)
+        self.route_table.setCellWidget(row, 0, combo)
+        self.route_table.setItem(row, 0, QTableWidgetItem(combo.currentText()))
+
+    def _route_vessel_at_row(self, row: int) -> str:
+        widget = self.route_table.cellWidget(row, 0)
+        if isinstance(widget, QComboBox):
+            return widget.currentText().strip()
+        item = self.route_table.item(row, 0)
+        return item.text().strip() if item else ""
+
+    def _set_route_stop_cell(self, row: int, selected_stop: str = "") -> None:
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.installEventFilter(self)
+        stops = self._available_manifest_stops()
+        if selected_stop and selected_stop not in stops:
+            stops = [selected_stop] + stops
+        combo.addItems(stops)
+        if selected_stop:
+            index = combo.findText(selected_stop)
+            if index >= 0:
+                combo.setCurrentIndex(index)
+        combo.currentTextChanged.connect(self._on_stop_combo_changed)
+        if combo.lineEdit():
+            combo.lineEdit().installEventFilter(self)
+        self.route_table.setCellWidget(row, 1, combo)
+        self.route_table.setItem(row, 1, QTableWidgetItem(combo.currentText()))
+
+    def _route_stop_at_row(self, row: int) -> str:
+        widget = self.route_table.cellWidget(row, 1)
+        if isinstance(widget, QComboBox):
+            return widget.currentText().strip()
+        item = self.route_table.item(row, 1)
+        return item.text().strip() if item else ""
+
+    def _set_route_destinations_cell(self, row: int, selected_destinations: str = "TODOS") -> None:
+        combo = QComboBox()
+        combo.installEventFilter(self)
+        options = self._available_destination_options_for_stop(self._route_stop_at_row(row))
+        selected = selected_destinations.strip().upper() if selected_destinations else "TODOS"
+        if selected not in options:
+            selected = "TODOS"
+        combo.addItems(options)
+        index = combo.findText(selected)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        combo.currentTextChanged.connect(self._on_destination_combo_changed)
+        self.route_table.setCellWidget(row, 2, combo)
+        self.route_table.setItem(row, 2, QTableWidgetItem(combo.currentText()))
+
+    def eventFilter(self, source, event):  # type: ignore[override]
+        if event.type() == QEvent.KeyPress and event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if self._is_route_table_editor(source):
+                self._add_route_stop_below_current()
+                return True
+        return super().eventFilter(source, event)
+
+    def _is_route_table_editor(self, source: object) -> bool:
+        if source is self.route_table:
+            return True
+        for row in range(self.route_table.rowCount()):
+            for col in range(self.route_table.columnCount()):
+                widget = self.route_table.cellWidget(row, col)
+                if source is widget:
+                    return True
+                if isinstance(widget, QComboBox) and widget.lineEdit() and source is widget.lineEdit():
+                    return True
+        return False
+
+    def _add_route_stop_below_current(self) -> None:
+        row = self.route_table.currentRow()
+        if row < 0:
+            row = self.route_table.rowCount() - 1
+        vessel = self._route_vessel_at_row(row) if row >= 0 else ""
+        insert_at = max(row + 1, 0)
+        self._insert_route_stop(insert_at, vessel, "", "TODOS")
+        stop_widget = self.route_table.cellWidget(insert_at, 1)
+        if stop_widget:
+            stop_widget.setFocus()
+
+    def _route_destinations_at_row(self, row: int) -> str:
+        widget = self.route_table.cellWidget(row, 2)
+        if isinstance(widget, QComboBox):
+            return widget.currentText().strip()
+        item = self.route_table.item(row, 2)
+        return item.text().strip() if item else ""
+
+    def _route_limit_at_row(self, row: int) -> int | None:
+        item = self.route_table.item(row, 4)
+        text = item.text().strip() if item else ""
+        try:
+            value = int(text)
+            return value if value > 0 else None
+        except ValueError:
+            return None
+
+    def _on_route_table_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._updating_route_calc:
+            return
+        if item.column() == 4:
+            self._user_overridden_limits.add(item.row())
+            self._recalculate_route_rows_from(item.row() + 1)
+
+    def _on_vessel_combo_changed(self, _text: str) -> None:
+        sender = self.sender()
+        if sender is None:
+            return
+        for row in range(self.route_table.rowCount()):
+            if self.route_table.cellWidget(row, 0) is sender:
+                self._on_route_context_changed(row)
+                return
+
+    def _on_stop_combo_changed(self, _text: str) -> None:
+        sender = self.sender()
+        if sender is None:
+            return
+        for row in range(self.route_table.rowCount()):
+            if self.route_table.cellWidget(row, 1) is sender:
+                self._on_route_stop_changed(row)
+                return
+
+    def _on_destination_combo_changed(self, _text: str) -> None:
+        sender = self.sender()
+        if sender is None:
+            return
+        for row in range(self.route_table.rowCount()):
+            if self.route_table.cellWidget(row, 2) is sender:
+                self._on_route_context_changed(row)
+                return
+
+    def _on_route_context_changed(self, row: int) -> None:
+        if self._updating_route_calc:
+            return
+        self._user_overridden_limits.discard(row)
+        self._recalculate_route_rows_from(row)
+
+    def _build_pax_snapshot(self) -> None:
+        if not self._loaded_deliveries and not self._loaded_transfers:
+            self._pax_snapshot = {}
+            return
+        alias = AliasResolver()
+        confirmed_transfers = self._confirmed_transfers()
+        ledger = build_passenger_positions(
+            self._loaded_deliveries,
+            confirmed_transfers,
+            self._configured_return_origins(),
+        )
+        snapshot: dict[str, dict[str, int]] = {}
+        for entry in ledger.values():
+            plat = entry.current_platform
+            dest = entry.return_destination
+            if plat == dest or plat == "TMIB":
+                continue
+            snapshot.setdefault(plat, {})
+            snapshot[plat][dest] = snapshot[plat].get(dest, 0) + 1
+            snapshot[plat]["TODOS"] = snapshot[plat].get("TODOS", 0) + 1
+
+        # The UI destination options include direct transfer-origin evidence:
+        # e.g. M1 -> M4 means there are M1-return pax waiting at M4. Keep the
+        # Pax count aligned with those options even when the delivery manifest
+        # match is imperfect or the passenger entered the ledger only via a
+        # transfer document.
+        return_origins = self._configured_return_origins(alias)
+        direct_transfer_counts: dict[str, dict[str, int]] = {}
+        for transfer in confirmed_transfers:
+            from_platform = alias.operational(transfer.from_platform)
+            to_platform = alias.operational(transfer.to_platform)
+            if from_platform not in return_origins or not to_platform or to_platform == from_platform:
+                continue
+            direct_transfer_counts.setdefault(to_platform, {})
+            direct_transfer_counts[to_platform][from_platform] = (
+                direct_transfer_counts[to_platform].get(from_platform, 0) + 1
+            )
+
+        for platform, by_destination in direct_transfer_counts.items():
+            snapshot.setdefault(platform, {})
+            for destination, count in by_destination.items():
+                existing = snapshot[platform].get(destination, 0)
+                if count <= existing:
+                    continue
+                delta = count - existing
+                snapshot[platform][destination] = count
+                snapshot[platform]["TODOS"] = snapshot[platform].get("TODOS", 0) + delta
+        self._pax_snapshot = snapshot
+
+    def _count_pax_at_stop(self, stop: str, destination_text: str) -> int:
+        plat_data = self._pax_snapshot.get(stop.upper(), {})
+        if not destination_text or destination_text.upper() in {"TODOS", "TODO", "ALL", "*"}:
+            return plat_data.get("TODOS", 0)
+        total = 0
+        for dest in re.split(r"[,;/\s]+", destination_text.upper()):
+            dest = dest.strip()
+            if dest:
+                total += plat_data.get(dest, 0)
+        return total
+
+    def _sum_a_recolher_at_stop(self, up_to_row: int, stop: str, destination_text: str) -> int:
+        stop_upper = stop.upper()
+        dest_is_todos = not destination_text or destination_text.upper() in {"TODOS", "TODO", "ALL", "*"}
+        dest_set = (
+            {d.strip() for d in re.split(r"[,;/\s]+", destination_text.upper()) if d.strip()}
+            if not dest_is_todos else set()
+        )
+        total = 0
+        for r in range(up_to_row):
+            if self._route_stop_at_row(r).upper() != stop_upper:
+                continue
+            row_dest = self._route_destinations_at_row(r).upper()
+            row_dest_is_todos = not row_dest or row_dest in {"TODOS", "TODO", "ALL", "*"}
+            if dest_is_todos or row_dest_is_todos:
+                overlap = True
+            else:
+                row_dest_set = {d.strip() for d in re.split(r"[,;/\s]+", row_dest) if d.strip()}
+                overlap = bool(dest_set & row_dest_set)
+            if overlap:
+                total += self._route_limit_at_row(r) or 0
+        return total
+
+    def _sum_a_recolher_for_vessel(self, up_to_row: int, vessel: str) -> int:
+        vessel_upper = vessel.upper()
+        return sum(
+            self._route_limit_at_row(r) or 0
+            for r in range(up_to_row)
+            if self._route_vessel_at_row(r).upper() == vessel_upper
+        )
+
+    def _manifest_vessel_capacity_single(self, vessel: str) -> int:
+        return self._manifest_vessel_capacities().get(vessel, 24)
+
+    def _pax_on_board_arriving_at_row(self, target_row: int, vessel: str) -> int:
+        """Pax on board when arriving at target_row's stop (before new pickup there).
+
+        For rows with a single explicit destination: exact disembarkation.
+        For rows with TODOS/empty destination: uses the pax snapshot to estimate
+        the proportion of pax that will disembark at each stop along the route.
+        """
+        vessel_upper = vessel.upper()
+        # First visit row index for each stop name
+        first_visit_row: dict[str, int] = {}
+        for r in range(self.route_table.rowCount()):
+            if self._route_vessel_at_row(r).upper() != vessel_upper:
+                continue
+            s = self._route_stop_at_row(r).upper()
+            if s not in first_visit_row:
+                first_visit_row[s] = r
+
+        bordo = 0.0
+        for r in range(target_row):
+            if self._route_vessel_at_row(r).upper() != vessel_upper:
+                continue
+            dest = self._route_destinations_at_row(r).upper()
+            dest_tokens = [
+                t.strip() for t in re.split(r"[,;/\s]+", dest)
+                if t.strip() and t.strip() not in {"TODOS", "TODO", "ALL", "*"}
+            ]
+            a = float(self._route_limit_at_row(r) or 0)
+
+            if len(dest_tokens) == 1:
+                # Single explicit destination — exact calculation
+                disembark_row = first_visit_row.get(dest_tokens[0], 99999)
+                if disembark_row <= target_row:
+                    continue  # disembarked before or at this stop
+                bordo += a
+            elif not dest_tokens:
+                # TODOS / empty — use snapshot for proportional estimation
+                stop_r = self._route_stop_at_row(r).upper()
+                snap = self._pax_snapshot.get(stop_r, {})
+                total_snap = snap.get("TODOS", 0)
+                if total_snap > 0 and a > 0:
+                    still_on_board = 0.0
+                    for dest_d, count_d in snap.items():
+                        if dest_d == "TODOS":
+                            continue
+                        proportion = count_d / total_snap
+                        disembark_row_d = first_visit_row.get(dest_d, 99999)
+                        if disembark_row_d > target_row:
+                            still_on_board += proportion * a
+                    bordo += still_on_board
+                else:
+                    bordo += a  # no snapshot data — conservative
+            else:
+                # Multiple explicit destinations — conservative, keep all on board
+                bordo += a
+
+        return max(0, round(bordo))
+
+    def _recalculate_route_rows_from(self, start_row: int) -> None:
+        for row in range(start_row, self.route_table.rowCount()):
+            self._recalculate_route_row(row)
+
+    def _recalculate_route_row(self, row: int) -> None:
+        stop = self._route_stop_at_row(row)
+        destination_text = self._route_destinations_at_row(row).upper()
+        vessel = self._route_vessel_at_row(row)
+
+        self._updating_route_calc = True
+        try:
+            pax_item = self.route_table.item(row, 3)
+            if pax_item is None:
+                pax_item = QTableWidgetItem()
+                pax_item.setFlags(pax_item.flags() & ~Qt.ItemIsEditable)
+                pax_item.setTextAlignment(Qt.AlignCenter)
+                self.route_table.setItem(row, 3, pax_item)
+
+            bordo_item = self.route_table.item(row, 5)
+            if bordo_item is None:
+                bordo_item = QTableWidgetItem()
+                bordo_item.setFlags(bordo_item.flags() & ~Qt.ItemIsEditable)
+                bordo_item.setTextAlignment(Qt.AlignCenter)
+                self.route_table.setItem(row, 5, bordo_item)
+
+            if not stop or not vessel or not self._pax_snapshot:
+                pax_item.setText("")
+                bordo_item.setText("")
+                return
+
+            pax_at_stop = self._count_pax_at_stop(stop, destination_text)
+            already_assigned = self._sum_a_recolher_at_stop(row, stop, destination_text)
+            available = max(0, pax_at_stop - already_assigned)
+
+            vessel_capacity = self._manifest_vessel_capacity_single(vessel)
+            # Fix: use arriving pax count (accounts for intermediate disembarkations)
+            pax_on_board = self._pax_on_board_arriving_at_row(row, vessel)
+            vessel_remaining = max(0, vessel_capacity - pax_on_board)
+
+            a_recolher = min(vessel_remaining, available)
+            pax_item.setText(str(pax_at_stop))
+
+            if row not in self._user_overridden_limits:
+                limit_item = self.route_table.item(row, 4)
+                if limit_item is None:
+                    limit_item = QTableWidgetItem()
+                    limit_item.setTextAlignment(Qt.AlignCenter)
+                    self.route_table.setItem(row, 4, limit_item)
+                limit_item.setText(str(a_recolher))
+
+            # Bordo = pax on board after pickup at this stop
+            a_recolher_final = (
+                a_recolher if row not in self._user_overridden_limits
+                else (self._route_limit_at_row(row) or 0)
+            )
+            bordo_after = pax_on_board + a_recolher_final
+            bordo_item.setText(f"{bordo_after}/{vessel_capacity}")
+        finally:
+            self._updating_route_calc = False
+
+    def _on_route_stop_changed(self, row: int) -> None:
+        if row < 0 or row >= self.route_table.rowCount():
+            return
+        self._updating_route_calc = True
+        try:
+            stop = self._route_stop_at_row(row)
+            self.route_table.setItem(row, 1, QTableWidgetItem(stop))
+            current_destinations = self._route_destinations_at_row(row)
+            self._set_route_destinations_cell(row, current_destinations or "TODOS")
+        finally:
+            self._updating_route_calc = False
+        self._on_route_context_changed(row)
+
+    def _on_transfer_confirmation_changed(self, item: QTableWidgetItem) -> None:
+        if self._updating_manifest_tables or item.column() != 0:
+            return
+        self._build_pax_snapshot()
+        self._refresh_route_stop_and_destination_options()
+        self._recalculate_route_rows_from(0)
+
+    def _available_manifest_stops(self) -> List[str]:
+        return sorted(self._manifest_destinations_by_platform().keys())
+
+    def _available_destination_options_for_stop(self, stop: str) -> List[str]:
+        destinations = self._manifest_destinations_by_platform().get(stop, [])
+        if not destinations:
+            return ["TODOS"]
+        options = ["TODOS"]
+        for size in range(1, len(destinations)):
+            for group in combinations(destinations, size):
+                options.append(",".join(group))
+        return options
+
+    def _manifest_destinations_by_platform(self) -> dict[str, List[str]]:
+        alias = AliasResolver()
+        ledger: dict[str, tuple[str, str]] = {}
+        name_index: dict[str, str] = {}
+        confirmed_transfers = self._confirmed_transfers()
+        for record in self._loaded_deliveries:
+            key = self._passenger_key(record.passenger_name, record.passenger_id)
+            ledger[key] = (
+                alias.operational(record.current_platform),
+                alias.operational(record.return_destination),
+            )
+            name_index[self._passenger_name_key(record.passenger_name)] = key
+
+        for transfer in confirmed_transfers:
+            key = self._passenger_key(transfer.passenger_name, transfer.passenger_id)
+            if key not in ledger:
+                key = name_index.get(self._passenger_name_key(transfer.passenger_name), key)
+            if key in ledger:
+                _platform, destination = ledger[key]
+                from_platform = alias.operational(transfer.from_platform)
+                if from_platform in self._configured_return_origins(alias):
+                    destination = from_platform
+                ledger[key] = (alias.operational(transfer.to_platform), destination)
+            else:
+                ledger[key] = (
+                    alias.operational(transfer.to_platform),
+                    alias.operational(transfer.from_platform),
+                )
+                name_index.setdefault(self._passenger_name_key(transfer.passenger_name), key)
+
+        destinations_by_platform: dict[str, set[str]] = {}
+        for platform, destination in ledger.values():
+            if not platform:
+                continue
+            destinations_by_platform.setdefault(platform, set()).add(destination)
+        return_origins = self._configured_return_origins(alias)
+        for transfer in confirmed_transfers:
+            from_platform = alias.operational(transfer.from_platform)
+            to_platform = alias.operational(transfer.to_platform)
+            if from_platform in return_origins:
+                destinations_by_platform.setdefault(to_platform, set()).add(from_platform)
+        return {
+            platform: sorted(destinations)
+            for platform, destinations in destinations_by_platform.items()
+        }
+
+    def _configured_return_origins(self, alias: AliasResolver | None = None) -> set[str]:
+        resolver = alias or AliasResolver()
+        op_config = self.parent_window.current_op_config
+        origins: set[str] = {"TMIB", "M9", "M1"}
+        for item in getattr(op_config, "origens_extrato", []) or []:
+            if getattr(item, "ativa", True):
+                code = str(getattr(item, "codigo", "")).strip()
+                if code:
+                    origins.add(resolver.operational(code))
+        return origins
+
+    @staticmethod
+    def _passenger_key(passenger_name: str, passenger_id: str = "") -> str:
+        if passenger_id.strip():
+            return f"id:{passenger_id.strip().upper()}"
+        return f"name:{passenger_name.strip().upper()}"
+
+    @staticmethod
+    def _passenger_name_key(passenger_name: str) -> str:
+        text = unicodedata.normalize("NFKD", passenger_name)
+        text = "".join(char for char in text if not unicodedata.combining(char))
+        text = re.sub(r"[^A-Z0-9]+", " ", text.upper())
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _refresh_route_stop_and_destination_options(self) -> None:
+        for row in range(self.route_table.rowCount()):
+            vessel = self._route_vessel_at_row(row)
+            stop = self._route_stop_at_row(row)
+            destinations = self._route_destinations_at_row(row)
+            self._set_route_vessel_cell(row, vessel)
+            self._set_route_stop_cell(row, stop)
+            self._set_route_destinations_cell(row, destinations or "TODOS")
+
+    def remove_selected_route_stop(self) -> None:
+        rows = sorted({index.row() for index in self.route_table.selectedIndexes()}, reverse=True)
+        if not rows and self.route_table.currentRow() >= 0:
+            rows = [self.route_table.currentRow()]
+        for row in rows:
+            self.route_table.removeRow(row)
+
+    def move_selected_route_stop(self, direction: int) -> None:
+        row = self.route_table.currentRow()
+        if row < 0:
+            return
+        target = row + direction
+        if target < 0 or target >= self.route_table.rowCount():
+            return
+        values = []
+        target_values = []
+        for col in range(self.route_table.columnCount()):
+            if col == 0:
+                values.append(self._route_vessel_at_row(row))
+                target_values.append(self._route_vessel_at_row(target))
+            elif col == 1:
+                values.append(self._route_stop_at_row(row))
+                target_values.append(self._route_stop_at_row(target))
+            elif col == 2:
+                values.append(self._route_destinations_at_row(row))
+                target_values.append(self._route_destinations_at_row(target))
+            else:
+                item = self.route_table.item(row, col)
+                target_item = self.route_table.item(target, col)
+                values.append(item.text() if item else "")
+                target_values.append(target_item.text() if target_item else "")
+        self._updating_route_calc = True
+        try:
+            self._set_route_vessel_cell(row, target_values[0])
+            self._set_route_vessel_cell(target, values[0])
+            self._set_route_stop_cell(row, target_values[1])
+            self._set_route_stop_cell(target, values[1])
+            self._set_route_destinations_cell(row, target_values[2])
+            self._set_route_destinations_cell(target, values[2])
+        finally:
+            self._updating_route_calc = False
+        self._user_overridden_limits.discard(row)
+        self._user_overridden_limits.discard(target)
+        self._recalculate_route_rows_from(min(row, target))
+        self.route_table.setCurrentCell(target, 0)
+
+    def clear_output(self) -> None:
+        self._latest_result = None
+        self._current_assignments = None
+        self.result_table.setRowCount(0)
+        self._reset_vessel_filter([])
+        self.summary_text.clear()
+        self.issues_text.clear()
+
+    def load_pdf_records(self) -> None:
+        pdf_dir = Path(self.pdf_dir_edit.text().strip())
+        if not pdf_dir.exists() or not pdf_dir.is_dir():
+            QMessageBox.warning(self, "Manifestos", "Informe uma pasta valida com os PDFs.")
+            return
+
+        deliveries: List[DeliveryRecord] = []
+        transfers: List[TransferRecord] = []
+        errors: List[str] = []
+        for pdf_path in sorted(pdf_dir.glob("*.pdf")):
+            try:
+                if "TRANSBORDO" in pdf_path.name.upper():
+                    transfers.extend(read_petrobras_transfer_pdf(pdf_path))
+                else:
+                    deliveries.extend(read_petrobras_delivery_pdf(pdf_path))
+            except Exception as exc:
+                errors.append(f"{pdf_path.name}: {exc}")
+
+        if not deliveries and not transfers:
+            QMessageBox.warning(self, "Manifestos", "Nenhum registro foi lido dos PDFs informados.")
+            return
+
+        self._loaded_deliveries = deliveries
+        self._loaded_transfers = transfers
+        self._read_errors = errors
+        self._populate_transfers_table(transfers)
+        self._build_pax_snapshot()
+        self._refresh_route_stop_and_destination_options()
+        self._recalculate_route_rows_from(0)
+        self.summary_text.setPlainText(
+            f"Entregas lidas: {len(deliveries)}\n"
+            f"Transbordos lidos: {len(transfers)}\n"
+            "Confira a tabela de transbordos antes de gerar a lista.\n"
+            + ("\nErros de leitura:\n- " + "\n- ".join(errors) if errors else "")
+        )
+
+    def _populate_transfers_table(self, transfers: List[TransferRecord]) -> None:
+        self._updating_manifest_tables = True
+        self.transfers_table.setRowCount(0)
+        for transfer in transfers:
+            row = self.transfers_table.rowCount()
+            self.transfers_table.insertRow(row)
+            values = [
+                "SIM",
+                transfer.passenger_name,
+                transfer.from_platform,
+                transfer.to_platform,
+                transfer.timestamp,
+                Path(transfer.source).name if transfer.source else "",
+            ]
+            for col, value in enumerate(values):
+                self.transfers_table.setItem(row, col, QTableWidgetItem(value))
+        self._updating_manifest_tables = False
+
+    def _confirmed_transfers(self) -> List[TransferRecord]:
+        confirmed: List[TransferRecord] = []
+        for row, transfer in enumerate(self._loaded_transfers):
+            item = self.transfers_table.item(row, 0)
+            marker = item.text().strip().upper() if item else "SIM"
+            if marker not in {"NAO", "NÃO", "N", "NO", "0", "FALSE"}:
+                confirmed.append(transfer)
+        return confirmed
+
+    def _read_itineraries_from_table(self) -> List[VesselItinerary]:
+        stops_by_vessel: dict[str, List[str]] = {}
+        filters_by_vessel: dict[str, dict[str, List[str]]] = {}
+        limits_by_vessel: dict[str, dict[str, int]] = {}
+        last_vessel = ""
+        for row in range(self.route_table.rowCount()):
+            vessel = self._route_vessel_at_row(row)
+            stop = self._route_stop_at_row(row)
+            if not vessel:
+                vessel = last_vessel
+            if not vessel or not stop:
+                continue
+
+            last_vessel = vessel
+            stops_by_vessel.setdefault(vessel, []).append(stop)
+            destination_text = self._route_destinations_at_row(row).upper()
+            if destination_text and destination_text not in {"TODOS", "TODO", "ALL", "*"}:
+                destinations = [
+                    token.strip()
+                    for token in re.split(r"[,;/\s]+", destination_text)
+                    if token.strip()
+                ]
+                if destinations:
+                    filters_by_vessel.setdefault(vessel, {})[stop] = destinations
+            limit = self._route_limit_at_row(row)
+            if limit is not None and limit > 0:
+                limits_by_vessel.setdefault(vessel, {})[stop] = limit
+
+        return [
+            VesselItinerary(
+                vessel=vessel,
+                stops=stops,
+                pickup_filters=filters_by_vessel.get(vessel, {}),
+                pickup_limits=limits_by_vessel.get(vessel, {}),
+            )
+            for vessel, stops in stops_by_vessel.items()
+            if stops
+        ]
+
+    def generate_manifest_list(self) -> None:
+        if not self._loaded_deliveries and not self._loaded_transfers:
+            self.load_pdf_records()
+            if not self._loaded_deliveries and not self._loaded_transfers:
+                return
+
+        itineraries = self._read_itineraries_from_table()
+        if not itineraries:
+            QMessageBox.warning(self, "Manifestos", "Monte o roteiro de recolhimento na tabela.")
+            return
+
+        transfers = self._confirmed_transfers()
+        result = build_passenger_pickup_list(
+            self._loaded_deliveries,
+            transfers,
+            itineraries,
+            return_origin_platforms=self._configured_return_origins(),
+            vessel_capacities=self._manifest_vessel_capacities(),
+        )
+        self._latest_result = result
+        self._current_assignments = list(result.assignments)
+        self._populate_result_table(self._current_assignments)
+        self._reset_vessel_filter(result.assignments)
+        self.summary_text.setPlainText(
+            f"Entregas lidas: {len(self._loaded_deliveries)}\n"
+            f"Transbordos lidos: {len(self._loaded_transfers)}\n"
+            f"Transbordos aplicados: {len(transfers)}\n"
+            f"Passageiros alocados: {len(result.assignments)}\n"
+            f"Pendencias: {len(result.issues)}\n"
+            + self._loads_summary(result)
+            + ("\nErros de leitura:\n- " + "\n- ".join(self._read_errors) if self._read_errors else "")
+        )
+        self.issues_text.setPlainText(self._issues_text(result.issues))
+
+    def _manifest_vessel_capacities(self) -> dict[str, int]:
+        op_config = self.parent_window.current_op_config
+        capacities: dict[str, int] = {}
+        for vessel in getattr(op_config, "frota", []) or []:
+            name = str(getattr(vessel, "nome", "")).strip()
+            if not name:
+                continue
+            capacities[name] = int(getattr(vessel, "capacidade", 24) or 24)
+        return capacities
+
+    @staticmethod
+    def _loads_summary(result: PickupListResult) -> str:
+        if not result.route_loads:
+            return ""
+        lines = ["\nCarga por embarcacao:"]
+        for vessel in sorted(result.route_loads):
+            capacity = result.route_capacities.get(vessel)
+            if capacity:
+                lines.append(f"- {vessel}: {result.route_loads[vessel]}/{capacity} pax")
+            else:
+                lines.append(f"- {vessel}: {result.route_loads[vessel]} pax")
+        return "\n".join(lines) + "\n"
+
+    def _on_result_pax_cell_clicked(self, row: int, col: int) -> None:
+        """Open pax selection dialog when user clicks the Passageiro column (col 3)."""
+        if col != 3:
+            return
+        if self._latest_result is None or self._current_assignments is None:
+            return
+        vessel_item = self.result_table.item(row, 0)
+        platform_item = self.result_table.item(row, 1)
+        dest_item = self.result_table.item(row, 2)
+        if not vessel_item or not platform_item or not dest_item:
+            return
+        self._open_pax_selection(
+            vessel_item.text().strip(),
+            platform_item.text().strip(),
+            dest_item.text().strip(),
+        )
+
+    def _on_add_pax_clicked(self) -> None:
+        """Button handler: choose vessel/platform/destination then open selection dialog."""
+        if self._latest_result is None or self._current_assignments is None:
+            QMessageBox.information(self, "Manifestos", "Gere a lista primeiro.")
+            return
+
+        vessels = sorted(self._latest_result.route_capacities.keys())
+        if not vessels:
+            QMessageBox.information(self, "Manifestos", "Nenhuma embarcacao no roteiro.")
+            return
+
+        platforms_dests: dict[str, set] = {}
+        for entry in self._latest_result.ledger.values():
+            plat = entry.current_platform
+            dest = entry.return_destination
+            if plat == dest or plat.upper() == "TMIB":
+                continue
+            platforms_dests.setdefault(plat, set()).add(dest)
+        platforms_dests_sorted = {k: sorted(v) for k, v in sorted(platforms_dests.items())}
+
+        if not platforms_dests_sorted:
+            QMessageBox.information(self, "Manifestos", "Nao ha passageiros aguardando recolhimento.")
+            return
+
+        dlg = _AddPaxChooser(vessels, platforms_dests_sorted, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        self._open_pax_selection(dlg.vessel, dlg.platform, dlg.destination)
+
+    def _open_pax_selection(self, vessel: str, platform: str, destination: str) -> None:
+        """Open PaxSelectionDialog for (vessel, platform, destination) and commit changes."""
+        all_pax = [
+            entry
+            for entry in self._latest_result.ledger.values()
+            if entry.current_platform.upper() == platform.upper()
+            and entry.return_destination.upper() == destination.upper()
+        ]
+
+        assigned_to_vessel = {
+            a.passenger_name
+            for a in self._current_assignments
+            if a.vessel == vessel
+            and a.pickup_platform.upper() == platform.upper()
+            and a.return_destination.upper() == destination.upper()
+        }
+        assigned_to_others: dict[str, str] = {
+            a.passenger_name: a.vessel
+            for a in self._current_assignments
+            if a.vessel != vessel
+            and a.pickup_platform.upper() == platform.upper()
+            and a.return_destination.upper() == destination.upper()
+        }
+
+        available_pax = [p for p in all_pax if p.passenger_name not in assigned_to_others]
+        if not available_pax and not assigned_to_others:
+            QMessageBox.information(
+                self, "Manifestos", f"Nao ha passageiros em {platform}→{destination}."
+            )
+            return
+
+        vessel_capacity = (
+            self._latest_result.route_capacities.get(vessel, 24)
+            if self._latest_result.route_capacities else 24
+        )
+        load_other_stops = sum(
+            1 for a in self._current_assignments
+            if a.vessel == vessel
+            and not (
+                a.pickup_platform.upper() == platform.upper()
+                and a.return_destination.upper() == destination.upper()
+            )
+        )
+        max_at_stop = max(0, vessel_capacity - load_other_stops)
+
+        sel_dlg = PaxSelectionDialog(
+            vessel, platform, destination, available_pax,
+            assigned_to_vessel, assigned_to_others, max_at_stop, self
+        )
+        if sel_dlg.exec_() != QDialog.Accepted:
+            return
+
+        new_selected = sel_dlg.selected_names()
+
+        kept = [
+            a for a in self._current_assignments
+            if not (
+                a.vessel == vessel
+                and a.pickup_platform.upper() == platform.upper()
+                and a.return_destination.upper() == destination.upper()
+            )
+        ]
+        original_lookup: dict[str, PassengerAssignment] = {
+            a.passenger_name: a
+            for a in self._latest_result.assignments
+            if a.pickup_platform.upper() == platform.upper()
+            and a.return_destination.upper() == destination.upper()
+        }
+        new_rows: List[PassengerAssignment] = []
+        for entry in sorted(all_pax, key=lambda e: e.passenger_name.upper()):
+            if entry.passenger_name not in new_selected:
+                continue
+            orig = original_lookup.get(entry.passenger_name)
+            new_rows.append(
+                PassengerAssignment(
+                    vessel=vessel,
+                    pickup_platform=platform,
+                    return_destination=destination,
+                    passenger_name=entry.passenger_name,
+                    passenger_id=orig.passenger_id if orig else entry.passenger_id,
+                    company=orig.company if orig else entry.company,
+                    sources=list(orig.sources if orig else entry.sources),
+                    movement_history=list(orig.movement_history if orig else entry.movement_history),
+                    notes=orig.notes if orig else "",
+                )
+            )
+
+        self._current_assignments = kept + new_rows
+        self._current_assignments.sort(
+            key=lambda a: (a.vessel, a.pickup_platform, a.return_destination, a.passenger_name.upper())
+        )
+        self._populate_result_table(self._current_assignments)
+        self._reset_vessel_filter(self._current_assignments)
+
+    def _populate_result_table(self, assignments: List[PassengerAssignment]) -> None:
+        self.result_table.setRowCount(0)
+        for item in assignments:
+            row = self.result_table.rowCount()
+            self.result_table.insertRow(row)
+            values = [
+                item.vessel,
+                item.pickup_platform,
+                item.return_destination,
+                item.passenger_name,
+                item.passenger_id,
+                " | ".join(item.sources),
+            ]
+            for col, value in enumerate(values):
+                self.result_table.setItem(row, col, QTableWidgetItem(value))
+        self._apply_result_filter()
+
+    def _reset_vessel_filter(self, assignments: List[PassengerAssignment]) -> None:
+        current = self.vessel_filter_combo.currentText()
+        self.vessel_filter_combo.blockSignals(True)
+        self.vessel_filter_combo.clear()
+        self.vessel_filter_combo.addItem("TODAS")
+        for vessel in sorted({item.vessel for item in assignments}):
+            self.vessel_filter_combo.addItem(vessel)
+        index = self.vessel_filter_combo.findText(current)
+        self.vessel_filter_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.vessel_filter_combo.blockSignals(False)
+        self._apply_result_filter()
+
+    def _apply_result_filter(self) -> None:
+        selected = self.vessel_filter_combo.currentText().strip()
+        for row in range(self.result_table.rowCount()):
+            vessel_item = self.result_table.item(row, 0)
+            vessel = vessel_item.text().strip() if vessel_item else ""
+            self.result_table.setRowHidden(row, bool(selected and selected != "TODAS" and vessel != selected))
+
+    @staticmethod
+    def _issues_text(issues: List[AssignmentIssue]) -> str:
+        if not issues:
+            return "Sem pendencias."
+        lines: List[str] = []
+        for issue in issues:
+            who = issue.passenger_name or issue.passenger_id or issue.platform
+            lines.append(f"[{issue.severity.upper()}] {issue.code}: {who} - {issue.message}")
+        return "\n".join(lines)
+
+    def _effective_result(self) -> Optional[PickupListResult]:
+        """Return a PickupListResult reflecting any manual assignment changes."""
+        if self._latest_result is None:
+            return None
+        if not self._current_assignments:
+            return self._latest_result
+        from collections import defaultdict
+        loads: dict[str, int] = defaultdict(int)
+        for a in self._current_assignments:
+            loads[a.vessel] += 1
+        return PickupListResult(
+            assignments=list(self._current_assignments),
+            issues=self._latest_result.issues,
+            ledger=self._latest_result.ledger,
+            route_loads=dict(loads),
+            route_capacities=self._latest_result.route_capacities,
+        )
+
+    def export_csv(self) -> None:
+        effective = self._effective_result()
+        if effective is None:
+            QMessageBox.warning(self, "Manifestos", "Gere a lista antes de exportar.")
+            return
+        file_name, _ = QFileDialog.getSaveFileName(
+            self,
+            "Salvar lista por embarcacao em CSV",
+            "lista_passageiros_recolhimento.csv",
+            "CSV (*.csv)",
+        )
+        if not file_name:
+            return
+        export_assignments_csv(effective, Path(file_name))
+        QMessageBox.information(self, "Manifestos", f"Arquivo salvo em:\n{file_name}")
+
+    def export_printable_manifest(self) -> None:
+        effective = self._effective_result()
+        if effective is None:
+            QMessageBox.warning(self, "Manifestos", "Gere a lista antes de exportar.")
+            return
+        file_name, _ = QFileDialog.getSaveFileName(
+            self,
+            "Salvar impressao dos manifestos",
+            "manifestos_recolhimento.txt",
+            "TXT (*.txt)",
+        )
+        if not file_name:
+            return
+        Path(file_name).write_text(self._printable_manifest_text(effective), encoding="utf-8")
+        QMessageBox.information(self, "Manifestos", f"Arquivo salvo em:\n{file_name}")
+
+    @staticmethod
+    def _printable_manifest_text(result: PickupListResult) -> str:
+        grouped: dict[str, dict[str, dict[str, List[PassengerAssignment]]]] = {}
+        for item in result.assignments:
+            grouped.setdefault(item.vessel, {}).setdefault(item.pickup_platform, {}).setdefault(
+                item.return_destination, []
+            ).append(item)
+
+        lines: List[str] = []
+        for vessel in sorted(grouped):
+            lines.extend(
+                [
+                    "=" * 78,
+                    "PETROBRAS".center(78),
+                    "MANIFESTO - RECOLHIMENTO DE PASSAGEIROS".center(78),
+                    f"EMBARCACAO: {vessel}",
+                    "-" * 78,
+                    f"{'ORIGEM':<10} {'DESTINO':<10} {'PASSAGEIRO':<38} {'DOCUMENTO':<16}",
+                    "-" * 78,
+                ]
+            )
+            for platform in grouped[vessel]:
+                for destination in grouped[vessel][platform]:
+                    passengers = sorted(
+                        grouped[vessel][platform][destination],
+                        key=lambda item: item.passenger_name.upper(),
+                    )
+                    for passenger in passengers:
+                        lines.append(
+                            f"{platform:<10} {destination:<10} {passenger.passenger_name[:38]:<38} {passenger.passenger_id[:16]:<16}"
+                        )
+            load = result.route_loads.get(vessel, 0)
+            capacity = result.route_capacities.get(vessel)
+            lines.append("-" * 78)
+            lines.append(f"TOTAL PAX: {load}" + (f" / CAPACIDADE: {capacity}" if capacity else ""))
+            lines.append("")
+        if result.issues:
+            lines.extend(["PENDENCIAS E ALERTAS", "-" * 78])
+            for issue in result.issues:
+                who = issue.passenger_name or issue.passenger_id or issue.platform
+                lines.append(f"[{issue.severity.upper()}] {issue.code}: {who} - {issue.message}")
+        return "\n".join(lines)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -3166,7 +4634,7 @@ class MainWindow(QMainWindow):
         self._apply_styles()
 
     def _build(self) -> None:
-        self.setWindowTitle("Roteirizador Desktop V2")
+        self.setWindowTitle("Roteirizador Desktop V2 - Manifestos")
         self.resize(1440, 960)
         central = QWidget()
         self.setCentralWidget(central)
@@ -3191,9 +4659,11 @@ class MainWindow(QMainWindow):
         self.config_tab = ConfigTab(self.service, self)
         self.programacao_tab = VersionEditor(self.service, self, VERSION_CL)
         self.pickup_tab = PickupTab(self.service, self)
+        self.manifest_tab = PassengerManifestTab(self.service, self)
         right.addTab(self.config_tab, "Configuracoes")
         right.addTab(self.programacao_tab, "Programacao")
         right.addTab(self.pickup_tab, "Recolhimento")
+        right.addTab(self.manifest_tab, "Manifestos")
 
         splitter = QSplitter()
         left_container = QWidget()

@@ -39,6 +39,9 @@ class VesselItinerary:
     # platform -> allowed return destinations. Empty/missing means collect all
     # passengers currently on that platform.
     pickup_filters: Dict[str, List[str]] = field(default_factory=dict)
+    # platform -> max passengers this vessel picks up at that stop (among those
+    # that pass the filter). Empty/missing means no limit.
+    pickup_limits: Dict[str, int] = field(default_factory=dict)
 
 
 @dataclass

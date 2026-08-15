@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(python:*)",
+      "Bash(PYTHONPATH=\"/mnt/c/Users/ka20/roteirizador/appDesktopV2\" /mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe:*)"
     ]
   }
 }

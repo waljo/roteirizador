@@ -131,7 +131,11 @@ def _apply_transfers(
             )
 
         entry.current_platform = transfer.to_platform
-        if transfer.from_platform in return_origin_platforms:
+        # Only update return_destination when the pax has no delivery record (was
+        # created from this transfer chain). Pax with a delivery already have the
+        # correct home base in return_destination; overriding it with the transfer
+        # origin (e.g. M1) would wrongly displace their real destination (e.g. TMIB).
+        if created_from_transfer and transfer.from_platform in return_origin_platforms:
             entry.return_destination = transfer.from_platform
         if transfer.source:
             entry.sources.append(transfer.source)
@@ -141,6 +145,28 @@ def _apply_transfers(
         entry.movement_history.append(marker)
 
     return issues
+
+
+def build_passenger_positions(
+    deliveries: Iterable[DeliveryRecord],
+    transfers: Iterable[TransferRecord],
+    return_origin_platforms: Iterable[str] | None = None,
+    resolver: AliasResolver | None = None,
+) -> dict[str, PassengerLedgerEntry]:
+    """Return final passenger positions after deliveries and transfers.
+
+    Does not perform route assignment. Useful for building UI snapshots that
+    show how many passengers are waiting at each platform.
+    """
+    alias = resolver or AliasResolver()
+    configured_return_origins = {
+        alias.operational(origin)
+        for origin in (return_origin_platforms or DEFAULT_RETURN_ORIGIN_PLATFORMS)
+        if str(origin).strip()
+    }
+    ledger, _ = _build_ledger(deliveries)
+    _apply_transfers(ledger, transfers, configured_return_origins)
+    return ledger
 
 
 def build_passenger_pickup_list(
@@ -172,6 +198,10 @@ def build_passenger_pickup_list(
                 alias.operational(platform): [alias.operational(destination) for destination in destinations]
                 for platform, destinations in item.pickup_filters.items()
             },
+            pickup_limits={
+                alias.operational(platform): limit
+                for platform, limit in item.pickup_limits.items()
+            },
         )
         for item in itineraries
     ]
@@ -187,6 +217,8 @@ def build_passenger_pickup_list(
         for vessel, capacity in (vessel_capacities or {}).items()
         if str(vessel).strip() and int(capacity) > 0
     }
+    # (vessel, platform) -> max passengers this vessel picks up at that stop
+    vessel_platform_limits: dict[tuple[str, str], int] = {}
 
     for vessel_idx, route in enumerate(normalized_itineraries):
         for stop_idx, stop in enumerate(route.stops):
@@ -196,21 +228,118 @@ def build_passenger_pickup_list(
                 route_order[(route.vessel, stop)] = stop_idx
                 allowed_destinations = frozenset(route.pickup_filters.get(stop, []))
                 platform_to_vessels[stop].append((route.vessel, vessel_idx, stop_idx, allowed_destinations))
+            if stop in route.pickup_limits:
+                vessel_platform_limits[(route.vessel, stop)] = route.pickup_limits[stop]
+
+    # track how many passengers each vessel has already picked up at each stop
+    vessel_platform_counts: dict[tuple[str, str], int] = defaultdict(int)
 
     assignments: list[PassengerAssignment] = []
     deferred_m9_tmib: list[PassengerLedgerEntry] = []
-    for entry in ledger.values():
+    sorted_entries = sorted(ledger.values(), key=lambda e: e.passenger_name.upper())
+    for entry in sorted_entries:
         platform = alias.operational(entry.current_platform)
         destination = alias.operational(entry.return_destination)
+        if platform == destination:
+            issues.append(
+                AssignmentIssue(
+                    severity="warning",
+                    code="passenger_already_at_origin",
+                    message=(
+                        f"Passageiro esta na propria plataforma de origem ({platform}); "
+                        "excluido do recolhimento."
+                    ),
+                    passenger_name=entry.passenger_name,
+                    passenger_id=entry.passenger_id,
+                    platform=platform,
+                )
+            )
+            continue
+        if platform == "TMIB":
+            issues.append(
+                AssignmentIssue(
+                    severity="warning",
+                    code="passenger_already_at_base",
+                    message="Passageiro ja esta no TMIB; excluido do recolhimento.",
+                    passenger_name=entry.passenger_name,
+                    passenger_id=entry.passenger_id,
+                    platform=platform,
+                )
+            )
+            continue
         if platform == "M9" and destination == "TMIB":
             deferred_m9_tmib.append(entry)
             continue
         platform_candidates = platform_to_vessels.get(platform, [])
-        candidates = [
+        # Filter 1: destination/pickup_filter check
+        dest_filter_candidates = [
             item for item in platform_candidates if not item[3] or destination in item[3]
+        ]
+        # Filter 2: route ordering — destination must be TMIB (always the final port) or
+        # must actually appear in the vessel's route AFTER the pickup stop.
+        # Destinations not in the route at all are excluded (route_order.get default 99999
+        # would wrongly pass them through, so we check membership explicitly).
+        candidates = [
+            item for item in dest_filter_candidates
+            if destination == "TMIB"
+            or (
+                (item[0], destination) in route_order
+                and route_order[(item[0], destination)] > item[2]
+            )
+        ]
+        # Filter 3: stop-level pickup limit
+        candidates = [
+            item for item in candidates
+            if (item[0], platform) not in vessel_platform_limits
+            or vessel_platform_counts[(item[0], platform)] < vessel_platform_limits[(item[0], platform)]
         ]
         if not candidates:
             if platform_candidates:
+                # Determine root cause for better error messages
+                ordering_blocked = dest_filter_candidates and all(
+                    destination != "TMIB" and (
+                        (item[0], destination) not in route_order
+                        or route_order[(item[0], destination)] <= item[2]
+                    )
+                    for item in dest_filter_candidates
+                )
+                if ordering_blocked:
+                    already_passed = any(
+                        (item[0], destination) in route_order
+                        and route_order[(item[0], destination)] <= item[2]
+                        for item in dest_filter_candidates
+                    )
+                    if already_passed:
+                        issues.append(
+                            AssignmentIssue(
+                                severity="error",
+                                code="destination_already_passed",
+                                message=(
+                                    f"O destino {destination} ja foi visitado antes de {platform} "
+                                    "no roteiro da embarcacao. O passageiro nao sera recolhido nesta "
+                                    "configuracao de rota."
+                                ),
+                                passenger_name=entry.passenger_name,
+                                passenger_id=entry.passenger_id,
+                                platform=platform,
+                            )
+                        )
+                    else:
+                        issues.append(
+                            AssignmentIssue(
+                                severity="error",
+                                code="destination_not_served",
+                                message=(
+                                    f"O destino {destination} nao consta no roteiro das embarcacoes "
+                                    f"que passam por {platform}. O passageiro nao sera recolhido nesta "
+                                    "configuracao de rota."
+                                ),
+                                passenger_name=entry.passenger_name,
+                                passenger_id=entry.passenger_id,
+                                platform=platform,
+                            )
+                        )
+                    continue
                 allowed = sorted(
                     {
                         destination_filter
@@ -263,6 +392,7 @@ def build_passenger_pickup_list(
                 )
             )
 
+        vessel_platform_counts[(vessel, platform)] += 1
         assignments.append(
             PassengerAssignment(
                 vessel=vessel,

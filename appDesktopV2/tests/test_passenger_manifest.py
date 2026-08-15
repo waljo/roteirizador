@@ -79,7 +79,7 @@ class PassengerManifestTests(unittest.TestCase):
 
     def test_applies_transfer_by_name_when_documents_do_not_match(self) -> None:
         deliveries = [
-            DeliveryRecord("Anderson Henrique dos Santos Silva", "M9", "TMIB", passenger_id=""),
+            DeliveryRecord("Anderson Henrique dos Santos Silva", "M9", "M9", passenger_id=""),
         ]
         transfers = [
             TransferRecord(
@@ -121,7 +121,28 @@ class PassengerManifestTests(unittest.TestCase):
         self.assertEqual("TMIB", by_name["Maria TMIB"].return_destination)
         self.assertEqual("M9", by_name["Icaro M9"].return_destination)
         self.assertEqual("TMIB", by_name["Matheus TMIB"].return_destination)
-        self.assertEqual("M1", by_name["Acival M1"].return_destination)
+        # Acival was delivered TMIB→M1 (return=TMIB), then transferred M1→M4.
+        # return_destination must stay TMIB — M1 was just a work stop, not their base.
+        self.assertEqual("TMIB", by_name["Acival M1"].return_destination)
+
+    def test_transfer_from_operational_origin_preserves_delivery_return_destination(self) -> None:
+        """Pax delivered TMIB→M1 then transferred M1→M4 must return to TMIB, not M1.
+
+        When a route visits M1 before M4 (e.g. M1→M4→TMIB), setting return=M1 would
+        cause destination_already_passed.  The fix: transfers from operational origins
+        only update return_destination when the pax has no delivery record.
+        """
+        deliveries = [DeliveryRecord("Joao", "M1", "TMIB")]
+        transfers = [TransferRecord("Joao", "M1", "M4")]
+        routes = [VesselItinerary("SURFER 1931", ["M1", "M4", "TMIB"])]
+
+        result = build_passenger_pickup_list(deliveries, transfers, routes)
+
+        self.assertEqual(1, len(result.assignments))
+        self.assertEqual("M4", result.assignments[0].pickup_platform)
+        self.assertEqual("TMIB", result.assignments[0].return_destination)
+        error_codes = [i.code for i in result.issues if i.severity == "error"]
+        self.assertNotIn("destination_already_passed", error_codes)
 
     def test_includes_transfer_passenger_even_without_delivery_manifest(self) -> None:
         result = build_passenger_pickup_list(
@@ -137,8 +158,12 @@ class PassengerManifestTests(unittest.TestCase):
         self.assertEqual("warning", result.issues[0].severity)
 
     def test_uses_configured_return_origins_for_transfer_origin_override(self) -> None:
+        # Custom origins only affect pax with no delivery (created_from_transfer).
+        # Pax M2 has delivery return=M2 (M2-based pax) — transfer preserves it.
+        # Pax M1 has delivery return=TMIB — transfer preserves it (M1 not in custom origins).
+        # No-delivery pax transferred from M2 gets return=M2 from entry creation.
         deliveries = [
-            DeliveryRecord("Pax M2", "M2", "TMIB"),
+            DeliveryRecord("Pax M2", "M2", "M2"),
             DeliveryRecord("Pax M1", "M1", "TMIB"),
         ]
         transfers = [
