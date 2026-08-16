@@ -99,6 +99,7 @@ Em caso de duvida, verifique operacoes de dias anteriores.
 
 try:
     from PySide6.QtCore import QEvent, QObject, QThread, QTimer, Qt, Signal
+    from PySide6.QtGui import QColor, QBrush
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QHeaderView,
@@ -178,9 +179,15 @@ except ImportError as exc:  # pragma: no cover
     QVBoxLayout = object
     QWidget = object
     QInputDialog = object
+    QColor = object
+    QBrush = object
     IMPORT_ERROR = exc
 else:
     IMPORT_ERROR = None
+
+
+def _make_color(hex_color: str):
+    return QBrush(QColor(hex_color))
 
 
 class AutoAppendTableWidget(QTableWidget):
@@ -3335,6 +3342,884 @@ class _AddPaxChooser(QDialog):
         return self._dest_combo.currentText()
 
 
+class _OriginsDialog(QDialog):
+    """Shows the operator which platforms count as passenger origins, and audits them.
+
+    TMIB and PCM-09 are always origins. Every other origin is dynamic: it follows the SOV,
+    which is attached to whichever platform is designated to host its two-shift (day/night)
+    crew, and that changes from day to day. Those live in
+    `Configurações > Origens do Extrato` — the same list the recolhimento module uses — so
+    this dialog only reports them. If they are stale the operator updates Configurações and
+    processes again, keeping one source of truth.
+
+    The Dados can tell when the list is stale: any passenger whose notas never mention a
+    configured origin must be based somewhere else. That check runs here and names both the
+    passengers affected and the platform the data points to.
+    """
+
+    def __init__(self, dados_rows: list, configured: set, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Origens dos passageiros")
+        self.setMinimumWidth(560)
+        self._dados_rows = dados_rows
+        self._origins = configured
+
+        from .distribuicao import audit_origins, suggest_origins
+        from .offshore_pd.aliases import AliasResolver, canonical_to_operational
+
+        resolver = AliasResolver()
+        layout = QVBoxLayout(self)
+
+        listed = ", ".join(sorted(canonical_to_operational(o) for o in configured))
+        header = QLabel(f"Origens configuradas para este processamento: <b>{listed}</b>")
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        note = QLabel(
+            "TMIB e M9 são sempre origens. As demais acompanham o SOV e são mantidas em "
+            "Configurações > Origens do Extrato."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #64748b;")
+        layout.addWidget(note)
+
+        missing, ambiguous = audit_origins(dados_rows, configured, resolver)
+        problems = []
+        if missing:
+            names = ", ".join(missing[:3])
+            if len(missing) > 3:
+                names += f" e mais {len(missing) - 3}"
+            problems.append(f"{len(missing)} pax sem nenhuma origem ({names})")
+        if ambiguous:
+            names = ", ".join(ambiguous[:3])
+            if len(ambiguous) > 3:
+                names += f" e mais {len(ambiguous) - 3}"
+            problems.append(f"{len(ambiguous)} pax com mais de uma origem ({names})")
+
+        if problems:
+            text = "A lista parece desatualizada: " + "; ".join(problems) + "."
+            suggested = suggest_origins(dados_rows, resolver)
+            faltando = [
+                (c, n) for c, n in suggested if c not in configured
+            ]
+            if faltando:
+                pistas = ", ".join(
+                    f"{canonical_to_operational(c)} ({n} pax)" for c, n in faltando
+                )
+                text += f"\nOs dados apontam para: {pistas}."
+            text += (
+                "\n\nAtualize em Configurações > Origens do Extrato e processe de novo. "
+                "Seguindo assim, as movimentações desses pax entram na tabela sem o teste "
+                "de recolhimento — nenhuma é descartada em silêncio."
+            )
+            warn = QLabel(text)
+            warn.setWordWrap(True)
+            warn.setStyleSheet("color: #b91c1c;")
+            layout.addWidget(warn)
+        else:
+            ok = QLabel(
+                f"Auditoria: os {len(dados_rows)} registros se resolvem com essas origens — "
+                "cada pax tem exatamente uma."
+            )
+            ok.setWordWrap(True)
+            ok.setStyleSheet("color: #15803d;")
+            layout.addWidget(ok)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        btn_cancel = QPushButton("Cancelar")
+        btn_cancel.clicked.connect(self.reject)
+        btn_ok = QPushButton("Processar")
+        btn_ok.setDefault(True)
+        btn_ok.clicked.connect(self.accept)
+        buttons.addWidget(btn_cancel)
+        buttons.addWidget(btn_ok)
+        layout.addLayout(buttons)
+
+    def origins(self) -> set:
+        return self._origins
+
+
+class _PaxSelectionDialog(QDialog):
+    """Dialog shown when Dados pax count > operacao pax_disembark for a vessel leg.
+
+    Displays the full pool of candidates with checkboxes, pre-selecting the first
+    `limit` rows as the default (same as the auto-assignment). The operator can
+    search by name and override the selection before confirming.
+    """
+
+    def __init__(self, group, parent=None):
+        super().__init__(parent)
+        self._group = group
+        self._pool = group.pool
+        horario_str = group.horario.strftime("%H:%M") if group.horario else "--:--"
+        self.setWindowTitle(f"Selecionar Passageiros — {group.vessel} {horario_str}")
+        self.setMinimumWidth(560)
+        self.setMinimumHeight(520)
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        horario_str = self._group.horario.strftime("%H:%M") if self._group.horario else "--:--"
+        info = QLabel(
+            f"<b>{self._group.vessel}</b> &nbsp;·&nbsp; {horario_str}"
+            f" &nbsp;·&nbsp; {self._group.tipo_viagem or '-'}"
+        )
+        layout.addWidget(info)
+
+        subtitle = QLabel(
+            f"Selecione <b>{self._group.limit}</b> passageiro(s) "
+            f"de <b>{len(self._pool)}</b> disponíveis"
+        )
+        layout.addWidget(subtitle)
+
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Buscar:"))
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Filtrar por nome…")
+        self._search.textChanged.connect(self._filter_rows)
+        search_row.addWidget(self._search)
+        layout.addLayout(search_row)
+
+        self._counter_label = QLabel()
+        layout.addWidget(self._counter_label)
+
+        self._table = QTableWidget()
+        self._table.setColumnCount(3)
+        self._table.setHorizontalHeaderLabels(["", "Nome Passageiro", "Orig → Dest"])
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.setSelectionMode(QAbstractItemView.NoSelection)
+        self._table.setRowCount(len(self._pool))
+
+        for i, fr in enumerate(self._pool):
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            chk.setCheckState(Qt.Checked if i < self._group.limit else Qt.Unchecked)
+            self._table.setItem(i, 0, chk)
+            self._table.setItem(i, 1, QTableWidgetItem(fr.dados_row.name or ""))
+            orig = fr.dados_row.origem_raw or ""
+            dest = fr.dados_row.destino_raw or ""
+            self._table.setItem(i, 2, QTableWidgetItem(f"{orig} → {dest}"))
+
+        self._table.resizeColumnToContents(0)
+        self._table.resizeColumnToContents(2)
+        self._table.itemChanged.connect(self._on_check_changed)
+        layout.addWidget(self._table)
+
+        self._update_counter()
+
+        btn_row = QHBoxLayout()
+        btn_auto = QPushButton("Selecionar Automaticamente")
+        btn_auto.setToolTip(f"Marcar os primeiros {self._group.limit} passageiros por ordem da planilha")
+        btn_auto.clicked.connect(self._select_auto)
+        btn_row.addWidget(btn_auto)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _filter_rows(self, text: str) -> None:
+        text_lower = text.strip().lower()
+        for row in range(self._table.rowCount()):
+            item = self._table.item(row, 1)
+            name = item.text().lower() if item else ""
+            self._table.setRowHidden(row, bool(text_lower) and text_lower not in name)
+
+    def _on_check_changed(self, item) -> None:
+        if item.column() == 0:
+            self._update_counter()
+
+    def _update_counter(self) -> None:
+        checked = sum(
+            1 for row in range(self._table.rowCount())
+            if self._table.item(row, 0) and
+               self._table.item(row, 0).checkState() == Qt.Checked
+        )
+        color = "green" if checked == self._group.limit else "red"
+        self._counter_label.setText(
+            f'<font color="{color}"><b>{checked}</b></font> / {self._group.limit} selecionados'
+        )
+
+    def _select_auto(self) -> None:
+        self._table.blockSignals(True)
+        for row in range(self._table.rowCount()):
+            item = self._table.item(row, 0)
+            if item:
+                item.setCheckState(Qt.Checked if row < self._group.limit else Qt.Unchecked)
+        self._table.blockSignals(False)
+        self._update_counter()
+
+    def get_selected(self) -> list:
+        return [
+            self._pool[row]
+            for row in range(self._table.rowCount())
+            if self._table.item(row, 0) and
+               self._table.item(row, 0).checkState() == Qt.Checked
+        ]
+
+
+class _AddTrechoDialog(QDialog):
+    """Dialog to manually assign sob_demanda passengers to a vessel trip."""
+
+    def __init__(self, sob_demanda_rows: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Adicionar Trecho Manual")
+        self.setMinimumWidth(620)
+        self._rows = sob_demanda_rows
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        # Vessel + time
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Embarcação:"))
+        self._vessel_edit = QLineEdit()
+        self._vessel_edit.setMinimumWidth(160)
+        top.addWidget(self._vessel_edit)
+        top.addWidget(QLabel("Horário (HH:MM):"))
+        self._horario_edit = QLineEdit()
+        self._horario_edit.setMaximumWidth(70)
+        top.addWidget(self._horario_edit)
+        top.addStretch()
+        layout.addLayout(top)
+
+        # Destination picker
+        dest_row = QHBoxLayout()
+        dest_row.addWidget(QLabel("Destino:"))
+        self._dest_combo = QComboBox()
+        self._dest_combo.setMinimumWidth(160)
+        destinos = sorted({fr.dados_row.destino_raw for fr in self._rows if fr.dados_row.destino_raw})
+        self._dest_combo.addItems(destinos)
+        self._dest_combo.currentIndexChanged.connect(self._refresh_pax)
+        dest_row.addWidget(self._dest_combo)
+        dest_row.addStretch()
+        layout.addLayout(dest_row)
+
+        # Passenger list with checkboxes
+        self._pax_table = QTableWidget()
+        self._pax_table.setColumnCount(2)
+        self._pax_table.setHorizontalHeaderLabels(["", "Nome Passageiro"])
+        self._pax_table.horizontalHeader().setStretchLastSection(True)
+        self._pax_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._pax_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        layout.addWidget(self._pax_table)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        self._refresh_pax()
+
+    def _refresh_pax(self) -> None:
+        dest = self._dest_combo.currentText()
+        filtered = [fr for fr in self._rows if fr.dados_row.destino_raw == dest]
+        self._pax_table.setRowCount(len(filtered))
+        for i, fr in enumerate(filtered):
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            chk.setCheckState(Qt.Unchecked)
+            self._pax_table.setItem(i, 0, chk)
+            self._pax_table.setItem(i, 1, QTableWidgetItem(fr.dados_row.name or ""))
+        self._pax_table.resizeColumnToContents(0)
+
+    def get_selection(self) -> tuple:
+        dest = self._dest_combo.currentText()
+        filtered = [fr for fr in self._rows if fr.dados_row.destino_raw == dest]
+        selected = [
+            filtered[i]
+            for i in range(self._pax_table.rowCount())
+            if self._pax_table.item(i, 0) and
+               self._pax_table.item(i, 0).checkState() == Qt.Checked
+        ]
+        return self._vessel_edit.text().strip(), self._horario_edit.text().strip(), selected
+
+
+class ManifestosDistribuicaoTab(QWidget):
+    _STATUS_COLORS = {
+        "auto":       "#d4edda",  # verde claro
+        "ambiguous":  "#fff3cd",  # amarelo
+        "sob_demanda":"#fde8d8",  # laranja claro
+    }
+    _STATUS_LABELS = {
+        "auto":       "Auto",
+        "ambiguous":  "Ambiguo",
+        "sob_demanda":"Sob demanda",
+    }
+    _COLS = ["Nome Passageiro", "Origem", "Destino",
+             "Embarcacao", "Horario", "Nº Viagem", "Tipo", "Status"]
+
+    def __init__(self, parent_window: "MainWindow"):
+        super().__init__()
+        self.parent_window = parent_window
+        self._filled_rows: list = []
+        self._n_viagem_map: dict = {}
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        # --- File pickers ---
+        form = QFormLayout()
+
+        dados_row = QHBoxLayout()
+        self._dados_path = QLineEdit()
+        self._dados_path.setPlaceholderText("Caminho da planilha Dados (.xlsx)")
+        btn_dados = QPushButton("Procurar")
+        btn_dados.clicked.connect(self._browse_dados)
+        dados_row.addWidget(self._dados_path)
+        dados_row.addWidget(btn_dados)
+        dados_widget = QWidget()
+        dados_widget.setLayout(dados_row)
+        form.addRow("Planilha Dados:", dados_widget)
+
+        operacao_row = QHBoxLayout()
+        self._operacao_path = QLineEdit()
+        self._operacao_path.setPlaceholderText("Caminho da planilha Operacao (.xlsx)")
+        btn_op = QPushButton("Procurar")
+        btn_op.clicked.connect(self._browse_operacao)
+        operacao_row.addWidget(self._operacao_path)
+        operacao_row.addWidget(btn_op)
+        operacao_widget = QWidget()
+        operacao_widget.setLayout(operacao_row)
+        form.addRow("Planilha Operacao:", operacao_widget)
+
+        layout.addLayout(form)
+
+        # --- Buttons ---
+        btn_row = QHBoxLayout()
+        btn_processar = QPushButton("Processar")
+        btn_processar.clicked.connect(self._processar)
+        self._btn_salvar = QPushButton("Salvar na planilha")
+        self._btn_salvar.clicked.connect(self._salvar)
+        self._btn_salvar.setEnabled(False)
+        self._btn_add_trecho = QPushButton("Adicionar Trecho")
+        self._btn_add_trecho.clicked.connect(self._adicionar_trecho)
+        self._btn_add_trecho.setEnabled(False)
+        self._btn_comparar = QPushButton("Comparar com PDFs")
+        self._btn_comparar.clicked.connect(self._comparar_pdfs)
+        self._btn_comparar.setEnabled(False)
+        self._lbl_status = QLabel("")
+        btn_row.addWidget(btn_processar)
+        btn_row.addWidget(self._btn_salvar)
+        btn_row.addWidget(self._btn_add_trecho)
+        btn_row.addWidget(self._btn_comparar)
+        btn_row.addStretch()
+        btn_row.addWidget(self._lbl_status)
+        layout.addLayout(btn_row)
+
+        # --- Filter bar ---
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Filtrar:"))
+
+        self._filter_nome = QLineEdit()
+        self._filter_nome.setPlaceholderText("Nome...")
+        self._filter_nome.setMaximumWidth(180)
+        self._filter_nome.textChanged.connect(self._apply_filters)
+        filter_row.addWidget(QLabel("Nome:"))
+        filter_row.addWidget(self._filter_nome)
+
+        self._filter_embarcacao = QComboBox()
+        self._filter_embarcacao.setMinimumWidth(140)
+        self._filter_embarcacao.currentIndexChanged.connect(self._apply_filters)
+        filter_row.addWidget(QLabel("Embarcacao:"))
+        filter_row.addWidget(self._filter_embarcacao)
+
+        self._filter_tipo = QComboBox()
+        self._filter_tipo.setMinimumWidth(160)
+        self._filter_tipo.currentIndexChanged.connect(self._apply_filters)
+        filter_row.addWidget(QLabel("Tipo:"))
+        filter_row.addWidget(self._filter_tipo)
+
+        self._filter_n_viagem = QComboBox()
+        self._filter_n_viagem.setMinimumWidth(80)
+        self._filter_n_viagem.currentIndexChanged.connect(self._apply_filters)
+        filter_row.addWidget(QLabel("Nº Viagem:"))
+        filter_row.addWidget(self._filter_n_viagem)
+
+        btn_limpar = QPushButton("Limpar filtros")
+        btn_limpar.clicked.connect(self._clear_filters)
+        filter_row.addWidget(btn_limpar)
+        filter_row.addStretch()
+        layout.addLayout(filter_row)
+
+        # --- Preview table ---
+        self._table = QTableWidget()
+        self._table.setColumnCount(len(self._COLS))
+        self._table.setHorizontalHeaderLabels(self._COLS)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.setEditTriggers(QAbstractItemView.AllEditTriggers)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._table.setSortingEnabled(True)
+        layout.addWidget(self._table)
+
+    def _browse_dados(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Selecionar planilha Dados", "", "Excel (*.xlsx)")
+        if path:
+            self._dados_path.setText(path)
+
+    def _browse_operacao(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Selecionar planilha Operacao", "", "Excel (*.xlsx)")
+        if path:
+            self._operacao_path.setText(path)
+
+    def _configured_origins(self) -> set:
+        """Canonical passenger origins: TMIB and M9 always, plus the active extrato origins.
+
+        Reads `Configurações > Origens do Extrato`, the same list the recolhimento module
+        consumes, so both modules agree on what an origin is. Note the recolhimento side
+        also hardcodes M1; here only TMIB and M9 are implicit, because M1 is a work platform
+        in the current operation and forcing it in makes passengers ambiguous.
+        """
+        from .distribuicao import FIXED_ORIGINS
+        from .offshore_pd.aliases import AliasResolver
+
+        resolver = AliasResolver()
+        origins = set(FIXED_ORIGINS)
+        op_config = getattr(self.parent_window, "current_op_config", None)
+        for item in getattr(op_config, "origens_extrato", []) or []:
+            if not getattr(item, "ativa", True):
+                continue
+            code = str(getattr(item, "codigo", "")).strip()
+            if not code:
+                continue
+            try:
+                origins.add(resolver.canonical(code))
+            except (ValueError, AttributeError):
+                continue
+        return origins
+
+    def _processar(self) -> None:
+        from .distribuicao import (
+            PLATFORM_EQUIVALENCES,
+            fill_rows,
+            parse_operacao,
+            read_dados,
+        )
+        from .distribuicao.filler import _assign_n_viagem
+
+        dados_path = self._dados_path.text().strip()
+        operacao_path = self._operacao_path.text().strip()
+
+        if not dados_path or not operacao_path:
+            QMessageBox.warning(self, "Manifestos Distribuicao", "Informe os caminhos das duas planilhas.")
+            return
+
+        try:
+            legs = parse_operacao(operacao_path)
+            dados_rows = read_dados(dados_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Erro ao ler planilhas", str(exc))
+            return
+
+        # The dynamic origins follow the SOV and change daily; show what is configured so
+        # the operator can fix Configuracoes and re-run before anything is assigned.
+        origins = self._configured_origins()
+        origins_dlg = _OriginsDialog(dados_rows, origins, parent=self)
+        if origins_dlg.exec() != QDialog.Accepted:
+            return
+
+        try:
+            self._filled_rows, sel_groups, n_viagem_map = fill_rows(
+                dados_rows, legs,
+                extra_aliases=PLATFORM_EQUIVALENCES,
+                origins=origins,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Erro ao processar", str(exc))
+            return
+
+        self._n_viagem_map = n_viagem_map
+
+        # Show a selection dialog for each contested group
+        for group in sel_groups:
+            dlg = _PaxSelectionDialog(group, parent=self)
+            if dlg.exec() == QDialog.Accepted:
+                self._apply_selection_group(group, dlg.get_selected())
+            # If cancelled: keep the pre-assigned default
+
+        # Re-run n_viagem assignment after any operator changes
+        _assign_n_viagem(self._filled_rows, n_viagem_map)
+
+        self._populate_table()
+        self._btn_salvar.setEnabled(True)
+        self._btn_add_trecho.setEnabled(True)
+        self._btn_comparar.setEnabled(True)
+
+        new_rows = [fr for fr in self._filled_rows if fr.status != "already_filled"]
+        auto = sum(1 for fr in new_rows if fr.status == "auto")
+        amb = sum(1 for fr in new_rows if fr.status == "ambiguous")
+        sob = sum(1 for fr in new_rows if fr.status == "sob_demanda")
+        self._lbl_status.setText(
+            f"{len(new_rows)} linhas | Auto: {auto}  Ambiguo: {amb}  Sob demanda: {sob}"
+        )
+
+    @staticmethod
+    def _apply_selection_group(group, selected_frs: list) -> None:
+        """Apply operator selection: assign selected to this vessel, cascade rest."""
+        selected_ids = {id(fr) for fr in selected_frs}
+
+        # Reset only the rows this group had pre-assigned. Other rows in the pool may
+        # belong to a different vessel that legitimately claimed them, and wiping those
+        # would drop their embarcacao/horario/n_viagem.
+        for fr in group.assigned or group.pool:
+            fr.embarcacao = None
+            fr.horario = None
+            fr.n_viagem = None
+            fr.status = "sob_demanda"
+
+        for fr in selected_frs:
+            fr.embarcacao = group.vessel
+            fr.horario = group.horario
+            fr.status = "auto"
+
+        # Cascade unselected pax to subsequent candidate legs
+        dest_c = group.pool[0].destino_canonical if group.pool else None
+        unselected = [fr for fr in group.pool if id(fr) not in selected_ids]
+        for leg in group.remaining_candidates:
+            if not unselected:
+                break
+            if dest_c and leg.destination_canonical == dest_c and leg.pax_disembark is not None:
+                limit = leg.pax_disembark
+            else:
+                limit = len(unselected)
+            auto_count = min(len(unselected), limit)
+            for fr in unselected[:auto_count]:
+                fr.embarcacao = leg.vessel
+                fr.horario = leg.departure_time
+                fr.status = "auto"
+            unselected = unselected[auto_count:]
+        # Any still unselected remain sob_demanda (already set above)
+
+    def _populate_table(self) -> None:
+        new_rows = [fr for fr in self._filled_rows if fr.status != "already_filled"]
+        self._table.setSortingEnabled(False)
+        self._table.setRowCount(len(new_rows))
+
+        embarcacoes: set = set()
+        tipos: set = set()
+        n_viagens: set = set()
+
+        for row_idx, fr in enumerate(new_rows):
+            dr = fr.dados_row
+            horario_str = fr.horario.strftime("%H:%M") if fr.horario else ""
+            n_str = str(fr.n_viagem) if fr.n_viagem else ""
+            candidates_str = ", ".join(c.vessel for c in fr.candidates) if fr.candidates else ""
+            embarcacao_display = fr.embarcacao or candidates_str
+            status_label = self._STATUS_LABELS.get(fr.status, fr.status)
+
+            if embarcacao_display:
+                embarcacoes.add(embarcacao_display)
+            if fr.tipo_viagem:
+                tipos.add(fr.tipo_viagem)
+            if n_str:
+                n_viagens.add(n_str)
+
+            values = [
+                dr.name or "",
+                dr.origem_raw or "",
+                dr.destino_raw or "",
+                embarcacao_display,
+                horario_str,
+                n_str,
+                fr.tipo_viagem or "",
+                status_label,
+            ]
+
+            color = self._STATUS_COLORS.get(fr.status)
+            for col_idx, val in enumerate(values):
+                item = QTableWidgetItem(val)
+                if col_idx == 0:
+                    item.setData(Qt.UserRole, row_idx)
+                if color and col_idx < len(self._COLS) - 1:
+                    item.setBackground(_make_color(color))
+                if col_idx == len(self._COLS) - 1:
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self._table.setItem(row_idx, col_idx, item)
+
+        self._table.resizeColumnsToContents()
+        self._table.setSortingEnabled(True)
+        self._populate_filter_combos(
+            sorted(embarcacoes), sorted(tipos),
+            sorted(n_viagens, key=lambda x: int(x) if x.isdigit() else 999),
+        )
+
+    def _populate_filter_combos(self, embarcacoes: list, tipos: list, n_viagens: list) -> None:
+        for combo, values in [
+            (self._filter_embarcacao, embarcacoes),
+            (self._filter_tipo, tipos),
+            (self._filter_n_viagem, n_viagens),
+        ]:
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("(Todas)")
+            combo.addItems(values)
+            combo.blockSignals(False)
+
+    def _apply_filters(self) -> None:
+        nome_filter = self._filter_nome.text().strip().lower()
+        emb_filter = self._filter_embarcacao.currentText()
+        tipo_filter = self._filter_tipo.currentText()
+        n_filter = self._filter_n_viagem.currentText()
+
+        for row in range(self._table.rowCount()):
+            def cell(col: int, _row: int = row) -> str:
+                item = self._table.item(_row, col)
+                return item.text() if item else ""
+
+            show = True
+            if nome_filter and nome_filter not in cell(0).lower():
+                show = False
+            if emb_filter != "(Todas)" and cell(3) != emb_filter:
+                show = False
+            if tipo_filter != "(Todas)" and cell(6) != tipo_filter:
+                show = False
+            if n_filter != "(Todas)" and cell(5) != n_filter:
+                show = False
+
+            self._table.setRowHidden(row, not show)
+
+    def _clear_filters(self) -> None:
+        self._filter_nome.clear()
+        for combo in (self._filter_embarcacao, self._filter_tipo, self._filter_n_viagem):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        self._apply_filters()
+
+    def _salvar(self) -> None:
+        from .distribuicao import write_dados
+        from datetime import time as dt_time
+
+        dados_path = self._dados_path.text().strip()
+        new_rows = [fr for fr in self._filled_rows if fr.status != "already_filled"]
+
+        # Sync table edits back — use UserRole to map visual rows to original indices
+        # (table may be sorted, so visual row != insertion order)
+        for table_row in range(self._table.rowCount()):
+            item0 = self._table.item(table_row, 0)
+            if not item0:
+                continue
+            orig_idx = item0.data(Qt.UserRole)
+            if orig_idx is None:
+                continue
+            fr = new_rows[orig_idx]
+
+            def cell(col: int, _row: int = table_row) -> str:
+                item = self._table.item(_row, col)
+                return item.text().strip() if item else ""
+
+            fr.embarcacao = cell(3) or None
+            horario_text = cell(4)
+            try:
+                h, m = horario_text.split(":")
+                fr.horario = dt_time(int(h), int(m))
+            except (ValueError, AttributeError):
+                fr.horario = None
+            n_text = cell(5)
+            fr.n_viagem = int(n_text) if n_text.isdigit() else None
+            fr.tipo_viagem = cell(6) or None
+
+        try:
+            write_dados(dados_path, self._filled_rows)
+            QMessageBox.information(self, "Manifestos Distribuicao", f"Planilha salva em:\n{dados_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Erro ao salvar", str(exc))
+
+    @staticmethod
+    def _dados_date(dados_rows):
+        """Data da planilha Dados, para não comparar com PDFs de outro dia."""
+        from datetime import datetime
+
+        for row in dados_rows:
+            texto = (row.date_str or "").strip()
+            for fmt in ("%d.%m.%Y", "%d/%m/%Y"):
+                try:
+                    return datetime.strptime(texto, fmt).date()
+                except ValueError:
+                    continue
+        return None
+
+    def _comparar_pdfs(self) -> None:
+        """Confere se cada movimentação programada consta também nos PDFs oficiais."""
+        from .distribuicao import (
+            comparar,
+            find_programacao_pdfs,
+            formatar_relatorio,
+            parse_lanchas_pdfs,
+            programacao_da_planilha,
+            read_dados,
+        )
+
+        dados_path = self._dados_path.text().strip()
+        if not dados_path:
+            QMessageBox.warning(self, "Comparar com PDFs", "Informe a planilha Dados.")
+            return
+
+        # Lê a planilha do disco: a comparação é do que está gravado, não do que esta sessão
+        # calculou. Só assim apagar uma programação no Excel aparece no relatório.
+        try:
+            dados_rows = read_dados(dados_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Erro ao ler a planilha Dados", str(exc))
+            return
+
+        sheet_rows = programacao_da_planilha(dados_rows)
+
+        folder = QFileDialog.getExistingDirectory(
+            self, "Selecionar a pasta com as programações em PDF"
+        )
+        if not folder:
+            return
+
+        paths = find_programacao_pdfs(folder)
+        if not paths:
+            QMessageBox.warning(
+                self, "Comparar com PDFs", f"Nenhum PDF encontrado em:\n{folder}"
+            )
+            return
+
+        try:
+            voyages = parse_lanchas_pdfs(paths)
+        except Exception as exc:
+            QMessageBox.critical(self, "Erro ao ler PDFs", str(exc))
+            return
+
+        if not voyages:
+            QMessageBox.warning(
+                self, "Comparar com PDFs",
+                f"Nenhuma programação foi reconhecida nos {len(paths)} PDF(s) da pasta.",
+            )
+            return
+
+        # A pasta pode conter dias diferentes — na de Downloads convivem as listas de 15 e
+        # 16/08. Cruzar dias daria um relatório cheio de divergências falsas.
+        data_planilha = self._dados_date(dados_rows)
+        ignorados: list[str] = []
+        if data_planilha is not None:
+            do_dia = [v for v in voyages if v.data in (None, data_planilha)]
+            ignorados = sorted({
+                f"{v.source} ({v.data.strftime('%d/%m/%Y')})"
+                for v in voyages if v.data is not None and v.data != data_planilha
+            })
+            if not do_dia:
+                QMessageBox.warning(
+                    self, "Comparar com PDFs",
+                    f"Nenhum PDF da pasta é de {data_planilha.strftime('%d/%m/%Y')}, "
+                    "a data da planilha Dados.\n\nIgnorados: " + ", ".join(ignorados),
+                )
+                return
+            voyages = do_dia
+
+        resultado = comparar(sheet_rows, voyages)
+
+        # Processar sem salvar deixa a planilha do disco atrasada; o relatório seria sobre um
+        # estado que o operador não reconhece.
+        pendentes = sum(1 for fr in self._filled_rows if fr.status == "auto")
+        nao_salvo = pendentes > 0 and len(sheet_rows) != pendentes
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Comparação com as programações em PDF")
+        dlg.setMinimumSize(820, 560)
+        layout = QVBoxLayout(dlg)
+
+        arquivos = sorted({v.source for v in voyages})
+        cabecalho = f"{len(voyages)} viagens lidas em {len(arquivos)} PDF(s)"
+        if data_planilha is not None:
+            cabecalho += f" de {data_planilha.strftime('%d/%m/%Y')}"
+        if resultado.iguais:
+            cabecalho += " — tudo confere."
+        resumo = QLabel(cabecalho)
+        resumo.setStyleSheet(
+            "color: #15803d; font-weight: bold;" if resultado.iguais
+            else "color: #b91c1c; font-weight: bold;"
+        )
+        layout.addWidget(resumo)
+
+        detalhe = QLabel(
+            f"Comparando com a planilha gravada em disco ({len(sheet_rows)} movimentações "
+            f"programadas).\nArquivos lidos: " + ", ".join(arquivos)
+        )
+        detalhe.setWordWrap(True)
+        detalhe.setStyleSheet("color: #64748b;")
+        layout.addWidget(detalhe)
+
+        if nao_salvo:
+            pendente = QLabel(
+                f"A tabela desta sessão tem {pendentes} movimentações e a planilha em disco "
+                f"tem {len(sheet_rows)}. Use \"Salvar na planilha\" antes de comparar, senão "
+                "o relatório é sobre a versão anterior do arquivo."
+            )
+            pendente.setWordWrap(True)
+            pendente.setStyleSheet("color: #b45309;")
+            layout.addWidget(pendente)
+
+        if ignorados:
+            aviso = QLabel(
+                "Ignorados por serem de outra data: " + ", ".join(ignorados)
+            )
+            aviso.setWordWrap(True)
+            aviso.setStyleSheet("color: #b45309;")
+            layout.addWidget(aviso)
+
+        texto = QTextEdit()
+        texto.setReadOnly(True)
+        texto.setPlainText(formatar_relatorio(resultado))
+        texto.setStyleSheet("font-family: Consolas, monospace;")
+        layout.addWidget(texto)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        btn_close = QPushButton("Fechar")
+        btn_close.clicked.connect(dlg.accept)
+        buttons.addWidget(btn_close)
+        layout.addLayout(buttons)
+        dlg.exec()
+
+    def _adicionar_trecho(self) -> None:
+        sob_demanda = [fr for fr in self._filled_rows if fr.status == "sob_demanda"]
+        if not sob_demanda:
+            QMessageBox.information(self, "Adicionar Trecho", "Não há passageiros sob demanda.")
+            return
+
+        dlg = _AddTrechoDialog(sob_demanda, parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        vessel, horario_str, selected_rows = dlg.get_selection()
+        if not vessel or not selected_rows:
+            QMessageBox.warning(self, "Adicionar Trecho", "Informe a embarcação e selecione ao menos um passageiro.")
+            return
+
+        from datetime import time as dt_time
+        try:
+            h, m = horario_str.split(":")
+            horario = dt_time(int(h), int(m))
+        except (ValueError, AttributeError):
+            QMessageBox.warning(
+                self, "Adicionar Trecho",
+                f"Horário inválido: {horario_str!r}. Use o formato HH:MM.",
+            )
+            return
+
+        for fr in selected_rows:
+            fr.embarcacao = vessel
+            fr.horario = horario
+            fr.status = "auto"
+
+        # Without this the rows keep embarcacao/horario but no Nº VIAGEM.
+        from .distribuicao.filler import _assign_n_viagem
+        _assign_n_viagem(self._filled_rows, self._n_viagem_map)
+
+        self._populate_table()
+
+
 class PassengerManifestTab(QWidget):
     def __init__(self, service: AppService, parent_window: "MainWindow"):
         super().__init__()
@@ -4660,10 +5545,14 @@ class MainWindow(QMainWindow):
         self.programacao_tab = VersionEditor(self.service, self, VERSION_CL)
         self.pickup_tab = PickupTab(self.service, self)
         self.manifest_tab = PassengerManifestTab(self.service, self)
+        self.distribuicao_tab = ManifestosDistribuicaoTab(self)
         right.addTab(self.config_tab, "Configuracoes")
         right.addTab(self.programacao_tab, "Programacao")
-        right.addTab(self.pickup_tab, "Recolhimento")
-        right.addTab(self.manifest_tab, "Manifestos")
+        recolhimento_idx = right.addTab(self.pickup_tab, "Recolhimento")
+        right.setTabEnabled(recolhimento_idx, False)
+        manifestos_rec_idx = right.addTab(self.manifest_tab, "Manifestos Recolhimento")
+        right.setTabEnabled(manifestos_rec_idx, False)
+        right.addTab(self.distribuicao_tab, "Manifestos Distribuicao")
 
         splitter = QSplitter()
         left_container = QWidget()

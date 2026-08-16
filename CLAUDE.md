@@ -245,15 +245,673 @@ Calcula pax a bordo quando o navio CHEGA à parada de `target_row` (antes de emb
 
 ---
 
+## Fix — Split de origens múltiplas em QUANT PAX DESEMBARQUE
+
+### Problema
+
+A leg `M9→B1` da SURFER 1930 tem `QUANT PAX DESEMBARQUE = "TMIB:11, M9:8"`. O parser antigo
+(`_parse_origin_disembark`) só reconhecia a forma de origem única (`"M6:13"`); com múltiplas
+origens caía no fallback que **somava** as contagens e devolvia `(None, 19)`, perdendo a origem.
+
+Como `fill_rows` começa o loop com `if leg.pax_origin is None: continue`, a leg era descartada
+inteira e nenhum pax com destino B1 era atribuído. Na tabela aparecia só os 13 pax de
+`TMIB→M9` (leg `"TMIB:13"`, origem única, que casava normalmente).
+
+### Solução
+
+`_parse_origin_disembark` foi substituída por `_parse_origin_disembark_list`, que devolve uma
+**lista** de `(pax_origin, count)`. O `parse_operacao` cria **uma `VesselLeg` por origem**,
+todas com o mesmo `origin_canonical`/`destination_canonical`/horários:
+
+```
+"TMIB:11, M9:8"  →  [(TMIB, 11), (PCM-09, 8)]
+"M6:13"          →  [(PCM-06, 13)]
+13               →  [(None, 13)]
+None / ""        →  []
+```
+
+Resultado para a SURFER 1930 (`TMIB>M9>B1`):
+
+| Leg | pax_origin | count |
+|-----|-----------|-------|
+| TMIB→PCM-09 06:20 | TMIB | 13 |
+| PCM-09→PCB-01 07:19 | TMIB | 11 |
+| PCM-09→PCB-01 07:19 | PCM-09 | 8 |
+
+Bate-volta viagem 1 = 13 + 11 = 24 pax; transbordo = 8 pax.
+
+### Regex
+
+`_SINGLE_ORIGIN_RE` e `_DISEMBARK_PART_RE` foram substituídos por um único
+`_MULTI_ORIGIN_RE = re.compile(r"([A-Za-z0-9\-]+):(\d+)")` aplicado com `findall`.
+
+---
+
+## Regra de classificação das viagens (definitiva)
+
+### Objetivo do módulo
+
+Preencher, para cada linha de pax no Dados, as colunas EMBARCAÇÃO, HORÁRIO, Nº VIAGEM e
+TIPO DE VIAGEM, para que o operador gere os manifestos. **Não** é objetivo calcular lotação
+nem programar o retorno — o retorno fica em branco e é tratado pelo módulo de recolhimento.
+
+### Recolhimento = retorno do pax à origem dele
+
+Recolhimento **não** é "movimento para TMIB/M9/M5". É o pax voltando para a origem em que
+começou o dia. Exemplo do usuário: pax sai de M1 para M3 e desta para M9 — a última é
+transbordo interno, não recolhimento, porque a origem dele é M1.
+
+Essas linhas ficam **em branco** (fora do `filled`, logo o `write_dados` não as toca).
+
+### Duas origens diferentes, não confundir
+
+| Conceito | Fonte | Uso |
+|---|---|---|
+| `nota_origin` | prefixo da Descrição da Nota (`"PCM-9: NOME"` → M9) | define o **tipo** e casa com `pax_origin` da leg |
+| `day_origin` | a origem operacional (TMIB > M9 > M1) entre os prefixos das notas do pax | define o que é **recolhimento** |
+
+Um pax pode ter várias notas, e o prefixo é da nota, não do dia. Silvia tem
+`PCM-9: SILVIA` (M9→PGA-2) e depois `PGA-2: SILVIA` (PGA-2→PGA-1, PGA-1→M9). A origem do
+dia é M9, então `PGA-1→M9` é recolhimento — mas `PGA-2→PGA-1` é TRANSBORDO INTERNO, tipo
+vindo do prefixo `PGA-2`. Usar só o prefixo classificaria o retorno como transbordo interno;
+usar só a origem do dia classificaria `PGA-2→PGA-1` como transbordo (M9 é hub). Precisa dos dois.
+
+### Classificação (`_classify`) — o tipo vem da origem da MOVIMENTAÇÃO
+
+```
+destino == TMIB  e  origem != TMIB   ->  DESEMBARQUE
+origem == TMIB   e  volta ao TMIB    ->  BATE VOLTA
+origem == TMIB   e  não volta        ->  EMBARQUE
+origem == M9                         ->  TRANSBORDO
+demais                               ->  TRANSBORDO INTERNO
+```
+
+**Não** do prefixo da nota. Prova no gabarito do colega para 16/08: `M6→M9` é
+TRANSBORDO INTERNO e `M9→M6` é TRANSBORDO, e as duas linhas carregam o mesmo prefixo
+`PCM-9:`. É a leg que o pax está viajando que decide, logo o sinal é `origem`.
+
+`_classify` sempre devolve um tipo — nunca `None`. Quem decide o que é preenchido é a
+operação, pela existência ou não de leg.
+
+### A operação é a autoridade; recolhimento e continuação só tratam as sobras
+
+`_is_leftover_return` é consultada **somente para linhas que nenhuma leg reivindicou**, e
+decide se a sobra fica em branco ou visível como `sob_demanda`. Fica em branco quando é:
+
+- **retorno à origem do dia** do pax — trabalho do módulo de recolhimento;
+- **continuação de nota** (`origem != nota_origin`) — só leva o pax adiante dentro de uma
+  jornada já registrada na primeira movimentação. Ex.: nota 326964519 (ANTONIO ACÁCIO) tem
+  item 1 `TMIB→B4` e item 2 `B4→M9`; o pax é lançado na embarcação que sai do TMIB e a linha
+  `B4→M9` não acrescenta nada.
+
+**Uma movimentação que casou com leg é sempre preenchida**, mesmo parecendo os dois casos:
+`M6→M9` é ao mesmo tempo retorno ao M9 e continuação de nota, e a operação a programa
+explicitamente na AQUA HELIX 17:30 com `M6:15`.
+
+Essa inversão foi a correção da discrepância grave dos transbordos internos: as regras eram
+aplicadas **antes** do casamento e descartavam 27 linhas (`SPH-02→M9` e `M6→M9`) que o
+gabarito preenche. As 100 linhas que o gabarito deixa em branco não precisam de regra —
+elas simplesmente não têm leg (`M10→M5`, `M8→M5` etc.).
+
+- **DESEMBARQUE**: pax deixa o campo pelo TMIB sem que o TMIB seja a origem dele.
+  Ex.: Jefferson (L233, `M9→TMIB`, origem M9).
+- **BATE VOLTA vs EMBARQUE**: o teste é **por passageiro**, não por nota — Thiago tem o
+  retorno ao TMIB em outra nota (`PCM-2`), e ainda assim é BATE VOLTA.
+  `_build_return_index` indexa por nome normalizado.
+
+### Horário e numeração de viagem
+
+Ambos vêm de `_voyage_horarios(trips)`, indexado por **(viagem, tipo)**:
+
+- **viagem** = a `VesselTrip`, ou seja, uma seção de embarcação na planilha de operação.
+  Mesma lancha no mesmo trecho = mesma viagem.
+- **tipo** = o grupo de numeração (`_numbering_group`), então EMBARQUE compartilha tudo com
+  BATE VOLTA — é a mesma partida física do TMIB. Confirmado na planilha do operador:
+  Valdemilson (bate volta) e Mateus/Eston/André (embarque) estão todos em SURFER 1930 06:20
+  **viagem 1**.
+
+O horário é o **embarque mais cedo** entre as legs daquele par. Quando uma viagem atende
+vários pontos de embarque do mesmo tipo, todos ficam na mesma viagem.
+
+**A numeração (`_build_n_viagem_map`) conta só as viagens que de fato levam pax daquele tipo**,
+ordenadas por **horário**, com desempate pela **ordem das seções na operação**. Ambas as regras
+vêm do gabarito de 16/08, que elas reproduzem exatamente nos quatro tipos.
+
+Duas armadilhas verificadas contra o gabarito:
+
+- Viagens vazias **não** consomem número. Antes, legs sem `pax_origin` eram registradas e
+  inflavam a sequência — TRANSBORDO INTERNO chegava a v8 onde o gabarito tem v6.
+- O desempate **não** é alfabético. Três seções partem às 10:00 e o gabarito as numera 1905,
+  1871, 1931 — a ordem em que aparecem na operação.
+
+Ordenar por seção em vez de horário também não serve: em TRANSBORDO o gabarito segue o relógio
+(05:30, 06:30, 06:50, 07:10, 07:20, 07:30, 16:45), que não é a ordem das seções.
+
+**Por que não indexar pela leg de embarque** (como era antes): a viagem das 10:00 da SURFER
+1870 (`M5 → M9 → TMIB`) desembarca no TMIB um pax de origem M5 e um de origem M9. Indexando
+por leg de embarque, o de M5 pegava a leg `M5→M9` (10:00) e o de M9 pegava a leg `M9→TMIB`
+(10:08) — mesma viagem física saindo com dois horários e **dois números de viagem**.
+
+```
+antes:   L14  M5→TMIB  SURFER 1870  10:00  v1      L228 M9→TMIB  SURFER 1870  10:08  v2
+depois:  L14  M5→TMIB  SURFER 1870  10:00  v1      L228 M9→TMIB  SURFER 1870  10:00  v1
+```
+
+Tipos diferentes na mesma viagem continuam com horários próprios, e isso é intencional: na
+SURFER 1931 os bate-volta embarcam no TMIB (06:20) e os transbordos no M9 (07:29).
+
+Legs sem `pax_origin` não levam pax mas continuam ocupando um número de viagem, indexadas
+pelo próprio horário — comportamento preservado de antes.
+
+### Casamento leg ↔ linha do Dados (`_matches`)
+
+O destino sempre tem de casar. O `pax_origin` da leg pode se referir a duas coisas:
+
+```
+leg.pax_origin == nota_origin   ->  origem do pax na jornada.
+                                    Basta destino + nota_origin, porque o barco pode ter
+                                    paradas no meio (leg M9->B1 com "TMIB:12" atende
+                                    linhas TMIB->B1).
+
+leg.pax_origin == origem        ->  plataforma de embarque naquela leg.
+  E destino != TMIB                 Exige origem == leg.origin_canonical. Ocorre na volta:
+                                    AQUA HELIX 17:30 `M6->M9` declara `M6:15` para linhas
+                                    cujas notas dizem `PCM-9:`.
+```
+
+Sem o primeiro ramo, as 27 linhas `M6→M9` / `SPH-02→M9` não achariam leg.
+
+A condição `origem == leg.origin_canonical` impede que a movimentação `B1→M9` do Mateus case
+com a leg `TMIB→M9` da 1930 só porque `nota_origin` é TMIB.
+
+**A guarda `destino != TMIB` no segundo ramo é essencial.** Sem ela, a única vaga da leg
+`M9→TMIB` da SURFER 1870 sorteia entre os 18 pax que voltam do M9 para casa, criando um
+dialog espúrio de 1 em 18. Movimento para terra só entra aqui quando o pax **não** começou o
+dia no TMIB — que é exatamente o desembarque, já coberto pelo primeiro ramo.
+
+### QUANT PAX DESEMBARQUE é teto, não contagem exata
+
+A coluna conta pax **físicos** desembarcando, incluindo quem está em recolhimento. Então o
+`pax_disembark` pode ser maior que o pool filtrado. Ex.: leg `M9→B1` da 1930 declara `M9:8`,
+mas 1 desses 8 é Jamerson (começou o dia em B1, `B1→B2→M9`, e `M9→B1` é o retorno dele),
+sobrando 7 para distribuir. Como o limite é teto, os 7 são atribuídos e nada se perde.
+
+### SPH-02 = turno da noite em M6 (`NIGHT_SHIFT_LABELS`)
+
+O M6 hospeda **duas turmas** e o **SPH-02** é o código cadastrado para a da noite. Nas outras
+plataformas a operação marca turno com sufixo `(D)`/`(N)`, mas essa convenção vive no
+**extrato PDF** — é o que os padrões `aceitar`/`descartar` das Configurações parseiam. Dentro
+do Dados não existe nenhuma marca `(D)`/`(N)`: conferido nos dois arquivos, os rótulos de
+Origem/Destino são só `PCB-1/2/4, PCM-1/2/3/5/6/8/9/10, PGA-1/2/3, SPH-02, TMIB`. Ali o turno
+aparece unicamente como esse código separado.
+
+A operação nunca diz SPH-02 — nomeia M6 para as duas turmas — então o rótulo tem de ser
+dobrado em M6 para achar leg. O casamento das quatro direções em 16/08, todas AQUA HELIX,
+identifica a plataforma e o par de legs de cada turma:
+
+| Turma | Dados | qtd | Leg | count |
+|---|---|---|---|---|
+| dia | `M9→M6` | 15 | 05:30 `M9→M6` | 15 |
+| **noite** | `M9→SPH-02` | 12 | 16:45 `M9→M6` | 12 |
+| dia | `M6→M9` | 15 | 17:30 `M6→M9` | 15 |
+| **noite** | `SPH-02→M9` | 12 | 04:50 `M6→M9` | 12 |
+
+Em 15/08 o padrão se repete com folga de 1 a 2 pax (12 contra 13, 13 contra 15), provavelmente
+porque a operação foi planejada antes do Dados final.
+
+**Alocação por turno é restrição de casamento, não preferência de ordem.** Dobrado o SPH-02 em
+M6, as duas turmas passam a ter o mesmo destino canônico e disputam o mesmo pool. As legs do
+grupo são distinguidas por horário (`_night_leg_position` + `_is_night_shift`):
+
+```
+ida    (destino != origem do dia)  ->  noite = leg MAIS TARDIA   (16:45 para o M6)
+volta  (destino == origem do dia)  ->  noite = leg MAIS CEDO     (04:50 do M6)
+```
+
+O turno é definido por *quando trabalha*, então a noite viaja nas bordas do dia: sai tarde e
+volta na madrugada. Confirmado no gabarito de 16/08 — `M9→SPH-02` em 16:45 e `SPH-02→M9` em
+04:50, contra `M9→M6` em 05:30 e `M6→M9` em 17:30.
+
+A restrição só entra em vigor quando o pool contém rótulo de noite **e** o grupo tem mais de
+uma leg. Sem essa guarda ela quebraria a divisão `TMIB→M9` entre 1931 e 1905, onde as duas
+legs atendem a mesma turma.
+
+Duas tentativas anteriores falharam, nesta ordem:
+
+1. **Sem nenhum tratamento**: a alocação seguia a ordem das linhas da planilha. Acertava por
+   acidente, porque as linhas `PCM-6` vinham antes das `SPH-02`. Invertendo a ordem, embaralha
+   (`05:30 → 12 NOITE + 3 DIA`, `16:45 → 12 DIA`) com o total certo, sem nada sinalizar.
+2. **Ordenando o pool dia-antes-de-noite**: resolve só quando as duas turmas estão no mesmo
+   pool. Rodando sobre uma planilha em que o dia **já estava preenchido** (`already_filled`,
+   fora do pool), sobrava só a noite e a leg das 05:30 engolia as 12 — foi o caso reportado.
+
+Verificado em quatro cenários (pool completo, pool completo com linhas invertidas, dia
+pré-preenchido, dia pré-preenchido com linhas invertidas): todos dão `SPH-02 → 16:45 v7`, que é
+o que o colega havia preenchido à mão no arquivo original de 16/08.
+
+**Lacuna conhecida**: se um Dados futuro passar a usar o sufixo, `PCM-06 (N)` cai no
+`return raw` do `_canonical_from_raw` e vira uma plataforma desconhecida — não casa com leg
+nenhuma e o pax vai para `sob_demanda` sem aviso. `_sanitize` remove espaços mas não trata
+parênteses.
+
+**Histórico**: este alias existia como `_DEFAULT_EXTRA_ALIASES`, foi removido a pedido, e está
+de volta como `PLATFORM_EQUIVALENCES`. A remoção foi correta na época: no modelo *Dados-centric*
+o alias fazia pax de SPH-02 casarem com legs de M6 de outras embarcações e estourarem a lotação
+da viagem 1 da SURFER 1870. A causa real era o casamento partindo do Dados, corrigido pela
+reescrita *operacao-centric* — agora a leg declara embarcação, destino, origem do pax e
+quantidade, então o alias não tem como espalhar pax para a lancha errada.
+
+Passado explicitamente em `_processar` via `extra_aliases=PLATFORM_EQUIVALENCES`, para ficar
+visível no ponto de chamada em vez de escondido como padrão.
+
+**Efeito**: 16/08 passou de 12 `sob_demanda` para **0** — todas as 136 linhas atribuídas.
+15/08 foi de 22 para 10.
+
+### Origens: TMIB e M9 fixas, o resto é dinâmico (perguntado ao operador)
+
+**Contexto operacional**: só TMIB e PCM-09 são origens permanentes. As outras acompanham o
+**SOV**, que fica associado à plataforma designada para receber a tripulação que trabalha em
+dois turnos (dia e noite). Essa plataforma muda constantemente, então não pode ser fixada no
+código nem inferida sozinha.
+
+**Como o `day_origin` é identificado**: é a **única** origem na interseção entre o conjunto
+de origens e os prefixos das notas do pax. Não há fallback — interseção vazia ou com mais de
+um elemento devolve `None`, e o efeito está descrito adiante.
+
+```python
+day_origin = (prefixos_das_notas_do_pax) ∩ (origens)   # tem de ter exatamente 1 elemento
+```
+
+Sem prioridade e sem ordem de planilha. Validado nos dois arquivos de referência: com
+`{TMIB, M9, M5}` **todos os 249 pax caem em exatamente uma origem** — 0 sem origem, 0 ambíguos.
+
+Isso também prova que **M1 não é origem**: incluí-lo cria o único conflito observado
+(EDUARDO DE SOUZA LIMA, prefixos `PCM-05` e `PCM-01`). Ele é plataforma de trabalho que por
+acaso aparece como prefixo de nota.
+
+Quando a interseção não tem exatamente 1 elemento, `_build_day_origins` devolve `None` e o
+`_classify` **pula o teste de recolhimento**. É de propósito: melhor deixar a movimentação na
+tabela para conferência do que descartá-la em silêncio.
+
+**Fonte da verdade: `Configurações > Origens do Extrato`** — a mesma lista que o módulo de
+recolhimento consome, para os dois módulos não divergirem. O `_OriginsDialog` **apenas
+informa e audita**; não edita. Se a lista estiver velha, o operador corrige em Configurações
+e processa de novo.
+
+Confirmação de que a lista é o lugar certo: as entradas trazem `aceitar`/`descartar` com
+sufixos `(D)` e `(N)` — **dia e noite**, exatamente o esquema de dois turnos do SOV. A do M5
+em uso é `aceitar=["PCM-05 (D)", "PCM5 (D)", "M5 (D)", "M5 D"]` e
+`descartar=["PCM-05 (N)", ...]`.
+
+**Atenção ao testar**: `default_extrato_origins()` em `domain.py` traz `M1, M9, TMIB` — são os
+defaults embutidos, usados só quando não existe `origens_extrato.json`. A configuração real
+fica em `dados_compartilhados/config/origens_extrato.json` e hoje é `M5, M9, TMIB`. Auditar
+contra os defaults dá falso positivo de "lista desatualizada".
+
+**Dialog (`_OriginsDialog` em `ui.py`)**, aberto ao clicar em Processar, antes do `fill_rows`:
+
+- mostra as origens configuradas em uso
+- roda `audit_origins` contra o Dados. Se sobrar pax sem origem ou com mais de uma, diz
+  quantos e quem, e — quando dá — qual plataforma os dados apontam (via `suggest_origins`),
+  instruindo a corrigir em Configurações
+- botões Cancelar / Processar: seguir é permitido, e nesse caso os pax não resolvidos entram
+  na tabela **sem** o teste de recolhimento, nunca descartados em silêncio
+
+`_configured_origins()` na aba lê `op_config.origens_extrato` (só as `ativa`) e soma
+`FIXED_ORIGINS`. **Diferença deliberada em relação ao recolhimento**: aquele lado força
+`{TMIB, M9, M1}` no código; aqui só TMIB e M9 são implícitos, porque na operação atual o M1 é
+plataforma de trabalho e forçá-lo torna pax ambíguos.
+
+Comportamento da auditoria por conjunto de origens (a linha do meio é a configuração real):
+
+| Origens | 15.08 | 16.08 |
+|---|---|---|
+| `M1, M9, TMIB` (defaults do código) | 2 sem origem, aponta M5 | 18 sem origem, aponta M5 |
+| **`M5, M9, TMIB` (config em uso)** | **limpo** | **limpo** |
+| `M1, M5, M9, TMIB` | 1 ambíguo: EDUARDO DE SOUZA LIMA | limpo |
+
+A última linha mostra por que o M1 não pode ser implícito no código como é no recolhimento:
+somado ao M5, ele torna o Eduardo ambíguo.
+
+**API** (`filler.py`, exportadas em `__init__.py`):
+
+```python
+FIXED_ORIGINS = ("TMIB", "PCM-09")
+suggest_origins(dados_rows, resolver=None) -> list[tuple[str, int]]   # (plataforma, n_pax)
+audit_origins(dados_rows, origins, resolver=None) -> tuple[list[str], list[str]]
+fill_rows(dados_rows, trips, ..., origins=None)                      # origens dinâmicas
+```
+
+`suggest_origins` é guloso: partindo de TMIB e M9, adiciona repetidamente a plataforma que
+cobre mais pax ainda sem origem. Nos dois arquivos devolve exatamente `[(M5, n)]`.
+
+**Pendência**: o módulo de recolhimento tem a sua própria lista configurável
+(*Configurações > Origens do Extrato*) mais TMIB/M9/M1 fixos no código. As duas definições
+de origem seguem separadas e podem divergir sem ninguém notar.
+
+### Fix — `day_origin` não pode vir da ordem da planilha
+
+**Sintoma**: a linha `TMIB→M2` do THIAGO CORREIA (16.08) ficava totalmente em branco, sem nem
+tipo, quando devia ser `SURFER 1871 / 07:10 / 4 / BATE VOLTA`.
+
+**Causa**: `_build_day_origins` pegava a origem da **primeira linha do pax na planilha**. A
+planilha é ordenada por número de nota, que **não é cronológico**. No arquivo de 15.08 a nota
+`TMIB:` do Thiago vinha antes da `PCM-2:`; no de 16.08 a ordem inverteu. Com a `PCM-2:` na
+frente, `day_origin` virou M2, e aí `TMIB→M2` casou com `destino == day_origin` e foi
+descartada como recolhimento.
+
+**Solução**: `day_origin` passa a ser a origem operacional presente entre os prefixos das
+notas do pax. A ordem das linhas deixa de influenciar o resultado.
+
+*(Esta seção descreve a correção como ela foi feita na época, com uma lista de prioridade
+`TMIB > M9 > M1` fixa no código. A prioridade foi depois substituída pela interseção única
+lida das Configurações — veja a seção das origens acima, que é a regra vigente.)*
+
+**Evidência independente**: JAMERSON DA SILVA tem notas `PCB-1:` e `PCM-9:` e movimentações
+`B1→B2`, `B2→M9`, `M9→B1` (um ciclo, sem início único). Pela ordem da planilha o `day_origin`
+saía B1 e o `M9→B1` era descartado como recolhimento, deixando a leg `M9→B1` da 1930 com 7
+pax contra os `M9:8` declarados. Com a prioridade operacional o `day_origin` é M9, o `M9→B1`
+entra, e a leg fecha em 8 exato.
+
+Divergências entre operação e Dados caíram de 15 para 4 grupos (15.08) e ficaram em 2 de 23
+(16.08). As restantes não são de lógica: `M6↔M9` é dupla programação manhã/tarde da AQUA
+HELIX, `M1→M10` não tem linha no Dados, e `M9→TMIB` é o dialog legítimo de 5 para 2 vagas.
+
+### Fix — legs concorrentes e o dialog que apagava a outra lancha
+
+**Sintoma**: 7 pax da SURFER 1905 saíam com EMBARCAÇÃO preenchida mas HORÁRIO e Nº VIAGEM
+em branco.
+
+**Causa (duas falhas encadeadas)**:
+
+1. `fill_rows` avaliava cada leg isoladamente. Havia 19 candidatos `TMIB→M9` para 12 vagas
+   na 1931 (06:20) + 7 na 1905 (06:30) — soma exata, sem excesso real. Mas a leg da 1931,
+   vista sozinha, enxergava 19 candidatos para 12 vagas e criava um `SelectionGroup` com os
+   19 no pool. Em seguida a leg da 1905 pegava os 7 restantes e preenchia corretamente.
+2. `_apply_selection_group` zerava **todo** o `group.pool` antes de reaplicar, inclusive os
+   7 que já pertenciam à 1905. Sobrando só os 12 selecionados, os 7 viravam `sob_demanda`
+   e perdiam embarcação, horário e nº viagem. O operador então os recolocava via
+   "Adicionar Trecho", que preenchia embarcação mas nunca o nº viagem.
+
+**Solução**:
+
+- `fill_rows` agrupa as legs por `(destination_canonical, pax_origin)` — as que disputam o
+  mesmo pool são resolvidas juntas. `overflow` passa a ser `len(pool) > soma dos limites`
+  do grupo, então dialog só aparece quando há excesso genuíno.
+- `SelectionGroup` ganhou o campo `assigned`, com as linhas que aquele grupo pré-atribuiu.
+  `_apply_selection_group` zera apenas essas, nunca as de outra lancha.
+- O pool do dialog passou a ser `assigned + sobras não reivindicadas`, em vez de todos os
+  candidatos.
+- **Cada sobra é oferecida a um único grupo.** Aparecendo em dois dialogs, o operador poderia
+  escolhê-la nas duas janelas: ela seria atribuída duas vezes e outro pax ficaria sem
+  embarcação sem nenhum aviso. Encontrado por teste, não em produção — nos arquivos de 15 e
+  16/08 não há excesso genuíno em grupo com mais de uma leg.
+- `_adicionar_trecho` agora chama `_assign_n_viagem` e rejeita horário fora de `HH:MM`
+  (antes engolia o erro e gravava `None`). `self._n_viagem_map` guarda o mapa para isso.
+
+**Resultado**: no conjunto de 16.08, de 1 dialog espúrio e 7 linhas incompletas para 0 e 0.
+No de 15.08 resta 1 dialog, legítimo (5 candidatos a desembarque para 2 vagas programadas).
+
+### Legs de recolhimento dentro da operação
+
+A operação contém legs cujo movimento é recolhimento e que por isso não recebem pax aqui:
+1870 05:00 (`M6→M9`, 13) e AQUA HELIX 17:27 (`M6→M9`, 15) — as linhas `M6→M9` são de pax com
+origem M9 voltando para M9. Era a pendência das "legs da tarde sem pax"; está explicada.
+
+Caso separado, de dado e não de lógica: a leg AQUA HELIX 06:20 (`M1→M10`, 14) não tem nenhuma
+linha correspondente no Dados.
+
+---
+
+## Feature: comparação com as programações oficiais em PDF
+
+### Motivação
+
+Os PDFs `LANCHAS_*` e `Lista de Transbordos Internos` continuam sendo a **base** — é neles que
+pax e supervisores se apoiam, e a intenção é substituí-los, não competir com eles. Então o que
+precisa ser verificado é se **toda movimentação programada existe nas duas fontes**.
+
+### Critério: presença, não conteúdo
+
+Compara-se apenas `(nome, origem, destino)`. **Embarcação, horário e nº de viagem não são
+comparados** — os PDFs são gerados de forma arbitrária e essas numerações não batem por
+construção (o PDF numera `1ª a 8ª PCM-09`, ordinal por origem; a planilha numera por tipo).
+
+Resultado em 16/08: **136 movimentações, idênticas nas duas fontes**, tanto para a saída do
+sistema quanto para a planilha do colega.
+
+### Leitura dos PDFs (`distribuicao/pdf_text.py`)
+
+Os PDFs não são imagens, mas o extrator do módulo de recolhimento não os lê: eles usam strings
+**literais** com códigos de glifo, recursos `/Rn`, `/Font` por referência indireta e
+`/Rotate 90`. Foi preciso um tokenizador próprio de content stream. Três armadilhas resolvidas:
+
+- `stream ... endstream` não casava por regex; deixar o `zlib` parar sozinho resolve.
+- `'R'` é o byte `0x29` = `)` e `'A'` é `0x28` = `(`. Um regex `\(.*?\)` trunca a string no
+  parêntese escapado — daí `SURFER` sair como `SUFE`. Exige scanner com escapes e aninhamento.
+- `'O'` é `0x0d`; a tabela de escapes tem de mapear `\r` para `0x0D`, não para o byte `'r'`.
+
+Cada página é um content stream separado e **as páginas compartilham coordenadas** — juntá-las
+sobrepõe as tabelas. `extract_pages()` devolve uma lista de runs por página.
+
+### Dois formatos de PDF, e o que a operação usa de verdade
+
+**`MANIFESTO - TRANSPORTE DE PASSAGEIROS`** é o formato real do dia a dia: **um arquivo por
+viagem**, guardado em subpastas por tipo.
+
+```
+16_08/
+  TMIB/                 1-TMIB-1931 - AT 509555428 1.pdf   ... 4-TMIB-1871- ...
+  TRANSBORDO/           1-PCM-9-AQUA HELIX- AT ...         ... 7-...
+  TRANSBORDO INTERNO/   1-TRANSB. INTERNO-AQUA HELIX-AT ...  ... 6-...
+  DESEMBARQUE/          DESEMBARQUE-1870-AT. 509555662.pdf
+```
+
+Estrutura de cada arquivo:
+
+```
+EQUIPAMENTO 30017853 SURFER 1870 DATA: 16/08/2026
+EMPRESA ATENDIMENTO: 509555662 001 HORA: 10:00:00
+Roteiro previsto PCM-5 -> PCM-9 -> TMIB
+PCM-9 | PLATAFORMA DE CAMORIM 9 | TMIB | TERMINAL MARÍTIMO   <- grupo origem/destino
+0002 TT 326964588 0001/0001 | JORGE BEZERRA LIMA | ...       <- pax do grupo
+```
+
+Um manifesto pode ter **vários grupos origem/destino**, cada um com seus pax — o
+`DESEMBARQUE-1870` traz `PCM-5→TMIB` e `PCM-9→TMIB` na mesma viagem. `to_lines` devolve a
+página de baixo para cima, então `_parse_manifesto_page` lê em `reversed`, que é o que coloca
+cada grupo antes dos seus passageiros.
+
+**`LANCHAS_<ORIGEM>`** é um consolidado (uma página por viagem da mesma origem) que o operador
+exportou para análise. `parse_lanchas_pdf` reconhece os dois e despacha pelo marcador
+`MANIFESTO` na página.
+
+**A busca é recursiva e sem filtro de nome** (`find_programacao_pdfs`). Os arquivos reais estão
+em subpastas e não têm palavra-chave comum no nome — `1-TMIB-1931`, `3-PCM-9-1870`,
+`1-TRANSB. INTERNO-...`, `DESEMBARQUE-1870`. Filtrar por nome descartaria justamente eles; quem
+decide se um PDF é programação é o parser, que exige a estrutura do manifesto.
+
+Resultado apontando para `16_08`: 19 arquivos → 19 viagens → 164 movimentações, todas com
+embarcação, hora e data. Cobre também a origem M6, que faltava nos consolidados. Um
+`DESEMBARQUE` de 15/08 guardado nessa pasta é reconhecido pela data e excluído.
+
+### Estrutura dos PDFs consolidados (`distribuicao/pdf_lanchas.py`)
+
+Cada `LANCHAS_<ORIGEM>` tem uma página por viagem que parte daquela origem:
+
+```
+3ª PCM-09: SURFER 1870|ORIGEM PCM-09 ÀS 06:50 (16/08/2026)
+ROTEIRO: PCM-09 X PCM-08
+N° | Origem | Destino | Nome do Executante | Tipo de Etapa | Empresa | Lancha
+```
+
+A `Lista de Transbordos Internos` é diferente: movimentações **sem lancha e sem horário**, e a
+última coluna é distância (`1,22km`) — não confundir com a lancha.
+
+### Casamento de nomes (`comparar.py`)
+
+Igualdade exata de nome gerava 14 falsos pares (7 "só no PDF" + 7 "só na planilha" que eram as
+mesmas pessoas). `_same_person` aceita: mesmo conjunto de palavras em ordem diferente, prefixo
+(o Dados trunca em ~40 caracteres) e similaridade ≥ 0,88 com o primeiro nome coincidindo.
+
+```
+MANOEL MESSIAS DOS SANTOS PORTELA  x  MANOEL MESSIAS SANTOS PORTELA
+SANDRO JOSE BRITO DE SOUZA         x  SANDRO JOSE DE BRITO SOUZA
+RIVALDO ... DE OLIVEIRA FREITAS    x  RIVALDO ... DE OLIVEIRA FRE
+```
+
+O sufixo de turno `(D)`/`(N)` do PDF é descartado na canonização, porque o Dados não o usa.
+
+### Origens sem PDF
+
+`origens_sem_pdf` lista origens presentes na planilha sem PDF correspondente, e essas linhas
+**não** entram na comparação. Sem isso, os 27 pax que partem do M6 apareceriam como "está na
+planilha e não está no PDF" só porque o `LANCHAS_PCM-06` não foi entregue.
+
+### Interface: seleção de PASTA, não de arquivos
+
+Botão **Comparar com PDFs** na aba, habilitado depois de Processar. Abre seletor de **pasta**,
+igual à aba Recolhimento — são 4 ou 5 arquivos por dia e escolhê-los um a um é ruim, mas o
+motivo principal é outro: na pasta convivem programações de dias diferentes
+(`Lista de Transbordos Internos - 15.08.2026` e `- 16.08.2026`). Selecionar arquivo por arquivo
+permite comparar a planilha de um dia com o PDF de outro **sem nada avisar**.
+
+**A comparação lê a planilha do disco**, não `self._filled_rows`. É o ponto que fez um teste do
+operador passar quando devia falhar: ele apagou a programação de um pax no Excel e o relatório
+continuou dizendo "idênticas". Usando o resultado em memória, apagar não muda nada — sem
+reprocessar, os valores antigos continuam ali; reprocessando, o `fill_rows` recalcula e
+preenche a linha de volta. `programacao_da_planilha()` envelopa as linhas como estão gravadas.
+Se a tabela da sessão tiver mais movimentações que o arquivo, a janela avisa para salvar antes.
+
+Duas outras proteções, ambas descobertas apontando o seletor para `Downloads`, que tem 45 PDFs:
+
+- **Filtro por data**: a data da planilha Dados (`date_str`) contra a data de cada viagem. O
+  que for de outro dia é descartado e **listado na janela**, para a exclusão ficar visível.
+  A data vem do cabeçalho (`DATA:` no manifesto, `(16/08/2026)` no consolidado) ou do nome do
+  arquivo — este último é fallback necessário porque em três páginas do TMIB consolidado os
+  fragmentos do ano saem fora de ordem (`26)` antes de `(16/08/20`).
+- **Isolamento de erro** (`parse_lanchas_pdfs`): um arquivo ilegível não interrompe os demais.
+  Um PDF de Downloads derrubava a leitura inteira com `ValueError` no tokenizador de string
+  hexadecimal — `<<` de abertura de dicionário dentro de um bloco `BT..ET` não é texto.
+
+### Testes
+
+107 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
+`pip install` falha no certificado TLS do Netskope). Os do módulo de distribuição estão em
+`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (44).
+
+```bash
+PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
+cd appDesktopV2 && $PY -m unittest discover -s tests -v
+```
+
+Cobrem, em ordem de risco:
+
+| Grupo | O que protege |
+|---|---|
+| `PdfTokenizerTests` | as três armadilhas silenciosas: `)` escapado como byte de 'R', `\r` como 0x0D para 'O', escapes octais, strings hex, aninhamento, kerning virando espaço |
+| `PdfGeometryTests` | a de-rotação (`/Rotate 90`) e o agrupamento em linhas |
+| `PdfStructureTests` | `_stream_of` sem casar `endstream`, e as formas de CMap (`bfchar`, `bfrange`, `bfrange` com array) |
+| `PdfLanchasParsingTests` | cabeçalho de viagem, cabeçalho com o horário quebrado entre células, linha de cabeçalho de tabela não virar movimentação, coluna de distância não virar lancha |
+| `NameMatchingTests` | os seis pares reais de grafia divergente **e** três pares de pessoas diferentes que não podem casar |
+| `ComparacaoTests` | idêntico; só-no-PDF; só-na-planilha; embarcação/horário/viagem ignorados; linha sem embarcação conta como ausente; origem sem PDF fora da conta; um movimento do PDF casa no máximo uma vez |
+| `PdfIntegrationTests` | os PDFs reais de 16/08 (4 viagens/60 pax no TMIB, 8 no PCM-09, lista de internos sem lancha). `skipUnless` — pulam onde os arquivos não existem |
+
+**Validados por mutação**: reverter o mapa de `\r`, voltar `_stream_of` ao regex com
+`endstream`, ou remover o filtro da coluna de distância faz a suíte falhar (6, 5 e 2 testes
+respectivamente). Um teste que não falha quando o bug volta não protege nada.
+
+### Testes da classificação (`tests/test_distribuicao_filler.py`)
+
+44 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
+para ligar a regra ao caso que a originou.
+
+| Grupo | O que protege |
+|---|---|
+| `ClassifyTests` | tipo vindo da origem da movimentação; `M6→M9` e `M9→M6` com o mesmo prefixo e tipos diferentes |
+| `DayOriginTests` | THIAGO (ordem das linhas não decide), JAMERSON (ciclo sem início), EDUARDO (M5 é origem, M1 não), ambiguidade devolvendo `None` |
+| `ReturnIndexTests` | retorno buscado por passageiro, atravessando notas |
+| `LeftoverTests` | recolhimento e continuação de nota como regra de sobra |
+| `MatchesTests` | os dois ramos e a guarda `destino != TMIB` |
+| `NightLegTests` | noite na leg mais tardia na ida, mais cedo na volta |
+| `OriginsConfigTests` | `suggest_origins` e `audit_origins` |
+| `FillRowsScenarioTests` | 11 cenários montados à mão: bate-volta/embarque na mesma viagem, legs concorrentes, teto do `pax_disembark`, viagem vazia não consumindo número, desempate por ordem da operação, uma viagem com um horário |
+| `GabaritoIntegrationTests` | as 244 de 263 linhas contra a planilha do operador, e a asserção de que as 19 restantes são exatamente 13 de horário + 5 de EMBARQUE + 1 de nº viagem. `skipUnless` |
+
+Os cenários de `FillRowsScenarioTests` acharam o bug da sobra oferecida em dois dialogs, que
+não aparecia em nenhum dos arquivos reais.
+
+---
+
+## Pendências conhecidas (distribuição)
+
+### 1. Sufixo `(D)`/`(N)` no Dados quebraria em silêncio
+
+A operação usa sufixo de turno `(D)`/`(N)` nas plataformas, mas hoje essa convenção só aparece
+no **extrato PDF**. Se um Dados futuro trouxer `PCM-06 (N)` na coluna Origem ou Destino,
+`_canonical_from_raw` cai no `return raw` e devolve `PCM-06(N)` — plataforma inexistente, que
+não casa com leg nenhuma. O pax vai para `sob_demanda` **sem aviso**. O `_sanitize` remove
+espaços e normaliza hífens, mas não trata parênteses.
+
+Correção sugerida: reconhecer o sufixo no `_canonical_from_raw`, devolvendo a plataforma e o
+turno separadamente. Elimina a classe inteira de problema e tornaria o `NIGHT_SHIFT_LABELS`
+desnecessário para plataformas que adotem a convenção.
+
+### 2. `NIGHT_SHIFT_LABELS` está fixo no código
+
+`SPH-02 = M6, turno noite` mora em `filler.py`. Se a Petrobras cadastrar outro código de turno
+noturno, ou mudar esse, é edição de código.
+
+O lugar coerente seria Configurações, junto das origens — mas exige campo novo: a informação é
+*"código X = plataforma Y, turno N"*, e o `ExtratoOriginConfig` atual só guarda
+`codigo / ativa / aceitar / descartar`, sem a plataforma de destino nem o turno.
+
+### 3. Definição de origem divergente entre os dois módulos
+
+O recolhimento força `{TMIB, M9, M1}` no código (`_configured_return_origins`) e soma as
+origens configuradas. A distribuição implica só `{TMIB, M9}` (`FIXED_ORIGINS`) e soma as
+mesmas configuradas. A diferença é deliberada — forçar M1 torna pax ambíguos, veja
+EDUARDO DE SOUZA LIMA — mas significa que os dois módulos podem discordar sobre o que é uma
+origem sem que nada avise. Paridade exigiria tirar o M1 do código do recolhimento e deixá-lo
+como item de configuração.
+
+### 4. Sobreposição manhã/tarde no mesmo par origem→destino
+
+`M9→M6` é programado duas vezes no dia e as duas legs disputam o mesmo pool. Resolve certo
+porque o rótulo SPH-02 identifica a turma da noite. **Duas legs do mesmo par sem nenhum rótulo
+que as distinga continuam sendo alocadas pela ordem da operação** — se um dia houver duas
+entregas ao mesmo destino para turmas diferentes sem código próprio, volta a embaralhar.
+
+### 5. Divergências residuais contra o gabarito de 16/08
+
+De 263 linhas, **244 batem exatamente** (144 preenchidas + 100 em branco). As 19 restantes não
+são erro do sistema:
+
+| Qtd | Divergência | Avaliação |
+|---|---|---|
+| 13 | horário: gabarito 07:30/07:20/07:10 contra 07:29/07:25/07:12 | arredondamento manual do colega, inconsistente (um para cima, outro para baixo). A operação traz os valores do sistema. Não é a chegada ao M9 — conferido, são 07:08/07:38, 07:22/07:32, 07:04/07:19 |
+| 5 | TIPO: gabarito BATE VOLTA, sistema EMBARQUE | esperado: a planilha do colega antecede a criação do tipo EMBARQUE |
+| 1 | L202 Nº VIAGEM: gabarito v4, sistema v2 | inconsistência do gabarito — AQUA HELIX 06:30 aparece como v2 para 8 pax e v4 para 1 |
+
+Decidir se o horário deve seguir a operação (atual) ou ser arredondado como o colega faz.
+
+---
+
 ## Como testar
 
 ```bash
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
-
-# Testes automatizados do módulo de manifestos
 cd /mnt/c/Users/ka20/roteirizador/appDesktopV2
-$PY -m pytest tests/test_passenger_manifest.py -v
+
+# Suíte completa — 63 testes, em unittest (stdlib)
+$PY -m unittest discover -s tests -v
+
+# Um arquivo só
+$PY -m unittest discover -s tests -p "test_distribuicao_pdf.py" -v
 ```
+
+**Não use pytest**: não está instalado no Python Windows e o `pip install` falha no
+certificado TLS do Netskope. Toda a suíte é `unittest`, que roda sem dependências.
 
 ### Rodar manualmente
 
