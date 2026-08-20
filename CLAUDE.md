@@ -652,6 +652,87 @@ em branco.
 **Resultado**: no conjunto de 16.08, de 1 dialog espúrio e 7 linhas incompletas para 0 e 0.
 No de 15.08 resta 1 dialog, legítimo (5 candidatos a desembarque para 2 vagas programadas).
 
+### Fix — reprocessar gastava de novo as vagas já ocupadas
+
+**Sintoma relatado**: a perna do AQUA HELIX 05:00 programava 2 desembarques e o sistema
+encontrou 4 candidatos, então pediu a seleção. O operador escolheu, salvou e processou de
+novo — e o diálogo voltou, agora com **dois pax diferentes** pré-marcados. Clicando OK, a
+perna terminaria com 4 pax numa programação de 2.
+
+**Forma silenciosa do mesmo defeito**, encontrada ao reproduzir com 15/08: quando as sobras
+cabem no limite, não há overflow e **nenhum diálogo aparece** — o pax que o operador havia
+**recusado** era atribuído automaticamente. Pool de 3 para 2 vagas: escolhidos 2, sobra 1,
+reprocessa, 1 ≤ 2, entra sem aviso.
+
+**Causa**: linhas que a planilha traz preenchidas saem do pool (`status="already_filled"`)
+mas a perna mantinha a lotação inteira. `overflow` e `SelectionGroup.limit` usavam
+`leg.pax_disembark` cru, então cada rodada gastava as mesmas vagas outra vez.
+
+**Solução** (`filler.py`): a lotação da perna passa a descontar as vagas já ocupadas.
+
+- `_row_platforms(row, resolver)` devolve `(origem, destino, nota_origin)` canônicos, e é
+  usada nos **dois** ramos do passo 1 — antes as linhas preenchidas nem eram canonizadas.
+- Passo 1 guarda `pre_key[idx]` e `preassigned_free` para as linhas já preenchidas.
+- O laço dos membros do grupo virou duas passadas. A primeira (`plan`) calcula `dep_leg`,
+  `tipo` e `horario` e só então desconta: `seats = max(0, leg.pax_disembark - len(spent))`.
+  Precisa ser nessa ordem — sem embarcação e horário não há como saber a que viagem a linha
+  preenchida pertence. A segunda aloca com `seats`, e `overflow` e `limit` também.
+- O `plan` roda **antes** do `if not pool: continue`, senão um grupo sem candidatos não
+  consumiria as suas linhas preenchidas e elas vazariam para um grupo posterior.
+- Com `seats == 0` ninguém é pego, a guarda `if not taken: continue` suprime o diálogo, e o
+  excedente fica visível como `sob_demanda` em vez de estourar a programação.
+
+**Critério de casamento da linha preenchida com a perna**: `_matches` **mais**
+`_same_vessel` **mais** `_same_horario`.
+
+- `_same_vessel`: igualdade normalizada ou substring nos dois sentidos. A planilha guarda o
+  nome como o operador digitou — `"1930"` contra `"SURFER 1930"`, `"AQUA HELIX"` contra
+  `"AQUA HELIX FCS-7011"`.
+- `_same_horario`: tolerância de 20 minutos, `None` de qualquer lado casa. Larga o bastante
+  para o arredondamento manual do operador (07:10 gravado contra 07:12 da operação — as 13
+  divergências de horário do gabarito), estreita o bastante para separar as duas pernas da
+  **mesma embarcação** no par dia/noite do M6 (AQUA HELIX 05:30 contra 16:45).
+
+Casar só por embarcação foi rejeitado: as duas pernas do M6 são AQUA HELIX com o mesmo
+`(destino, pax_origin)`, então uma linha da noite gravada às 16:45 seria consumida pela perna
+das 05:30 — que é a primeira do grupo —, zerando as vagas do dia e mandando a turma do dia
+para a viagem da tarde.
+
+**Numeração**: `voyage_sections` agora registra também as viagens das linhas preenchidas.
+A numeração conta as viagens que levam pax de cada tipo; sem registrá-las, num
+reprocessamento em que quase tudo já está preenchido a única atribuição nova seria numerada
+viagem 1 independentemente da posição dela. `_assign_n_viagem` só toca linhas `auto`, então
+o número gravado das preenchidas não é sobrescrito.
+
+**Testes**: `ReprocessTests` (8) em `tests/test_distribuicao_filler.py` — 131 no total.
+Validados por mutação: tirar o desconto derruba 5; ignorar o horário derruba 1; tolerância 0
+derruba 1; comparação exata de nome de embarcação derruba 1; não registrar a viagem
+pré-preenchida derruba 1.
+
+O caso do dia pré-preenchido no par do M6 já estava documentado como cenário verificado, mas
+o teste que o cobria montava as quatro linhas em branco. Agora há um par de testes com
+`embarcacao` de fato preenchida, nos dois sentidos (dia gravado, noite gravada).
+
+### UI — marca de seleção com check em vez do indicador nativo
+
+O indicador de check do Qt (`Qt.ItemIsUserCheckable` + `setCheckState`) é um quadradinho
+pequeno e de baixo contraste, e o operador achou pouco intuitivo. Nas duas tabelas de escolha
+de passageiro a marca passou a ser um **✓ verde** na coluna 0, com a linha inteira em fundo
+`#eafaf1`, e **clicar em qualquer célula da linha** marca ou desmarca — alvo muito maior que a
+caixinha.
+
+Helpers em `ui.py`, ao lado de `_make_color`: `_set_row_checked`, `_is_row_checked`,
+`_setup_check_column` (coluna fixa de 34 px, com o próprio ✓ no cabeçalho). Aplicados em
+`_PaxSelectionDialog` e `_AddTrechoDialog`.
+
+O estado deixou de morar no `checkState` e passou a morar em `Qt.UserRole` — todos os leitores
+(`get_selected`, `get_selection`, `_update_counter`, `_select_auto`) foram atualizados, e não
+sobrou nenhum `checkState()` nessas tabelas. A linha desmarcada recebe `QBrush(Qt.NoBrush)`,
+não branco: com `SolidPattern` ela ignoraria o `alternate-background-color` da folha de estilo.
+
+`_ManifestoPaxDialog` (aba Recolhimento) **não** foi alterado — ali são `QCheckBox` de verdade
+com rótulo ao lado, que já têm o alvo de clique grande e o texto associado.
+
 ### Legs de recolhimento dentro da operação
 
 A operação contém legs cujo movimento é recolhimento e que por isso não recebem pax aqui:
@@ -660,6 +741,182 @@ origem M9 voltando para M9. Era a pendência das "legs da tarde sem pax"; está 
 
 Caso separado, de dado e não de lógica: a leg AQUA HELIX 06:20 (`M1→M10`, 14) não tem nenhuma
 linha correspondente no Dados.
+
+---
+
+### Fix — a sobra do diálogo saía da planilha parecendo meio programada
+
+**Sintoma relatado**: a operação programou 14 desembarques M9→TMIB na SURFER 1870 pela manhã e
+o Dados tinha 20 candidatos. O diálogo pediu os 14, o operador escolheu, e os **6 restantes**
+saíram na planilha com `EMBARCAÇÃO = SURFER 1870` e `TIPO = DESEMBARQUE`, mas **horário e nº de
+viagem em branco**. O colega que gera os manifestos veio perguntar se faltava programar aqueles
+pax.
+
+**Causa — duas camadas encadeadas.**
+
+1. `fill_rows` grava `filled[idx].candidates = [dep_leg]` na linha que a perna reivindicou.
+   `_apply_selection_group` zera `embarcacao`, `horario`, `n_viagem` e `status` de quem o
+   operador desmarcou, mas **deixava o `candidates`**.
+2. A coluna EMBARCAÇÃO da tabela era `fr.embarcacao or candidates_str`. Com a embarcação
+   zerada, ela passava a exibir o palpite. E como **o `_salvar` lê os valores DA TABELA**
+   (`fr.embarcacao = cell(3) or None`), o palpite virava dado gravado.
+
+Só aparece quando o operador **desmarca** alguém que já estava pré-marcado — as sobras que
+nunca foram reivindicadas têm `candidates` vazio. Foi por isso que o primeiro repro, que
+aceitava a pré-marcação, não mostrou nada.
+
+**Solução, nas três camadas:**
+
+- `_apply_selection_group` limpa `fr.candidates = []` junto com o resto.
+- A coluna EMBARCAÇÃO mostra **só** `fr.embarcacao`. O fallback para `candidates` era a
+  passagem por onde um palpite de exibição virava dado; `candidates` continua sendo gravado
+  pelo `fill_rows` como registro de qual perna reivindicou a linha, mas não é mais exibido.
+- `write_dados`: linha **sem embarcação** sai com as **quatro** colunas em branco, TIPO
+  incluído. Gravar só o tipo era o que deixava a linha com cara de meio programada.
+
+**A regra do `write_dados` olha a embarcação, não o status.** Chavear por
+`status == "sob_demanda"` descartaria em silêncio uma embarcação que o operador digitou à mão
+na tabela — a tabela é editável (`AllEditTriggers`) e o `_salvar` respeita a edição, mas o
+`status` continua o que o `fill_rows` decidiu.
+
+E o `write_dados` **limpa** as células em vez de pular a linha: a planilha pode ter valor de um
+salvamento anterior, e pular deixaria o lixo antigo lá.
+
+Na tabela do aplicativo a linha continua aparecendo como `Sob demanda` com o TIPO — é
+informação útil para o operador saber que há 6 pendências. O que muda é só o que vai para a
+planilha, que é o que o colega lê.
+
+**Verificado** gravando numa cópia da planilha de 15/08 e conferindo célula por célula: 10
+linhas sem embarcação, todas com as quatro colunas vazias; 138 com embarcação, nenhuma com
+coluna faltando; e três linhas sujadas de propósito antes de salvar saíram limpas.
+
+**Testes**: `SelecaoDesmarcadaTests` (2) monta os 20 candidatos para 14 vagas e troca um
+pré-marcado por uma sobra; `PlanilhaEscritaTests` (5) escreve numa planilha temporária.
+Mutações que a suíte pega: voltar a gravar o TIPO da linha sem embarcação (2 falhas), chavear
+por status em vez de embarcação (1), e voltar a não limpar o `candidates` (2).
+
+### Adicionar Trecho inativado
+
+Botão retirado da interface a pedido do operador — nunca teve uso na prática. O código do
+botão, do `_adicionar_trecho` e do `_AddTrechoDialog` fica no lugar; basta remover o
+`setVisible(False)` para trazer de volta. Mesmo tratamento dado às abas Recolhimento e
+Manifestos Recolhimento.
+
+## Feature: troca e permuta manual de viagem
+
+### Motivação
+
+Duas situações do operador, que são a mesma operação vista de dois ângulos.
+
+**A** — 3 pax de M9 para M8, com a operação programando 1 viagem de manhã (1 pax) e outra à
+tarde (2 pax). O sistema aloca por ordem das linhas da planilha, os totais ficam certos, mas
+**quem** vai em cada viagem sai trocado. Não é erro de regra: nada no Dados nem na operação
+diz qual dos três é o da manhã. Quem sabe é o cliente.
+
+**B** — muitos pax no mesmo origem→destino, divididos em duas lanchas lotadas, e o cliente
+exige que uma pessoa mude de lancha. Só fecha como **permuta 1 por 1**, senão a lancha de
+destino passa do que a operação programou.
+
+### Decisões tomadas com o operador
+
+| Decisão | Escolha |
+|---|---|
+| Persistência | **Só na sessão**; quem guarda a troca é a planilha (`Salvar`). Descartada a alternativa de gravar a troca como decisão permanente. |
+| Viagens oferecidas | **Só as que a operação programou** para a movimentação do pax — o filtro é o próprio `_matches`. Não há como mandar o pax para uma lancha que não passa no destino dele. |
+| O que é "lotada" | O **QUANT PAX DESEMBARQUE** daquela perna. É o número que gera o manifesto e que o fiscal confere. |
+
+Como a troca vive só na sessão, **`Processar` avisa quando há troca não salva** e pede
+confirmação: reprocessar relê o Dados e refaz a distribuição do zero. `Salvar` zera o contador.
+
+### API (`filler.py`, testável sem Qt)
+
+A decisão toda mora no `filler`, que é a mesma fonte que o processamento usa; a UI só conversa
+com o operador.
+
+```python
+@dataclass(frozen=True)
+class VoyageSlot:          # uma viagem programada como lugar onde um pax pode ser posto
+    leg: VesselLeg         # responde "esta viagem atende esta movimentação?" e o limite
+    section: int           # ordem na operação, para o desempate da numeração
+    vessel: str            # da leg de EMBARQUE, que é onde o pax entra
+    horario: time | None
+    tipo_viagem: str
+    limit: int             # pax_disembark
+
+voyage_slots(trips)                     -> list[VoyageSlot]
+row_movement(row, ...)                  -> (origem, destino, nota_origin) | None
+slot_matches_row(slot, movement)        -> bool
+slot_occupants(slot, filled, resolver)  -> list[FilledRow]
+current_slot(fr, slots, movement)       -> VoyageSlot | None
+swap_options(fr, filled, trips, ...)    -> (atual, [(slot, ocupação)]) | None
+swap_partners(fr, atual, destino, ...)  -> list[FilledRow]
+rebuild_n_viagem(filled, trips, ...)    -> mapa de numeração
+```
+
+**`slot_occupants` conta por trecho, não por viagem.** Uma viagem pode ter mais de uma leg no
+mesmo horário — as legs que compartilham o tipo colapsam —, cada uma com o seu destino e o seu
+limite. Contar a viagem inteira misturaria destinos diferentes e daria lotação errada.
+
+**`swap_partners` exige que o par caiba na viagem de origem.** Sem isso a permuta apenas
+empurra o problema: quem sai iria para uma viagem que a operação não programou para ele.
+O caso que prova a regra tem duas viagens M9→M8 declarando origens de pax diferentes (o mesmo
+`TMIB:11, M9:8` da operação): ANDERSON, de nota TMIB, cabe nas duas; PEDRO, de nota M9, só cabe
+na do M9 — então PEDRO não pode ceder o lugar, e a troca é recusada com explicação.
+
+### `rebuild_n_viagem` — a numeração tem de ser refeita depois de mover alguém
+
+A numeração conta as viagens que **de fato levam pax de cada tipo**. Depois de uma troca o mapa
+devolvido pelo `fill_rows` está velho, e reaproveitá-lo deixa `n_viagem=None` **em silêncio**
+para quem entrou numa viagem que antes não levava ninguém do tipo dele — a mesma classe de
+falha que o `_adicionar_trecho` já tinha tido.
+
+`rebuild_n_viagem` reconstrói o `voyage_sections` a partir das atribuições como elas estão
+agora, casando cada linha ao seu slot por embarcação, horário e `_matches`. Verificado nos dois
+arquivos de referência: **sem nenhuma troca, o mapa refeito é idêntico ao do `fill_rows`**
+(15/08 e 17/08, 138 e 165 linhas atribuídas).
+
+### Interface
+
+Botão **Trocar Viagem** na aba, habilitado depois de Processar.
+
+1. Selecione a linha do pax na tabela.
+2. `_TrocarViagemDialog` lista as viagens possíveis com `Embarcacao | Horario | Tipo |
+   Ocupacao | Situacao`, onde Situação é `N vaga(s) livre(s)` ou `lotada — exige permuta`
+   (em laranja).
+3. Vaga livre → move direto. Lotada → `_PermutaDialog` pede com quem trocar, listando só
+   quem pode ceder o lugar.
+4. A numeração é refeita, a tabela recarrega, e a confirmação lembra de salvar.
+
+Se o pax escolhido **não tinha viagem** (sob demanda) e a de destino está lotada, quem sai fica
+sob demanda — o diálogo diz isso na cara antes de confirmar.
+
+### Verificação
+
+Além dos 10 testes de `TrocaViagemTests`, dois roteiros headless sobre os arquivos reais
+(`QT_QPA_PLATFORM=offscreen`):
+
+- 15/08 e 17/08, 21 e 20 pax `TMIB→M9` divididos em duas lanchas: a troca ofereceu a outra
+  lancha como `8/8 lotada`, a permuta listou os 8 elegíveis, e depois de confirmar o Nº Viagem
+  saiu 2 para quem entrou e 1 para quem saiu. **Nenhuma viagem acima do programado.**
+- Abrindo uma vaga na lancha de destino, a mesma troca virou `7/8 → 1 vaga livre` e não pediu
+  permuta.
+
+Mutações que a suíte pega: tirar o `_matches` do `swap_options` (oferece viagem não
+programada), tirar o filtro de origem do `swap_partners` (permuta empurra o problema), contar
+ocupação por viagem em vez de por trecho.
+
+### Limitações conhecidas
+
+**A troca só alcança as linhas que esta rodada preencheu.** A tabela esconde as linhas
+`already_filled`, então depois de salvar e reprocessar os pax voltam como já preenchidos, saem
+da tabela e não podem mais ser trocados. O fluxo previsto é processar → trocar → salvar. Para
+mexer depois, limpe as colunas na planilha e processe de novo.
+
+**A troca não impede cruzar turno.** No par M6 a operação tem duas viagens (05:30 dia e 16:45
+noite) e as duas atendem o mesmo movimento canônico, então as duas são oferecidas. O
+`_night_leg_position`, que resolve isso na alocação automática, **não** é aplicado aqui: a
+troca é um pedido explícito do operador e ele vê lancha e horário na lista. Mas nada avisa que
+aquela é a viagem da outra turma.
 
 ---
 
@@ -796,9 +1053,9 @@ Duas outras proteções, ambas descobertas apontando o seletor para `Downloads`,
 
 ### Testes
 
-107 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
+148 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
 `pip install` falha no certificado TLS do Netskope). Os do módulo de distribuição estão em
-`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (44).
+`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (68).
 
 ```bash
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
@@ -823,7 +1080,7 @@ respectivamente). Um teste que não falha quando o bug volta não protege nada.
 
 ### Testes da classificação (`tests/test_distribuicao_filler.py`)
 
-44 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
+68 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
 para ligar a regra ao caso que a originou.
 
 | Grupo | O que protege |
@@ -836,6 +1093,10 @@ para ligar a regra ao caso que a originou.
 | `NightLegTests` | noite na leg mais tardia na ida, mais cedo na volta |
 | `OriginsConfigTests` | `suggest_origins` e `audit_origins` |
 | `FillRowsScenarioTests` | 11 cenários montados à mão: bate-volta/embarque na mesma viagem, legs concorrentes, teto do `pax_disembark`, viagem vazia não consumindo número, desempate por ordem da operação, uma viagem com um horário |
+| `SelecaoDesmarcadaTests` | desmarcar no diálogo não deixar rastro de embarcação |
+| `PlanilhaEscritaTests` | linha sem embarcação sai com as quatro colunas em branco; lixo antigo é limpo; a regra é a embarcação, não o status |
+| `TrocaViagemTests` | a troca manual: só viagens programadas são oferecidas, ocupação por trecho, o par da permuta tem de caber na origem, numeração refeita, o cenário M9→M8 manhã/tarde |
+| `ReprocessTests` | o reprocessamento não gastar de novo as vagas ocupadas: nada de novo diálogo, o pax recusado não entra sozinho, nome curto e horário arredondado descontando, o par dia/noite do M6 nos dois sentidos, numeração preservada |
 | `GabaritoIntegrationTests` | as 244 de 263 linhas contra a planilha do operador, e a asserção de que as 19 restantes são exatamente 13 de horário + 5 de EMBARQUE + 1 de nº viagem. `skipUnless` |
 
 Os cenários de `FillRowsScenarioTests` acharam o bug da sobra oferecida em dois dialogs, que
@@ -903,7 +1164,7 @@ Decidir se o horário deve seguir a operação (atual) ou ser arredondado como o
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
 cd /mnt/c/Users/ka20/roteirizador/appDesktopV2
 
-# Suíte completa — 63 testes, em unittest (stdlib)
+# Suíte completa — 148 testes, em unittest (stdlib)
 $PY -m unittest discover -s tests -v
 
 # Um arquivo só

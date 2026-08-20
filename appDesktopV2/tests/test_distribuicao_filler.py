@@ -20,6 +20,15 @@ from roteirizador_desktop.distribuicao import (
     suggest_origins,
 )
 from roteirizador_desktop.distribuicao.filler import (
+    current_slot,
+    rebuild_n_viagem,
+    row_movement,
+    slot_matches_row,
+    slot_occupants,
+    swap_options,
+    swap_partners,
+    voyage_slots,
+    _assign_n_viagem,
     _build_day_origins,
     _build_return_index,
     _classify,
@@ -396,6 +405,467 @@ _CONFIG = (Path(__file__).resolve().parents[1]
     _DADOS_16.exists() and _OPERACAO_16.exists(),
     "arquivos de referência de 16/08 não disponíveis nesta máquina",
 )
+class ReprocessTests(unittest.TestCase):
+    """Reprocessar não pode gastar de novo as vagas que a planilha já trouxe ocupadas.
+
+    O operador processou, escolheu 2 dos 4 desembarques que a perna programava, salvou e
+    processou de novo — e o sistema voltou a pedir a seleção, agora com dois pax diferentes
+    pré-marcados. Aceitando, a perna terminaria com 4 pax numa programação de 2. E na forma
+    silenciosa do mesmo defeito, quando as sobras couberam no limite, o pax **recusado** era
+    atribuído sem nenhum diálogo.
+    """
+
+    @staticmethod
+    def _gravar(escolhidos):
+        """O que o write_dados grava na planilha depois da escolha do operador."""
+        for fr in escolhidos:
+            fr.dados_row.embarcacao = fr.embarcacao
+            fr.dados_row.horario = fr.horario
+            fr.dados_row.n_viagem = fr.n_viagem
+            fr.dados_row.tipo_viagem = fr.tipo_viagem
+
+    def test_reprocessing_after_a_choice_asks_nothing_again(self):
+        rows = [row(i, f"PAX{i}", "PCM-09", "PCM-09", "TMIB") for i in range(1, 5)]
+        trips = [VesselTrip("SURFER 1870", [
+            leg("SURFER 1870", "PCM-09", "TMIB", time(5, 30), pax_origin="PCM-09", pax=2)])]
+
+        filled, groups, _ = run(rows, trips)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].limit, 2)
+        self._gravar(groups[0].pool[:2])          # o operador aceita a pré-marcação
+
+        filled2, groups2, _ = run(rows, trips)
+        self.assertEqual(groups2, [])
+        embarcados = [fr for fr in filled2 if fr.embarcacao]
+        self.assertEqual(len(embarcados), 2)
+        self.assertEqual({fr.status for fr in embarcados}, {"already_filled"})
+
+    def test_the_rejected_passenger_is_not_assigned_on_reprocessing(self):
+        """A forma silenciosa: sobra 1 candidato para 2 vagas, e ele entrava sem diálogo."""
+        rows = [row(i, f"PAX{i}", "PCM-09", "PCM-09", "TMIB") for i in range(1, 4)]
+        trips = [VesselTrip("SURFER 1870", [
+            leg("SURFER 1870", "PCM-09", "TMIB", time(5, 30), pax_origin="PCM-09", pax=2)])]
+
+        filled, groups, _ = run(rows, trips)
+        recusado = groups[0].pool[2].dados_row.name
+        self._gravar(groups[0].pool[:2])
+
+        got = {fr.dados_row.name: fr for fr in run(rows, trips)[0]}
+        self.assertEqual(got[recusado].embarcacao, None)
+        self.assertEqual(got[recusado].status, "sob_demanda")
+
+    def test_short_vessel_name_and_rounded_horario_still_discount(self):
+        """A planilha guarda "1930" e 07:10; a operação diz "SURFER 1930" e 07:12."""
+        rows = [row(i, f"PAX{i}", "TMIB", "TMIB", "PCM-9") for i in (1, 2)]
+        trips = [VesselTrip("SURFER 1930", [
+            leg("SURFER 1930", "TMIB", "PCM-09", time(7, 12), pax_origin="TMIB", pax=1)])]
+
+        rows[0].embarcacao = "1930"
+        rows[0].horario = time(7, 10)
+        rows[0].tipo_viagem = "TRANSBORDO"
+
+        filled, groups, _ = run(rows, trips)
+        self.assertEqual(groups, [])
+        got = by_excel(filled)
+        self.assertEqual(got[1].status, "already_filled")
+        self.assertEqual(got[2].embarcacao, None)     # a única vaga já estava ocupada
+
+    def test_a_filled_day_leg_does_not_discount_the_night_one(self):
+        """As duas pernas do M6 são da mesma lancha: só o horário as separa."""
+        rows = [row(i, f"DIA{i}", "PCM-9", "PCM-9", "PCM-6") for i in (1, 2)]
+        rows += [row(i, f"NOITE{i}", "PCM-9", "PCM-9", "SPH-02") for i in (3, 4)]
+        for r in rows[:2]:
+            r.embarcacao, r.horario, r.tipo_viagem = "AQUA HELIX", time(5, 30), "TRANSBORDO"
+        trips = [
+            VesselTrip("AQUA HELIX", [
+                leg("AQUA HELIX", "PCM-09", "PCM-06", time(5, 30), pax_origin="PCM-09", pax=2)]),
+            VesselTrip("AQUA HELIX", [
+                leg("AQUA HELIX", "PCM-09", "PCM-06", time(16, 45), pax_origin="PCM-09", pax=2)]),
+        ]
+        got = by_excel(run(rows, trips)[0])
+        self.assertEqual({got[3].horario, got[4].horario}, {time(16, 45)})
+        self.assertEqual({got[3].status, got[4].status}, {"auto"})
+
+    def test_a_filled_night_leg_does_not_discount_the_day_one(self):
+        """O inverso, e é aqui que a tolerância de horário se paga.
+
+        Casando só por embarcação, a perna das 05:30 — a primeira do grupo — consumiria as
+        linhas da noite já gravadas às 16:45, zeraria as próprias vagas, e a turma do dia
+        sairia na viagem da tarde.
+        """
+        rows = [row(i, f"NOITE{i}", "PCM-9", "PCM-9", "SPH-02") for i in (1, 2)]
+        rows += [row(i, f"DIA{i}", "PCM-9", "PCM-9", "PCM-6") for i in (3, 4)]
+        for r in rows[:2]:
+            r.embarcacao, r.horario, r.tipo_viagem = "AQUA HELIX", time(16, 45), "TRANSBORDO"
+        trips = [
+            VesselTrip("AQUA HELIX", [
+                leg("AQUA HELIX", "PCM-09", "PCM-06", time(5, 30), pax_origin="PCM-09", pax=2)]),
+            VesselTrip("AQUA HELIX", [
+                leg("AQUA HELIX", "PCM-09", "PCM-06", time(16, 45), pax_origin="PCM-09", pax=2)]),
+        ]
+        got = by_excel(run(rows, trips)[0])
+        self.assertEqual({got[3].horario, got[4].horario}, {time(5, 30)})
+
+    def test_one_filled_row_discounts_only_one_leg(self):
+        """Contada nas duas pernas do grupo, ela zeraria uma vaga que ninguém ocupa."""
+        rows = [row(i, f"PAX{i}", "TMIB", "TMIB", "PCM-9") for i in (1, 2)]
+        rows[0].embarcacao, rows[0].horario = "SURFER 1931", time(6, 20)
+        rows[0].tipo_viagem = "TRANSBORDO"
+        trips = [
+            VesselTrip("SURFER 1931", [
+                leg("SURFER 1931", "TMIB", "PCM-09", time(6, 20), pax_origin="TMIB", pax=1)]),
+            VesselTrip("SURFER 1931", [
+                leg("SURFER 1931", "TMIB", "PCM-09", time(6, 30), pax_origin="TMIB", pax=1)]),
+        ]
+        got = by_excel(run(rows, trips)[0])
+        self.assertEqual(got[1].status, "already_filled")
+        self.assertEqual(got[2].horario, time(6, 30))
+
+    def test_prefilled_voyages_keep_their_place_in_the_numbering(self):
+        """Sem registrá-las, a única atribuição nova de um reprocessamento vira viagem 1."""
+        rows = [row(i, f"PAX{i}", "TMIB", "TMIB", "PCM-9") for i in (1, 2)]
+        trips = [
+            VesselTrip("SURFER 1930", [
+                leg("SURFER 1930", "TMIB", "PCM-09", time(6, 20), pax_origin="TMIB", pax=1)]),
+            VesselTrip("SURFER 1905", [
+                leg("SURFER 1905", "TMIB", "PCM-09", time(6, 30), pax_origin="TMIB", pax=1)]),
+        ]
+        got = by_excel(run(rows, trips)[0])
+        self.assertEqual(got[2].n_viagem, 2)
+
+        self._gravar([got[1]])                    # a viagem 1 vai para a planilha
+        got2 = by_excel(run(rows, trips)[0])
+        self.assertEqual(got2[2].n_viagem, 2)     # a 1905 continua sendo a viagem 2
+
+
+class SelecaoDesmarcadaTests(unittest.TestCase):
+    """Desmarcar um pax no diálogo não pode deixar rastro de embarcação.
+
+    Era a primeira metade do problema dos 6 pax: `_apply_selection_group` zerava embarcação,
+    horário, nº de viagem e status, mas deixava `candidates` com a perna que tinha
+    reivindicado a linha. A tabela mostrava esse palpite na coluna EMBARCAÇÃO e o `_salvar`,
+    que lê os valores DA TABELA, o transformava em dado gravado.
+
+    O `_apply_selection_group` não precisa de janela — é `staticmethod`.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        try:
+            from roteirizador_desktop.ui import ManifestosDistribuicaoTab
+        except Exception as exc:                        # pragma: no cover
+            raise unittest.SkipTest(f"PySide6 indisponível: {exc}")
+        cls.Tab = ManifestosDistribuicaoTab
+
+    def _grupo(self):
+        """20 candidatos M9 → TMIB para as 14 vagas da 1870, como em 19/08."""
+        from roteirizador_desktop.distribuicao.models import SelectionGroup
+        rows = [row(i, f"PAX{i:02d}", "PCM-9", "PCM-9", "TMIB") for i in range(1, 21)]
+        trips = [VesselTrip("SURFER 1870", [
+            leg("SURFER 1870", "PCM-09", "TMIB", time(10, 0), pax_origin="PCM-09", pax=14)])]
+        filled, groups, _ = run(rows, trips)
+        self.assertEqual(len(groups), 1)
+        g = groups[0]
+        self.assertEqual((g.limit, len(g.pool), len(g.assigned)), (14, 20, 14))
+        return filled, g
+
+    def test_a_deselected_pax_keeps_no_vessel_trace(self):
+        filled, g = self._grupo()
+        # O operador troca um dos pré-marcados por uma sobra.
+        escolhidos = list(g.assigned[1:]) + [g.pool[14]]
+        self.assertEqual(len(escolhidos), 14)
+        desmarcado = g.assigned[0]
+        self.assertTrue(desmarcado.candidates)          # tinha sido reivindicado
+
+        self.Tab._apply_selection_group(g, escolhidos)
+
+        self.assertEqual(desmarcado.status, "sob_demanda")
+        self.assertIsNone(desmarcado.embarcacao)
+        self.assertIsNone(desmarcado.horario)
+        self.assertIsNone(desmarcado.n_viagem)
+        self.assertEqual(desmarcado.candidates, [])
+
+    def test_only_fourteen_end_up_on_the_vessel(self):
+        filled, g = self._grupo()
+        escolhidos = list(g.assigned[1:]) + [g.pool[14]]
+        self.Tab._apply_selection_group(g, escolhidos)
+        embarcados = [fr for fr in filled if fr.embarcacao]
+        self.assertEqual(len(embarcados), 14)
+        sobras = [fr for fr in filled if not fr.embarcacao]
+        self.assertEqual(len(sobras), 6)
+        # Nenhuma das 6 sobras pode ter qualquer rastro de programação.
+        for fr in sobras:
+            self.assertEqual((fr.embarcacao, fr.horario, fr.n_viagem, fr.candidates),
+                             (None, None, None, []))
+
+
+class PlanilhaEscritaTests(unittest.TestCase):
+    """O que sai na planilha para uma linha que NÃO está programada.
+
+    O colega que gera os manifestos veio perguntar se faltava programar 6 pax: eles tinham
+    saído com EMBARCAÇÃO e TIPO preenchidos e horário e nº de viagem em branco, parecendo
+    meio programados. Eram as sobras de um diálogo de seleção de 20 candidatos para 14 vagas.
+    """
+
+    def _planilha(self, linhas: int = 4):
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        for r in range(2, 2 + linhas):
+            ws.cell(row=r, column=1).value = "R3"
+        caminho = Path(self._dir.name) / "dados.xlsx"
+        wb.save(caminho)
+        wb.close()
+        return str(caminho)
+
+    def setUp(self):
+        import tempfile
+        self._dir = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    @staticmethod
+    def _filled(excel_row, nome, embarcacao, horario, n_viagem, tipo, status):
+        from roteirizador_desktop.distribuicao.models import FilledRow
+        dr = row(excel_row, nome, "PCM-9", "PCM-9", "TMIB")
+        return FilledRow(dados_row=dr, embarcacao=embarcacao, horario=horario,
+                         n_viagem=n_viagem, tipo_viagem=tipo, status=status)
+
+    def _colunas(self, caminho, excel_row):
+        import openpyxl
+        from roteirizador_desktop.distribuicao.dados_io import (
+            _C_EMBARCACAO, _C_HORARIO, _C_N_VIAGEM, _C_TIPO)
+        wb = openpyxl.load_workbook(caminho)
+        ws = wb.active
+        vals = [ws.cell(row=excel_row, column=c).value
+                for c in (_C_EMBARCACAO, _C_HORARIO, _C_N_VIAGEM, _C_TIPO)]
+        wb.close()
+        return vals
+
+    def test_row_without_vessel_leaves_all_four_columns_blank(self):
+        from roteirizador_desktop.distribuicao import write_dados
+        caminho = self._planilha()
+        sobra = self._filled(2, "SOBRA", None, None, None, "DESEMBARQUE", "sob_demanda")
+        write_dados(caminho, [sobra])
+        self.assertEqual(self._colunas(caminho, 2), [None, None, None, None])
+
+    def test_stale_values_are_cleared_not_ignored(self):
+        """A planilha pode ter valor de um salvamento anterior; branco tem de apagar."""
+        import openpyxl
+        from roteirizador_desktop.distribuicao import write_dados
+        from roteirizador_desktop.distribuicao.dados_io import _C_EMBARCACAO, _C_TIPO
+        caminho = self._planilha()
+        wb = openpyxl.load_workbook(caminho)
+        wb.active.cell(row=2, column=_C_EMBARCACAO).value = "SURFER 1870"
+        wb.active.cell(row=2, column=_C_TIPO).value = "DESEMBARQUE "
+        wb.save(caminho)
+        wb.close()
+
+        sobra = self._filled(2, "SOBRA", None, None, None, "DESEMBARQUE", "sob_demanda")
+        write_dados(caminho, [sobra])
+        self.assertEqual(self._colunas(caminho, 2), [None, None, None, None])
+
+    def test_a_programmed_row_keeps_writing_all_four(self):
+        from roteirizador_desktop.distribuicao import write_dados
+        caminho = self._planilha()
+        ok = self._filled(2, "OK", "SURFER 1870", time(5, 30), 1, "DESEMBARQUE", "auto")
+        write_dados(caminho, [ok])
+        self.assertEqual(self._colunas(caminho, 2),
+                         ["SURFER 1870", time(5, 30), 1, "DESEMBARQUE "])
+
+    def test_the_rule_is_the_vessel_not_the_status(self):
+        """Embarcação digitada à mão na tabela não pode ser descartada pelo status."""
+        from roteirizador_desktop.distribuicao import write_dados
+        caminho = self._planilha()
+        mao = self._filled(2, "MANUAL", "SURFER 1905", time(6, 30), 2,
+                           "DESEMBARQUE", "sob_demanda")
+        write_dados(caminho, [mao])
+        self.assertEqual(self._colunas(caminho, 2),
+                         ["SURFER 1905", time(6, 30), 2, "DESEMBARQUE "])
+
+    def test_already_filled_rows_are_never_touched(self):
+        import openpyxl
+        from roteirizador_desktop.distribuicao import write_dados
+        from roteirizador_desktop.distribuicao.dados_io import _C_EMBARCACAO
+        caminho = self._planilha()
+        wb = openpyxl.load_workbook(caminho)
+        wb.active.cell(row=2, column=_C_EMBARCACAO).value = "1930"
+        wb.save(caminho)
+        wb.close()
+        ja = self._filled(2, "JA", "1930", time(6, 20), 1, "BATE VOLTA", "already_filled")
+        write_dados(caminho, [ja])
+        self.assertEqual(self._colunas(caminho, 2)[0], "1930")
+
+
+class TrocaViagemTests(unittest.TestCase):
+    """Troca e permuta manual de viagem.
+
+    Duas situações reais do operador. A primeira: 3 pax de M9 para M8, com a operação
+    programando 1 de manhã e 2 à tarde. O sistema aloca por ordem de linha e os totais ficam
+    certos, mas **quem** vai em cada uma pode estar trocado — só o cliente sabe, e nada no
+    Dados diz. A segunda: duas lanchas lotadas no mesmo trecho e o cliente exige que uma
+    pessoa mude de lancha, o que só fecha como permuta 1 por 1.
+    """
+
+    @staticmethod
+    def _m9_m8():
+        """3 pax M9 → M8: uma viagem de manhã com 1 vaga e outra à tarde com 2."""
+        rows = [row(i, f"PAX{i}", "PCM-9", "PCM-9", "PCM-8") for i in (1, 2, 3)]
+        trips = [
+            VesselTrip("SURFER 1870", [
+                leg("SURFER 1870", "PCM-09", "PCM-08", time(6, 0), pax_origin="PCM-09", pax=1)]),
+            VesselTrip("SURFER 1905", [
+                leg("SURFER 1905", "PCM-09", "PCM-08", time(14, 0), pax_origin="PCM-09", pax=2)]),
+        ]
+        return rows, trips
+
+    def test_slots_carry_vessel_horario_and_the_programmed_limit(self):
+        _, trips = self._m9_m8()
+        slots = voyage_slots(trips)
+        self.assertEqual(
+            [(s.vessel, s.horario, s.limit) for s in slots],
+            [("SURFER 1870", time(6, 0), 1), ("SURFER 1905", time(14, 0), 2)],
+        )
+
+    def test_only_voyages_programmed_for_the_movement_are_offered(self):
+        """Um pax M9 → M6 não pode ser oferecido às viagens que vão para o M8."""
+        rows, trips = self._m9_m8()
+        outro = row(4, "ESTRANHO", "PCM-9", "PCM-9", "PCM-6")
+        filled, _, _ = run(rows + [outro], trips)
+        got = by_excel(filled)
+        self.assertEqual(swap_options(got[4], filled, trips)[1], [])
+
+    def test_swap_between_the_morning_and_the_afternoon_voyage(self):
+        rows, trips = self._m9_m8()
+        filled, _, _ = run(rows, trips)
+        got = by_excel(filled)
+        manha = [fr for fr in filled if fr.horario == time(6, 0)]
+        self.assertEqual(len(manha), 1)
+        entra = manha[0]
+
+        atual, opcoes = swap_options(entra, filled, trips)
+        self.assertEqual(atual.vessel, "SURFER 1870")
+        self.assertEqual([(s.vessel, ocup) for s, ocup in opcoes],
+                         [("SURFER 1905", 2)])
+
+        destino, ocupados = opcoes[0]
+        self.assertGreaterEqual(ocupados, destino.limit)      # lotada: exige permuta
+        candidatos = swap_partners(entra, atual, destino, filled)
+        self.assertEqual(len(candidatos), 2)
+        sai = candidatos[0]
+
+        entra.embarcacao, entra.horario = destino.vessel, destino.horario
+        sai.embarcacao, sai.horario = atual.vessel, atual.horario
+
+        self.assertEqual(
+            sorted(fr.dados_row.name for fr in filled if fr.horario == time(6, 0)),
+            [sai.dados_row.name],
+        )
+        self.assertEqual(
+            len([fr for fr in filled if fr.horario == time(14, 0)]), 2)
+
+    def test_a_free_seat_needs_no_swap(self):
+        """Duas vagas à tarde e só um pax nela: dá para entrar sem tirar ninguém."""
+        rows, trips = self._m9_m8()
+        filled, _, _ = run(rows[:2], trips)                   # 2 pax: 1 manhã, 1 tarde
+        entra = [fr for fr in filled if fr.horario == time(6, 0)][0]
+        _, opcoes = swap_options(entra, filled, trips)
+        destino, ocupados = opcoes[0]
+        self.assertEqual((ocupados, destino.limit), (1, 2))
+        self.assertLess(ocupados, destino.limit)
+
+    def test_the_partner_must_fit_the_origin_voyage(self):
+        """Sem esse filtro a permuta empurra o problema para o outro lado.
+
+        As duas viagens vão de M9 para M8, mas declaram origens de pax diferentes — é o
+        mesmo `TMIB:11, M9:8` que a operação usa. ANDERSON (nota TMIB) cabe nas duas;
+        PEDRO (nota M9) só cabe na do M9. Então PEDRO não pode ceder o lugar: ele não tem
+        como assumir a viagem que ANDERSON está deixando.
+        """
+        anderson = row(1, "ANDERSON", "TMIB", "PCM-9", "PCM-8")
+        pedro = row(2, "PEDRO", "PCM-9", "PCM-9", "PCM-8")
+        trips = [
+            VesselTrip("SURFER 1870", [
+                leg("SURFER 1870", "PCM-09", "PCM-08", time(6, 0), pax_origin="TMIB", pax=1)]),
+            VesselTrip("SURFER 1905", [
+                leg("SURFER 1905", "PCM-09", "PCM-08", time(14, 0), pax_origin="PCM-09", pax=1)]),
+        ]
+        filled, _, _ = run([anderson, pedro], trips)
+        got = by_excel(filled)
+        self.assertEqual(got[1].embarcacao, "SURFER 1870")
+        self.assertEqual(got[2].embarcacao, "SURFER 1905")
+
+        atual, opcoes = swap_options(got[1], filled, trips)
+        self.assertEqual([s.vessel for s, _ in opcoes], ["SURFER 1905"])
+        destino, ocupados = opcoes[0]
+        self.assertGreaterEqual(ocupados, destino.limit)      # lotada
+
+        # PEDRO esta na viagem de destino, mas nao cabe na de origem: sem permuta possivel.
+        self.assertEqual(slot_occupants(
+            destino, filled, AliasResolver(explicit=dict(PLATFORM_EQUIVALENCES))), [got[2]])
+        self.assertEqual(swap_partners(got[1], atual, destino, filled), [])
+
+    def test_occupancy_counts_per_leg_not_per_voyage(self):
+        """Uma viagem com dois destinos no mesmo horário tem um limite para cada."""
+        rows = [row(1, "PARA_M8", "PCM-9", "PCM-9", "PCM-8"),
+                row(2, "PARA_M4", "PCM-9", "PCM-9", "PCM-4")]
+        trips = [VesselTrip("SURFER 1905", [
+            leg("SURFER 1905", "PCM-09", "PCM-08", time(14, 0), pax_origin="PCM-09", pax=1),
+            leg("SURFER 1905", "PCM-08", "PCM-04", time(14, 0), pax_origin="PCM-09", pax=1)])]
+        filled, _, _ = run(rows, trips)
+        resolver = AliasResolver(explicit=dict(PLATFORM_EQUIVALENCES))
+        for slot in voyage_slots(trips):
+            self.assertEqual(len(slot_occupants(slot, filled, resolver)), 1)
+
+    def test_numbering_is_rebuilt_after_a_swap(self):
+        """O mapa do fill_rows envelhece: quem entra numa viagem que não levava ninguém do
+        tipo dele ficaria com Nº Viagem em branco, sem nada avisar."""
+        rows, trips = self._m9_m8()
+        filled, _, mapa = run(rows, trips)
+        entra = [fr for fr in filled if fr.horario == time(6, 0)][0]
+
+        # A viagem das 06:00 fica vazia: era a unica do tipo naquele horario.
+        entra.embarcacao, entra.horario = "SURFER 1905", time(14, 0)
+        refeito = rebuild_n_viagem(filled, trips, extra_aliases=PLATFORM_EQUIVALENCES)
+        _assign_n_viagem(filled, refeito)
+        self.assertNotEqual(mapa, refeito)
+        for fr in filled:
+            self.assertIsNotNone(fr.n_viagem, fr.dados_row.name)
+        self.assertEqual({fr.n_viagem for fr in filled}, {1})
+
+    def test_rebuild_reproduces_the_original_numbering_when_nothing_moved(self):
+        rows = [row(i, f"PAX{i}", "TMIB", "TMIB", "PCM-9") for i in (1, 2, 3)]
+        trips = [
+            VesselTrip("SURFER 1930", [
+                leg("SURFER 1930", "TMIB", "PCM-09", time(6, 20), pax_origin="TMIB", pax=2)]),
+            VesselTrip("SURFER 1905", [
+                leg("SURFER 1905", "TMIB", "PCM-09", time(6, 30), pax_origin="TMIB", pax=1)]),
+        ]
+        filled, _, mapa = run(rows, trips)
+        self.assertEqual(
+            mapa, rebuild_n_viagem(filled, trips, extra_aliases=PLATFORM_EQUIVALENCES))
+
+    def test_an_unassigned_pax_has_no_current_voyage(self):
+        rows, trips = self._m9_m8()
+        filled, _, _ = run(rows, trips)
+        solto = filled[0]
+        solto.embarcacao, solto.horario = None, None
+        movement = row_movement(solto.dados_row, extra_aliases=PLATFORM_EQUIVALENCES)
+        self.assertIsNone(current_slot(solto, voyage_slots(trips), movement))
+        atual, opcoes = swap_options(solto, filled, trips)
+        self.assertIsNone(atual)
+        self.assertEqual(len(opcoes), 2)     # as duas viagens ficam disponiveis
+
+    def test_a_row_with_no_readable_movement_returns_none(self):
+        rows, trips = self._m9_m8()
+        filled, _, _ = run(rows, trips)
+        filled[0].dados_row.destino_raw = None
+        self.assertIsNone(swap_options(filled[0], filled, trips))
+
+
 class GabaritoIntegrationTests(unittest.TestCase):
     """Confronto com a planilha preenchida à mão pelo operador (o gabarito de 16/08).
 

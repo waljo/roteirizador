@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unicodedata
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import time
 
 from ..offshore_pd.aliases import AliasResolver
@@ -253,6 +254,240 @@ def _matches(
     return False
 
 
+def _row_platforms(
+    row: DadosRow, resolver: AliasResolver
+) -> tuple[str, str, str] | None:
+    """(origem, destino, nota_origin) canonicos, ou None se a linha nao da para casar."""
+    if not row.origem_raw or not row.destino_raw:
+        return None
+    try:
+        origem_c = resolver.canonical(row.origem_raw)
+        destino_c = resolver.canonical(row.destino_raw)
+    except (ValueError, AttributeError):
+        return None
+    nota_origin = _nota_origin(row.desc, resolver)
+    if nota_origin is None:
+        return None
+    return origem_c, destino_c, nota_origin
+
+
+def _same_vessel(a: str | None, b: str | None) -> bool:
+    """A planilha guarda o nome como o operador digitou: "1930" contra "SURFER 1930"."""
+    if not a or not b:
+        return False
+    x = " ".join(str(a).upper().split())
+    y = " ".join(str(b).upper().split())
+    return x == y or x in y or y in x
+
+
+# Tolerancia do casamento de horario de linhas ja preenchidas. Larga o bastante para o
+# arredondamento manual do operador (07:10 gravado contra 07:12 da operacao), estreita o
+# bastante para separar as duas pernas da mesma embarcacao no par dia/noite do M6
+# (AQUA HELIX 05:30 contra 16:45). Casar so por embarcacao zeraria as duas.
+_HORARIO_TOLERANCE_MIN = 20
+
+
+def _same_horario(a: time | None, b: time | None) -> bool:
+    if a is None or b is None:
+        return True
+    delta = abs((a.hour * 60 + a.minute) - (b.hour * 60 + b.minute))
+    return delta <= _HORARIO_TOLERANCE_MIN
+
+
+@dataclass(frozen=True)
+class VoyageSlot:
+    """Uma viagem da operacao vista como um lugar onde um pax pode ser posto.
+
+    A identidade da viagem, aqui e no `fill_rows`, e o par `(embarcacao, horario)` — o mesmo
+    par que a numeracao usa. A `leg` fica junto porque e ela que responde duas perguntas que
+    a viagem sozinha nao responde: quais movimentacoes esta viagem atende (`_matches`) e
+    quantos pax a operacao programou para desembarcar ali (`limit`).
+
+    Uma mesma viagem pode ter mais de um slot: as legs de um trip que compartilham o tipo
+    colapsam no mesmo horario, mas cada uma tem o seu destino e o seu proprio limite.
+    """
+    leg: VesselLeg
+    section: int             # ordem da secao na operacao, para o desempate da numeracao
+    vessel: str              # da leg de embarque, que e onde o pax entra
+    horario: time | None
+    tipo_viagem: str
+    limit: int
+
+
+def voyage_slots(
+    trips: list[VesselTrip],
+) -> list[VoyageSlot]:
+    """Todas as viagens programadas, com embarcacao, horario e limite de cada uma.
+
+    Reproduz o mesmo calculo do `fill_rows` (leg de embarque para a embarcacao, horario da
+    viagem por tipo), para que uma troca feita pela UI caia exatamente na viagem que o
+    processamento teria usado.
+    """
+    voyage_horarios = _voyage_horarios(trips)
+    slots: list[VoyageSlot] = []
+    for index, trip in enumerate(trips):
+        for leg in trip.legs:
+            if leg.pax_origin is None or not leg.pax_disembark:
+                continue
+            dep_leg = trip.departure_leg_from(leg.pax_origin) or leg
+            tipo = _classify(leg.pax_origin, leg.destination_canonical, True)
+            grupo = _numbering_group(tipo)
+            slots.append(VoyageSlot(
+                leg=leg,
+                section=index,
+                vessel=dep_leg.vessel,
+                horario=voyage_horarios.get((index, grupo), dep_leg.departure_time),
+                tipo_viagem=tipo,
+                limit=leg.pax_disembark,
+            ))
+    return slots
+
+
+def row_movement(
+    row: DadosRow, resolver: AliasResolver | None = None,
+    extra_aliases: dict[str, str] | None = None,
+) -> tuple[str, str, str] | None:
+    """A chave `(origem, destino, nota_origin)` que o `_matches` consome, para uso externo."""
+    if resolver is None:
+        resolver = AliasResolver(explicit=extra_aliases or {})
+    return _row_platforms(row, resolver)
+
+
+def slot_matches_row(slot: VoyageSlot, movement: tuple[str, str, str]) -> bool:
+    """Esta viagem atende a movimentacao deste pax?"""
+    return _matches(slot.leg, *movement)
+
+
+def slot_occupants(
+    slot: VoyageSlot, filled: list[FilledRow], resolver: AliasResolver,
+) -> list[FilledRow]:
+    """Os pax que hoje estao nessa viagem por esse trecho da operacao.
+
+    Compara `(embarcacao, horario)` **e** o `_matches` da leg, porque uma viagem pode ter
+    mais de um trecho no mesmo horario, cada um com o seu proprio limite — contar por viagem
+    inteira misturaria destinos diferentes.
+    """
+    dentro: list[FilledRow] = []
+    for fr in filled:
+        if not fr.embarcacao or not _same_vessel(fr.embarcacao, slot.vessel):
+            continue
+        if fr.horario != slot.horario:
+            continue
+        movement = _row_platforms(fr.dados_row, resolver)
+        if movement is not None and _matches(slot.leg, *movement):
+            dentro.append(fr)
+    return dentro
+
+
+def current_slot(
+    fr: FilledRow, slots: list[VoyageSlot], movement: tuple[str, str, str],
+) -> VoyageSlot | None:
+    """Em qual viagem programada este pax esta agora, se estiver em alguma."""
+    if not fr.embarcacao:
+        return None
+    for slot in slots:
+        if (_same_vessel(fr.embarcacao, slot.vessel) and fr.horario == slot.horario
+                and _matches(slot.leg, *movement)):
+            return slot
+    return None
+
+
+def swap_options(
+    fr: FilledRow,
+    filled: list[FilledRow],
+    trips: list[VesselTrip],
+    resolver: AliasResolver | None = None,
+    extra_aliases: dict[str, str] | None = None,
+) -> tuple[VoyageSlot | None, list[tuple[VoyageSlot, int]]] | None:
+    """(viagem atual, [(viagem alternativa, ocupacao)]) para este pax.
+
+    As alternativas sao **so** as viagens que a operacao programou para a movimentacao dele,
+    ordenadas por horario. Devolve None quando a linha nao da para casar (origem, destino ou
+    prefixo da nota ilegiveis), que e diferente de casar e nao ter alternativa.
+    """
+    if resolver is None:
+        resolver = AliasResolver(explicit=extra_aliases or {})
+    movement = _row_platforms(fr.dados_row, resolver)
+    if movement is None:
+        return None
+
+    slots = voyage_slots(trips)
+    atual = current_slot(fr, slots, movement)
+    opcoes: list[tuple[VoyageSlot, int]] = []
+    for slot in slots:
+        if not _matches(slot.leg, *movement):
+            continue
+        if atual is not None and (slot.vessel, slot.horario) == (atual.vessel, atual.horario):
+            continue
+        opcoes.append((slot, len(slot_occupants(slot, filled, resolver))))
+    opcoes.sort(key=lambda o: (o[0].horario or time(23, 59), o[0].vessel))
+    return atual, opcoes
+
+
+def swap_partners(
+    fr: FilledRow,
+    atual: VoyageSlot | None,
+    destino: VoyageSlot,
+    filled: list[FilledRow],
+    resolver: AliasResolver | None = None,
+    extra_aliases: dict[str, str] | None = None,
+) -> list[FilledRow]:
+    """Quem, na viagem de destino, pode ceder o lugar assumindo a viagem de origem.
+
+    Sem o filtro pela viagem de origem a permuta so empurraria o problema: o pax que sai
+    iria para uma viagem que a operacao nao programou para ele.
+    """
+    if resolver is None:
+        resolver = AliasResolver(explicit=extra_aliases or {})
+    candidatos: list[FilledRow] = []
+    for outro in slot_occupants(destino, filled, resolver):
+        if outro is fr:
+            continue
+        if atual is not None:
+            movement = _row_platforms(outro.dados_row, resolver)
+            if movement is None or not _matches(atual.leg, *movement):
+                continue
+        candidatos.append(outro)
+    return candidatos
+
+
+def rebuild_n_viagem(
+    filled: list[FilledRow],
+    trips: list[VesselTrip],
+    resolver: AliasResolver | None = None,
+    extra_aliases: dict[str, str] | None = None,
+) -> dict[str, dict[tuple[str, time | None], int]]:
+    """Recalcula a numeracao das viagens a partir das atribuicoes como elas estao agora.
+
+    Precisa existir porque a numeracao conta as viagens que de fato levam pax de cada tipo:
+    depois de uma troca manual, o mapa devolvido pelo `fill_rows` esta velho. Reutilizar o
+    mapa velho deixa `n_viagem=None` — em silencio — para um pax movido para uma viagem que
+    antes nao levava ninguem do tipo dele.
+    """
+    if resolver is None:
+        resolver = AliasResolver(explicit=extra_aliases or {})
+
+    slots = voyage_slots(trips)
+    voyage_sections: dict[tuple[str | None, str, time | None], int] = {}
+    for fr in filled:
+        if not fr.embarcacao or not fr.tipo_viagem:
+            continue
+        movement = _row_platforms(fr.dados_row, resolver)
+        if movement is None:
+            continue
+        for slot in slots:
+            if not _same_vessel(fr.embarcacao, slot.vessel):
+                continue
+            if fr.horario != slot.horario:
+                continue
+            if not _matches(slot.leg, *movement):
+                continue
+            key = (_numbering_group(fr.tipo_viagem), slot.vessel, slot.horario)
+            voyage_sections[key] = min(voyage_sections.get(key, slot.section), slot.section)
+            break
+    return _build_n_viagem_map(voyage_sections)
+
+
 def fill_rows(
     dados_rows: list[DadosRow],
     trips: list[VesselTrip],
@@ -276,8 +511,18 @@ def fill_rows(
     unassigned: list[tuple[int, str, str, str]] = []  # (idx, origem, destino, nota_origin)
     leftover_returns: dict[int, bool] = {}
 
+    # Linhas que a planilha ja trouxe preenchidas saem do pool, mas o lugar delas na perna
+    # continua ocupado: sem descontar, cada reprocessamento gasta a lotacao declarada de
+    # novo e o dialogo de selecao volta a perguntar (ou, pior, atribui em silencio o pax que
+    # o operador tinha recusado).
+    pre_key: dict[int, tuple[str, str, str]] = {}
+    preassigned_free: set[int] = set()
+
     for row in dados_rows:
+        keys = _row_platforms(row, resolver)
+
         if row.embarcacao is not None:
+            idx = len(filled)
             filled.append(FilledRow(
                 dados_row=row,
                 embarcacao=row.embarcacao,
@@ -286,20 +531,14 @@ def fill_rows(
                 tipo_viagem=row.tipo_viagem,
                 status="already_filled",
             ))
+            if keys is not None:
+                pre_key[idx] = keys
+                preassigned_free.add(idx)
             continue
 
-        if not row.origem_raw or not row.destino_raw:
+        if keys is None:
             continue
-
-        try:
-            origem_c = resolver.canonical(row.origem_raw)
-            destino_c = resolver.canonical(row.destino_raw)
-        except (ValueError, AttributeError):
-            continue
-
-        nota_origin = _nota_origin(row.desc, resolver)
-        if nota_origin is None:
-            continue
+        origem_c, destino_c, nota_origin = keys
 
         name_key = _normalize_name(row.name)
         tipo = _classify(origem_c, destino_c, name_key in returning)
@@ -354,6 +593,46 @@ def fill_rows(
             if idx not in claimed
             and any(_matches(leg, origem_c, destino_c, nota_origin) for _, _, leg in members)
         ]
+        # Vessel and horario of each leg first, because as vagas ja ocupadas por linhas
+        # preenchidas so podem ser descontadas depois de saber em que viagem elas estao.
+        plan: list[tuple[int, VesselLeg, VesselLeg, time | None, int]] = []
+        for index, trip, leg in members:
+            # Passengers board where their journey starts — that leg gives the vessel. The
+            # horario comes from the voyage, so one voyage is never split in two.
+            dep_leg = trip.departure_leg_from(leg.pax_origin) or leg
+            tipo = _numbering_group(
+                _classify(leg.pax_origin, leg.destination_canonical, True)
+            )
+            horario = voyage_horarios.get((index, tipo), dep_leg.departure_time)
+
+            # Cada linha ja preenchida consome no maximo uma vaga, e de uma perna so — por
+            # isso sai de `preassigned_free` assim que e contada.
+            spent: list[int] = []
+            for idx in sorted(preassigned_free):
+                if len(spent) >= leg.pax_disembark:
+                    break
+                if not _matches(leg, *pre_key[idx]):
+                    continue
+                if not _same_vessel(filled[idx].embarcacao, dep_leg.vessel):
+                    continue
+                if not _same_horario(filled[idx].horario, horario):
+                    continue
+                spent.append(idx)
+            preassigned_free.difference_update(spent)
+
+            # A viagem existe mesmo que ninguem novo embarque nela: a numeracao conta as
+            # viagens que levam pax de cada tipo, entao sem registrar as ja preenchidas um
+            # reprocessamento numeraria a primeira atribuicao nova como viagem 1.
+            for idx in spent:
+                v_key = (
+                    _numbering_group(filled[idx].tipo_viagem), dep_leg.vessel, horario
+                )
+                voyage_sections[v_key] = min(voyage_sections.get(v_key, index), index)
+
+            plan.append(
+                (index, leg, dep_leg, horario, max(0, leg.pax_disembark - len(spent)))
+            )
+
         if not pool:
             continue
 
@@ -371,22 +650,14 @@ def fill_rows(
             homeward = any(row_key[idx][2] == key[0] for idx in pool)
             night_leg_position = _night_leg_position(members, homeward)
 
-        # Genuine contention only when the candidates outnumber every seat on offer.
-        overflow = len(pool) > sum(leg.pax_disembark for _, _, leg in members)
+        # Genuine contention only when the candidates outnumber every seat still on offer.
+        overflow = len(pool) > sum(seats for *_, seats in plan)
 
-        allocations: list[tuple[VesselLeg, VesselLeg, time | None, list[int]]] = []
-        for position, (index, trip, leg) in enumerate(members):
-            # Passengers board where their journey starts — that leg gives the vessel. The
-            # horario comes from the voyage, so one voyage is never split in two.
-            dep_leg = trip.departure_leg_from(leg.pax_origin) or leg
-            tipo = _numbering_group(
-                _classify(leg.pax_origin, leg.destination_canonical, True)
-            )
-            horario = voyage_horarios.get((index, tipo), dep_leg.departure_time)
-
+        allocations: list[tuple[VesselLeg, VesselLeg, time | None, int, list[int]]] = []
+        for position, (index, leg, dep_leg, horario, seats) in enumerate(plan):
             taken: list[int] = []
             for idx in pool:
-                if len(taken) >= leg.pax_disembark:
+                if len(taken) >= seats:
                     break
                 if idx in claimed or not _matches(leg, *row_key[idx]):
                     continue
@@ -407,13 +678,13 @@ def fill_rows(
                 # order — that is what reproduces the operator's numbering.
                 v_key = (_numbering_group(filled[idx].tipo_viagem), dep_leg.vessel, horario)
                 voyage_sections[v_key] = min(voyage_sections.get(v_key, index), index)
-            allocations.append((leg, dep_leg, horario, taken))
+            allocations.append((leg, dep_leg, horario, seats, taken))
 
         if not overflow:
             continue
 
         leftover = [idx for idx in pool if idx not in claimed]
-        for leg, dep_leg, horario, taken in allocations:
+        for leg, dep_leg, horario, seats, taken in allocations:
             if not taken:
                 continue
             spare = [idx for idx in leftover if _matches(leg, *row_key[idx])]
@@ -428,7 +699,7 @@ def fill_rows(
                 vessel=dep_leg.vessel,
                 horario=horario,
                 tipo_viagem=filled[taken[0]].tipo_viagem,
-                limit=leg.pax_disembark,
+                limit=seats,
                 pool=[filled[i] for i in candidates],
                 remaining_candidates=[],
                 assigned=[filled[i] for i in taken],

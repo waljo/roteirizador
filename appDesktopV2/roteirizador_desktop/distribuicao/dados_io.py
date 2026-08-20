@@ -71,6 +71,17 @@ def write_dados(path: str, filled_rows: list[FilledRow]) -> None:
         if fr.status == "already_filled":
             continue
         r = fr.dados_row.excel_row
+
+        # Sem embarcacao a linha nao esta programada, e ai as quatro colunas saem em branco —
+        # inclusive o TIPO. Gravar so o tipo deixava a linha parecendo meio programada e o
+        # colega que gera os manifestos vinha perguntar se faltava programar aqueles pax.
+        # A regra olha a embarcacao, e nao o status, para nunca descartar uma embarcacao que
+        # o operador digitou a mao na tabela.
+        if not fr.embarcacao:
+            for col in (_C_EMBARCACAO, _C_HORARIO, _C_N_VIAGEM, _C_TIPO):
+                ws.cell(row=r, column=col).value = None
+            continue
+
         ws.cell(row=r, column=_C_EMBARCACAO).value = fr.embarcacao
         ws.cell(row=r, column=_C_HORARIO).value = fr.horario
         ws.cell(row=r, column=_C_N_VIAGEM).value = fr.n_viagem
