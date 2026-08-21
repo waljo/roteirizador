@@ -892,6 +892,56 @@ linha correspondente no Dados.
 
 ---
 
+### Fix — a linha única da esquerda precisava de um clique que nada indicava
+
+**Sintoma relatado** (21/08): com **um** passageiro selecionado, o operador buscou o
+substituto na lista da direita, clicou nele e a janela não montou o par — sem que ele
+entendesse por quê. O caso: JOÃO BISPO (SURFER 1870 · 10:30) por OSMAR JUNIOR
+(SURFER 1931 · 06:40), os dois `TMIB → PCM-9`.
+
+**Causa**: a troca exige uma linha ativa à esquerda, e com uma linha só nada sugeria que
+faltava clicar nela. Conferido com os arquivos de 21/08: `can_swap_pair(JOÃO, OSMAR)` é
+`True` — a troca era válida, faltava só o estado.
+
+**Solução, em duas partes:**
+
+- **A linha única fica ativa sozinha.** Vale também quando a busca da esquerda reduz a lista
+  a um nome — que é como o operador procura alguém no meio de 88.
+- **Clicar de novo na linha ativa não a desativa mais.** A alternância era a segunda forma do
+  mesmo problema: dois cliques na mesma linha e o clique seguinte à direita não pareava nada.
+  Para desmontar um par existe o `Desfazer par`.
+
+### Feature: ocultar lanchas da lista de candidatos
+
+**Motivação do operador**: feita a troca da 1905, ao trabalhar a 1931 os pax que ele acabou de
+colocar na 1905 continuam aparecendo entre os candidatos — e um clique errado desfaz o que ele
+já fez.
+
+Uma caixa por lancha presente na lista, na barra acima dela. Caixas em vez de combo porque
+mostram de uma vez o que está escondido e aguentam mais de uma lancha oculta ao mesmo tempo.
+O cabeçalho da janela conta quantos estão fora e nomeia as lanchas, em laranja.
+
+**Nenhuma lancha é ocultada sozinha** — decisão explícita do operador. Esconder por conta
+própria a lancha já trabalhada tiraria o único caminho de desfazer uma troca equivocada.
+
+Ocultar **não desfaz par nenhum**: os pares vivem em `_pares`/`_usados`, não na tabela.
+
+### Fix — os cabeçalhos das duas tabelas em alturas diferentes
+
+Duas fontes, as duas encontradas medindo a geometria com a janela aberta:
+
+- o **negrito** do título da esquerda (`clique em quem <b>não</b> deveria estar aí`) deixa
+  aquele rótulo 2 px mais alto que o da direita;
+- a **linha de caixas de lancha** existe só à direita.
+
+`_mesma_altura(a, b)` fixa os dois no maior dos dois `sizeHint`. Fixar só um lado não resolve:
+o widget livre é comprimido pelo layout e o desalinhamento volta com outro número. Como a
+janela existe para ler as duas listas em paralelo, um teste mede o topo das duas tabelas.
+
+**Testes**: 202 no total. Mutações que a suíte pega: não auto-ativar a linha única (2), voltar
+a alternância do clique (1), o filtro de lancha não filtrar (1), as lanchas começarem ocultas
+(1), e cada um dos dois alinhamentos (1 cada).
+
 ### Fix — o Shift+clique arrastava junto as linhas que o filtro escondeu
 
 **Sintoma relatado** (21/08): com `Embarcacao = SURFER 1905 · Destino = PCM-9 ·
@@ -1240,7 +1290,7 @@ alterar as tabelas de escolha de passageiro, cuja marca é o check verde.
 
 ### Testes
 
-`TrocaPareadaTests` (8) e `TrocaPareadaUiTests` (11) — 193 no total. Mutações que a suíte pega:
+`TrocaPareadaTests` (8) e `TrocaPareadaUiTests` (18) — 202 no total. Mutações que a suíte pega:
 
 | Mutação | Falhas |
 |---|---|
@@ -1389,9 +1439,9 @@ Duas outras proteções, ambas descobertas apontando o seletor para `Downloads`,
 
 ### Testes
 
-195 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
+202 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
 `pip install` falha no certificado TLS do Netskope). Os do módulo de distribuição estão em
-`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (115).
+`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (122).
 
 ```bash
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
@@ -1416,7 +1466,7 @@ respectivamente). Um teste que não falha quando o bug volta não protege nada.
 
 ### Testes da classificação (`tests/test_distribuicao_filler.py`)
 
-115 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
+122 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
 para ligar a regra ao caso que a originou.
 
 | Grupo | O que protege |
@@ -1438,7 +1488,7 @@ para ligar a regra ao caso que a originou.
 | `PlanilhaEscritaTests` | linha sem embarcação sai com as quatro colunas em branco; lixo antigo é limpo; a regra é a embarcação, não o status |
 | `TrocaViagemTests` | a troca manual: só viagens programadas são oferecidas, ocupação por trecho, o par da permuta tem de caber na origem, numeração refeita, o cenário M9→M8 manhã/tarde |
 | `TrocaPareadaTests` | a troca por pessoa: o agregado de todas as lanchas, o par nos dois sentidos, quem já está na viagem fora da lista, o sob demanda como candidato, e o `apply_pairs` lendo antes de escrever |
-| `TrocaPareadaUiTests` | a janela das duas listas: clique sem linha ativa, par montado e ativo limpo, a ordenação por cabeçalho, candidato usado passando para a linha ativa, a busca não pareando errado, o par impossível recusado com o motivo |
+| `TrocaPareadaUiTests` | a janela das duas listas: clique sem linha ativa, par montado e ativo limpo, a ordenação por cabeçalho, candidato usado passando para a linha ativa, a busca não pareando errado, o par impossível recusado com o motivo, a linha única já ativa, o filtro de lanchas e o alinhamento das duas tabelas |
 | `ReprocessTests` | o reprocessamento não gastar de novo as vagas ocupadas: nada de novo diálogo, o pax recusado não entra sozinho, nome curto e horário arredondado descontando, o par dia/noite do M6 nos dois sentidos, numeração preservada |
 | `GabaritoIntegrationTests` | as 244 de 263 linhas contra a planilha do operador, e a asserção de que as 19 restantes são exatamente 13 de horário + 5 de EMBARQUE + 1 de nº viagem. `skipUnless` |
 
@@ -1508,7 +1558,7 @@ são erro do sistema:
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
 cd /mnt/c/Users/ka20/roteirizador/appDesktopV2
 
-# Suíte completa — 195 testes, em unittest (stdlib)
+# Suíte completa — 202 testes, em unittest (stdlib)
 $PY -m unittest discover -s tests -v
 
 # Um arquivo só

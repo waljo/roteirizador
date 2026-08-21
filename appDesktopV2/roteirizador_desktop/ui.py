@@ -3941,6 +3941,9 @@ class _TrocaParesDialog(QDialog):
         # `setSortingEnabled` perderia a ordem justamente ai.
         self._ordem_esq = None
         self._ordem_dir = None
+        # Lanchas ocultas na lista da direita, por escolha explicita do operador. Nunca
+        # ocultadas sozinhas: uma troca pode ter sido equivocada e ele precisa poder desfazer.
+        self._lanchas_ocultas: set = set()
         # Por identidade: FilledRow e dataclass com __eq__, entao list.index() pode
         # devolver a posicao de uma linha equivalente em vez da propria.
         self._pos_esq = {id(fr): i for i, fr in enumerate(self._frs)}
@@ -3952,9 +3955,8 @@ class _TrocaParesDialog(QDialog):
         self.setMinimumHeight(560)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(
-            f"<b>{len(frs)} passageiro(s) selecionado(s)</b> &nbsp;·&nbsp; "
-            f"{len(pool.candidatos)} disponível(is) para troca"))
+        self._resumo = QLabel("")
+        layout.addWidget(self._resumo)
         self._hint = QLabel("")
         self._hint.setStyleSheet("color: #475569;")
         layout.addWidget(self._hint)
@@ -3968,6 +3970,13 @@ class _TrocaParesDialog(QDialog):
             self._COLS_DIR, "dir"))
         splitter.setSizes([500, 520])
         layout.addWidget(splitter, 1)
+        # Os cabecalhos das duas tabelas TEM de ficar na mesma altura: a janela existe para
+        # ler as duas listas em paralelo. Duas fontes de desalinhamento, as duas tratadas
+        # fixando a altura nos dois lados com o mesmo numero:
+        #   - o negrito do titulo da esquerda faz aquele rotulo ficar 2 px mais alto;
+        #   - a linha de caixas de lancha existe so a direita.
+        self._mesma_altura(self._titulo_esq, self._titulo_dir)
+        self._mesma_altura(self._espaco_esq, self._linha_lanchas)
 
         rodape = QHBoxLayout()
         self._contador = QLabel("")
@@ -3996,17 +4005,34 @@ class _TrocaParesDialog(QDialog):
 
         self._render()
 
+    @staticmethod
+    def _mesma_altura(a, b) -> None:
+        altura = max(a.sizeHint().height(), b.sizeHint().height())
+        a.setFixedHeight(altura)
+        b.setFixedHeight(altura)
+
     # ----- construcao -------------------------------------------------------------
     def _painel(self, titulo: str, cols: list, lado: str):
         caixa = QWidget()
         v = QVBoxLayout(caixa)
         v.setContentsMargins(0, 0, 0, 0)
-        v.addWidget(QLabel(titulo))
+        rotulo = QLabel(titulo)
+        v.addWidget(rotulo)
 
         busca = QLineEdit()
         busca.setPlaceholderText("Buscar nome...")
         busca.textChanged.connect(self._render)
         v.addWidget(busca)
+
+        # A linha de caixas existe so a direita, mas o espaco reservado existe nos dois
+        # lados: sem isso os cabecalhos das duas tabelas ficam em alturas diferentes, e ler
+        # as duas listas em paralelo — que e o proposito da janela — fica mais difícil.
+        if lado == "dir":
+            self._linha_lanchas = self._caixas_de_lancha()
+            v.addWidget(self._linha_lanchas)
+        else:
+            self._espaco_esq = QWidget()
+            v.addWidget(self._espaco_esq)
 
         tabela = QTableWidget()
         tabela.setColumnCount(len(cols))
@@ -4029,10 +4055,47 @@ class _TrocaParesDialog(QDialog):
         v.addWidget(tabela)
 
         if lado == "esq":
-            self._tab_esq, self._busca_esq = tabela, busca
+            self._tab_esq, self._busca_esq, self._titulo_esq = tabela, busca, rotulo
         else:
-            self._tab_dir, self._busca_dir = tabela, busca
+            self._tab_dir, self._busca_dir, self._titulo_dir = tabela, busca, rotulo
         return caixa
+
+    @staticmethod
+    def _lancha_de(fr) -> str:
+        return fr.embarcacao or "sem viagem"
+
+    def _caixas_de_lancha(self):
+        """Uma caixa por lancha presente na lista da direita, todas marcadas.
+
+        Pedido do operador: feita a troca da 1905, ao trabalhar a 1931 os pax da 1905 que ele
+        acabou de colocar la continuam aparecendo entre os candidatos, e um clique errado
+        desfaria o que ele fez. Caixas em vez de combo porque mostram de uma vez o que esta
+        escondido e aguentam mais de uma lancha oculta.
+
+        **Nunca marcadas sozinhas.** Ocultar por conta propria a lancha ja trabalhada tiraria
+        o unico caminho de desfazer uma troca equivocada.
+        """
+        caixa_widget = QWidget()
+        linha = QHBoxLayout(caixa_widget)
+        linha.setContentsMargins(0, 0, 0, 0)
+        linha.addWidget(QLabel("Mostrar:"))
+        self._chk_lanchas = {}
+        for nome in sorted({self._lancha_de(c) for c in self._pool.candidatos}):
+            caixa = QCheckBox(nome)
+            caixa.setChecked(True)
+            caixa.toggled.connect(
+                lambda ligada, n=nome: self._alterna_lancha(n, ligada))
+            self._chk_lanchas[nome] = caixa
+            linha.addWidget(caixa)
+        linha.addStretch()
+        return caixa_widget
+
+    def _alterna_lancha(self, nome: str, ligada: bool) -> None:
+        if ligada:
+            self._lanchas_ocultas.discard(nome)
+        else:
+            self._lanchas_ocultas.add(nome)
+        self._render()
 
     # ----- texto ------------------------------------------------------------------
     @staticmethod
@@ -4091,10 +4154,15 @@ class _TrocaParesDialog(QDialog):
     def _render(self) -> None:
         from .distribuicao.filler import can_swap_pair
 
-        ativo = self._frs[self._ativo] if self._ativo is not None else None
-
         visiveis = self._visiveis(self._frs, self._busca_esq, self._ordem_esq,
                                   self._valores_esq)
+        # Com uma linha so a mostra, exigir o clique e atrito puro — e foi assim que a janela
+        # recusou uma troca valida sem o operador entender: ele havia selecionado um pax so, e
+        # a lista da esquerda com uma linha nao parecia precisar de clique nenhum.
+        if self._ativo is None and len(visiveis) == 1:
+            self._ativo = self._pos_esq[id(visiveis[0])]
+        ativo = self._frs[self._ativo] if self._ativo is not None else None
+
         self._tab_esq.setRowCount(len(visiveis))
         for r, fr in enumerate(visiveis):
             fundo = (self._ATIVO_BG if fr is ativo
@@ -4102,7 +4170,9 @@ class _TrocaParesDialog(QDialog):
             self._preenche(self._tab_esq, r, self._valores_esq(fr), self._pos_esq[id(fr)],
                            fundo, negrito=fr is ativo)
 
-        visiveis = self._visiveis(self._pool.candidatos, self._busca_dir, self._ordem_dir,
+        candidatos = [c for c in self._pool.candidatos
+                      if self._lancha_de(c) not in self._lanchas_ocultas]
+        visiveis = self._visiveis(candidatos, self._busca_dir, self._ordem_dir,
                                   self._valores_dir)
         self._tab_dir.setRowCount(len(visiveis))
         for r, cand in enumerate(visiveis):
@@ -4123,6 +4193,15 @@ class _TrocaParesDialog(QDialog):
             if ordem is not None:
                 cabecalho.setSortIndicator(
                     ordem[0], Qt.AscendingOrder if ordem[1] else Qt.DescendingOrder)
+
+        total = len(self._pool.candidatos)
+        resumo = (f"<b>{len(self._frs)} passageiro(s) selecionado(s)</b> &nbsp;·&nbsp; "
+                  f"{len(candidatos)} disponível(is) para troca")
+        if len(candidatos) != total:
+            resumo += (f" &nbsp;·&nbsp; <span style='color:#b45309'>"
+                       f"{total - len(candidatos)} oculto(s): "
+                       f"{', '.join(sorted(self._lanchas_ocultas))}</span>")
+        self._resumo.setText(resumo)
 
         n = len(self._pares)
         self._contador.setText(f"{n} troca(s) montada(s)")
@@ -4161,7 +4240,9 @@ class _TrocaParesDialog(QDialog):
         idx = self._indice(self._tab_esq, linha)
         if idx is None:
             return
-        self._ativo = None if idx == self._ativo else idx
+        # Sem alternancia: clicar duas vezes na mesma linha desativava, e ai o clique
+        # seguinte na direita nao pareava nada. Para desmontar um par existe o Desfazer par.
+        self._ativo = idx
         self._render()
 
     def _clique_dir(self, linha: int, _col: int) -> None:

@@ -1701,6 +1701,85 @@ class TrocaPareadaUiTests(unittest.TestCase):
         self.assertEqual(par[0].dados_row.name, primeiro)
         self.assertEqual(par[1].dados_row.name, dlg._tab_dir.item(0, 0).text())
 
+    def test_a_single_row_is_active_from_the_start(self):
+        """Um pax selecionado: exigir o clique na única linha é atrito puro.
+
+        Relatado em 21/08 — a janela recusou uma troca válida (JOÃO BISPO, SURFER 1870 10:30,
+        por OSMAR JUNIOR, SURFER 1931 06:40, os dois `TMIB → PCM-9`) e o operador não entendeu
+        por quê: com uma linha só à esquerda, nada indicava que faltava clicar nela.
+        """
+        rows, trips = TrocaPareadaTests._tres_lanchas()
+        filled, _, mapa = run(rows, trips)
+        _assign_n_viagem(filled, mapa)
+        um = [fr for fr in filled if fr.horario == time(6, 0)][:1]
+        pool = pair_swap_pool(um, filled, trips)
+        dlg = self.ui._TrocaParesDialog(um, pool)
+        self.assertEqual(dlg._ativo, 0)
+        dlg._clique_dir(0, 0)                          # sem tocar na lista da esquerda
+        self.assertEqual(len(dlg.pares()), 1)
+
+    def test_the_search_narrowing_the_left_list_to_one_activates_it(self):
+        dlg, sel, _, _ = self._janela()
+        self.assertIsNone(dlg._ativo)
+        dlg._busca_esq.setText(sel[0].dados_row.name)
+        self.assertEqual(dlg._tab_esq.rowCount(), 1)
+        self.assertIs(dlg._frs[dlg._ativo], sel[0])
+
+    def test_clicking_the_active_row_again_does_not_deactivate_it(self):
+        """Alternar deixava o clique seguinte na direita sem parear nada."""
+        dlg, _, _, _ = self._janela()
+        dlg._clique_esq(0, 0)
+        dlg._clique_esq(0, 0)
+        self.assertIsNotNone(dlg._ativo)
+        dlg._clique_dir(0, 0)
+        self.assertEqual(len(dlg.pares()), 1)
+
+    def test_a_vessel_can_be_hidden_from_the_candidate_list(self):
+        """Feita a troca da 1905, os pax que ele acabou de pôr lá continuam aparecendo."""
+        dlg, _, pool, _ = self._janela()
+        self.assertEqual(sorted(dlg._chk_lanchas), ["SURFER 1905", "SURFER 1931"])
+        total = dlg._tab_dir.rowCount()
+
+        dlg._alterna_lancha("SURFER 1905", False)
+        restantes = {dlg._tab_dir.item(r, 2).text().split(" ·")[0]
+                     for r in range(dlg._tab_dir.rowCount())}
+        self.assertEqual(restantes, {"SURFER 1931"})
+        self.assertLess(dlg._tab_dir.rowCount(), total)
+        self.assertIn("oculto(s)", dlg._resumo.text())
+
+        dlg._alterna_lancha("SURFER 1905", True)
+        self.assertEqual(dlg._tab_dir.rowCount(), total)
+
+    def test_no_vessel_is_hidden_on_its_own(self):
+        """Ocultar sozinho a lancha já trabalhada tiraria o caminho de desfazer a troca."""
+        dlg, _, _, _ = self._janela()
+        self.assertEqual(dlg._lanchas_ocultas, set())
+        self.assertTrue(all(c.isChecked() for c in dlg._chk_lanchas.values()))
+
+    def test_hiding_a_vessel_keeps_the_pairs_already_built(self):
+        dlg, _, pool, _ = self._janela()
+        dlg._clique_esq(0, 0)
+        alvo = next(r for r in range(dlg._tab_dir.rowCount())
+                    if dlg._tab_dir.item(r, 2).text().startswith("SURFER 1905"))
+        dlg._clique_dir(alvo, 0)
+        self.assertEqual(len(dlg.pares()), 1)
+        dlg._alterna_lancha("SURFER 1905", False)
+        self.assertEqual(len(dlg.pares()), 1)
+
+    def test_the_two_tables_start_at_the_same_height(self):
+        """Ler as duas listas em paralelo é o propósito da janela.
+
+        A linha de caixas de lancha existe só à direita; sem reservar o mesmo espaço à
+        esquerda os dois cabeçalhos ficam desalinhados.
+        """
+        dlg, _, _, _ = self._janela()
+        dlg.resize(1040, 520)
+        dlg.show()
+        self.app.processEvents()
+        self.assertEqual(dlg._tab_esq.mapTo(dlg, dlg._tab_esq.rect().topLeft()).y(),
+                         dlg._tab_dir.mapTo(dlg, dlg._tab_dir.rect().topLeft()).y())
+        dlg.close()
+
     def test_the_old_flow_is_still_reachable(self):
         dlg, _, _, _ = self._janela()
         dlg._ir_para_viagem()
