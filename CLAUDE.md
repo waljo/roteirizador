@@ -789,6 +789,34 @@ cada uma) e, na coluna Situação, `N vaga(s) livre(s)`, `N livre(s) — permuta
 programado, ninguém sem viagem e ninguém sem Nº Viagem. Mutações que a suíte pega: união em vez
 de interseção, emparelhamento guloso, nunca recusar, e contar como vaga quem estava sob demanda.
 
+### Fix — a seleção misturada e a mensagem que não ajudava
+
+**Sintoma relatado** (21/08): filtrando `Embarcacao = SURFER 1905` e `Tipo = EMBARQUE`, o
+operador arrastou a seleção sobre as linhas e o Trocar Viagem respondeu *"Não há nenhuma outra
+viagem que a operação tenha programado para todos os passageiros selecionados"*.
+
+**Causa**: a seleção pegou 24 pax `TMIB → PCM-9` **mais um** `TMIB → PCB-1` — o ABNADAB, que o
+mesmo filtro mostrava porque também está na SURFER 1905. Nenhuma viagem atende as duas
+movimentações, então a interseção do `batch_swap_options` é vazia. Reproduzido com os arquivos
+de 21/08: os 24 sozinhos oferecem SURFER 1931 06:40 e SURFER 1870 10:30; somando o ABNADAB,
+nenhuma.
+
+Ou seja, **o comportamento estava certo e a mensagem é que era inútil**: com 25 linhas marcadas,
+"movimentações diferentes" não diz qual é a intrusa.
+
+**Solução, nas duas pontas:**
+
+- `_sem_opcoes_txt` conta a seleção por movimentação e lista as contagens, **maior grupo
+  primeiro** — a linha de 1 pax salta aos olhos. Quando a movimentação é uma só, a mensagem é
+  outra: "a operação não programou nenhuma outra viagem para TMIB → PCB-1".
+- **Filtro `Destino` na barra de filtros.** Era o que faltava para isolar um lote homogêneo:
+  `Destino = PCM-9` + `Embarcacao = SURFER 1905` deixa exatamente as 24 linhas certas na tela.
+  A barra tinha Nome, Embarcação, Tipo e Nº Viagem, mas não Destino — justamente a coluna que
+  define se a troca em lote fecha.
+
+**Testes**: `FiltroDestinoTests` (5). Mutações que a suíte pega: voltar à mensagem genérica (2
+falhas) e o filtro de destino não filtrar (1).
+
 ### Horário arredondado para o múltiplo de 10 (`_round_horario`)
 
 **Motivação**: o operador escreve os horários redondos. Em 16/08, dos 12 horários que ele usou
@@ -1173,9 +1201,9 @@ Duas outras proteções, ambas descobertas apontando o seletor para `Downloads`,
 
 ### Testes
 
-169 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
+174 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
 `pip install` falha no certificado TLS do Netskope). Os do módulo de distribuição estão em
-`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (89).
+`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (94).
 
 ```bash
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
@@ -1200,7 +1228,7 @@ respectivamente). Um teste que não falha quando o bug volta não protege nada.
 
 ### Testes da classificação (`tests/test_distribuicao_filler.py`)
 
-89 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
+94 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
 para ligar a regra ao caso que a originou.
 
 | Grupo | O que protege |
@@ -1213,6 +1241,7 @@ para ligar a regra ao caso que a originou.
 | `NightLegTests` | noite na leg mais tardia na ida, mais cedo na volta |
 | `OriginsConfigTests` | `suggest_origins` e `audit_origins` |
 | `FillRowsScenarioTests` | 11 cenários montados à mão: bate-volta/embarque na mesma viagem, legs concorrentes, teto do `pax_disembark`, viagem vazia não consumindo número, desempate por ordem da operação, uma viagem com um horário |
+| `FiltroDestinoTests` | a mensagem nomeando a linha intrusa e o filtro Destino isolando o lote |
 | `TrocaEmLoteTests` | interseção das viagens, vagas vindas de quem tinha viagem, emparelhamento máximo dos deslocados, recusa quando a troca não fecha, e o cenário dos 71 pax da GAD |
 | `ArredondamentoHorarioTests` | múltiplo de 10 mais próximo, empate intacto, virada de hora e de dia, e a numeração não reordenando |
 | `TabelaCompletaTests` | as linhas já preenchidas aparecem, o índice do UserRole aponta para a lista certa, e editar uma delas marca para gravar |
@@ -1288,7 +1317,7 @@ são erro do sistema:
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
 cd /mnt/c/Users/ka20/roteirizador/appDesktopV2
 
-# Suíte completa — 169 testes, em unittest (stdlib)
+# Suíte completa — 174 testes, em unittest (stdlib)
 $PY -m unittest discover -s tests -v
 
 # Um arquivo só

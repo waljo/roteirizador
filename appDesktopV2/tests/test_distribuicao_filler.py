@@ -719,6 +719,85 @@ class TabelaCompletaTests(unittest.TestCase):
         self.assertEqual(filled[0].status, "already_filled")
 
 
+class FiltroDestinoTests(unittest.TestCase):
+    """Isolar um lote homogêneo, e dizer qual linha quebrou a seleção quando não é.
+
+    Erro real de 21/08: 24 pax `TMIB → PCM-9` na SURFER 1905, o operador arrastou a seleção e
+    pegou junto o único `TMIB → PCB-1` que o filtro também mostrava. Nenhuma viagem atende as
+    duas movimentações, então a troca dizia "movimentações diferentes" — correto, mas inútil
+    com 25 linhas marcadas.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        try:
+            from PySide6.QtWidgets import QApplication
+            from roteirizador_desktop import ui as ui_mod
+        except Exception as exc:                        # pragma: no cover
+            raise unittest.SkipTest(f"PySide6 indisponível: {exc}")
+        cls.app = QApplication.instance() or QApplication([])
+        cls.ui = ui_mod
+
+    @staticmethod
+    def _linhas():
+        from roteirizador_desktop.distribuicao.models import FilledRow
+        feitas = []
+        destinos = ["PCM-9"] * 4 + ["PCB-1"]
+        for i, dest in enumerate(destinos, start=1):
+            dr = row(i, f"PAX{i}", "TMIB", "TMIB", dest)
+            feitas.append(FilledRow(
+                dados_row=dr, embarcacao="SURFER 1905", horario=time(6, 30),
+                n_viagem=2, tipo_viagem="EMBARQUE", status="auto"))
+        return feitas
+
+    def _aba(self):
+        aba = self.ui.ManifestosDistribuicaoTab(None)
+        aba._filled_rows = self._linhas()
+        aba._populate_table()
+        return aba
+
+    def test_the_message_names_the_odd_row_out(self):
+        aba = self._aba()
+        texto = aba._sem_opcoes_txt(aba._filled_rows)
+        self.assertIn("TMIB → PCM-9: 4 passageiro(s)", texto)
+        self.assertIn("TMIB → PCB-1: 1 passageiro(s)", texto)
+        # O maior grupo vem primeiro, então o intruso fica visível no fim.
+        self.assertLess(texto.index("PCM-9: 4"), texto.index("PCB-1: 1"))
+
+    def test_a_single_movement_gets_the_short_message(self):
+        aba = self._aba()
+        so_um = [fr for fr in aba._filled_rows
+                 if fr.dados_row.destino_raw == "PCB-1"]
+        self.assertEqual(aba._sem_opcoes_txt(so_um),
+                         "A operação não programou nenhuma outra viagem para TMIB → PCB-1.")
+
+    def test_the_destination_filter_isolates_the_batch(self):
+        aba = self._aba()
+        aba._filter_destino.setCurrentText("PCM-9")
+        visiveis = [r for r in range(aba._table.rowCount())
+                    if not aba._table.isRowHidden(r)]
+        self.assertEqual(len(visiveis), 4)
+        for r in visiveis:
+            self.assertEqual(aba._table.item(r, 2).text(), "PCM-9")
+
+    def test_the_destination_filter_is_offered_for_every_destination(self):
+        aba = self._aba()
+        itens = [aba._filter_destino.itemText(i)
+                 for i in range(aba._filter_destino.count())]
+        self.assertEqual(itens, ["(Todas)", "PCB-1", "PCM-9"])
+
+    def test_clearing_the_filters_resets_the_destination(self):
+        aba = self._aba()
+        aba._filter_destino.setCurrentText("PCM-9")
+        aba._clear_filters()
+        self.assertEqual(aba._filter_destino.currentText(), "(Todas)")
+        self.assertEqual(
+            sum(1 for r in range(aba._table.rowCount())
+                if not aba._table.isRowHidden(r)), 5)
+
+
 class ArredondamentoHorarioTests(unittest.TestCase):
     """O horário sai em múltiplos de 10 minutos, como o operador escreve.
 

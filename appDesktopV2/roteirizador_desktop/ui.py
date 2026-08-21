@@ -4015,6 +4015,15 @@ class ManifestosDistribuicaoTab(QWidget):
         filter_row.addWidget(QLabel("Embarcacao:"))
         filter_row.addWidget(self._filter_embarcacao)
 
+        # Filtrar por destino é o caminho natural para isolar um lote homogêneo — foi a
+        # falta dele que fez a seleção dos 24 do TMIB para o M9 pegar junto um pax que ia
+        # para o B1, e aí nenhuma viagem atendia todo mundo.
+        self._filter_destino = QComboBox()
+        self._filter_destino.setMinimumWidth(100)
+        self._filter_destino.currentIndexChanged.connect(self._apply_filters)
+        filter_row.addWidget(QLabel("Destino:"))
+        filter_row.addWidget(self._filter_destino)
+
         self._filter_tipo = QComboBox()
         self._filter_tipo.setMinimumWidth(160)
         self._filter_tipo.currentIndexChanged.connect(self._apply_filters)
@@ -4213,6 +4222,7 @@ class ManifestosDistribuicaoTab(QWidget):
         embarcacoes: set = set()
         tipos: set = set()
         n_viagens: set = set()
+        destinos: set = set()
 
         for row_idx, fr in enumerate(new_rows):
             dr = fr.dados_row
@@ -4228,6 +4238,8 @@ class ManifestosDistribuicaoTab(QWidget):
 
             if embarcacao_display:
                 embarcacoes.add(embarcacao_display)
+            if dr.destino_raw:
+                destinos.add(dr.destino_raw)
             if fr.tipo_viagem:
                 tipos.add(fr.tipo_viagem)
             if n_str:
@@ -4260,11 +4272,14 @@ class ManifestosDistribuicaoTab(QWidget):
         self._populate_filter_combos(
             sorted(embarcacoes), sorted(tipos),
             sorted(n_viagens, key=lambda x: int(x) if x.isdigit() else 999),
+            sorted(destinos),
         )
 
-    def _populate_filter_combos(self, embarcacoes: list, tipos: list, n_viagens: list) -> None:
+    def _populate_filter_combos(self, embarcacoes: list, tipos: list, n_viagens: list,
+                                destinos: list | None = None) -> None:
         for combo, values in [
             (self._filter_embarcacao, embarcacoes),
+            (self._filter_destino, destinos or []),
             (self._filter_tipo, tipos),
             (self._filter_n_viagem, n_viagens),
         ]:
@@ -4277,6 +4292,7 @@ class ManifestosDistribuicaoTab(QWidget):
     def _apply_filters(self) -> None:
         nome_filter = self._filter_nome.text().strip().lower()
         emb_filter = self._filter_embarcacao.currentText()
+        dest_filter = self._filter_destino.currentText()
         tipo_filter = self._filter_tipo.currentText()
         n_filter = self._filter_n_viagem.currentText()
 
@@ -4290,6 +4306,8 @@ class ManifestosDistribuicaoTab(QWidget):
                 show = False
             if emb_filter != "(Todas)" and cell(3) != emb_filter:
                 show = False
+            if dest_filter != "(Todas)" and cell(2) != dest_filter:
+                show = False
             if tipo_filter != "(Todas)" and cell(6) != tipo_filter:
                 show = False
             if n_filter != "(Todas)" and cell(5) != n_filter:
@@ -4299,7 +4317,8 @@ class ManifestosDistribuicaoTab(QWidget):
 
     def _clear_filters(self) -> None:
         self._filter_nome.clear()
-        for combo in (self._filter_embarcacao, self._filter_tipo, self._filter_n_viagem):
+        for combo in (self._filter_embarcacao, self._filter_destino,
+                      self._filter_tipo, self._filter_n_viagem):
             combo.blockSignals(True)
             combo.setCurrentIndex(0)
             combo.blockSignals(False)
@@ -4537,6 +4556,33 @@ class ManifestosDistribuicaoTab(QWidget):
         hor = slot.horario.strftime("%H:%M") if slot and slot.horario else "--:--"
         return f"{slot.vessel} · {hor}" if slot else "sem viagem"
 
+    @staticmethod
+    def _sem_opcoes_txt(frs: list) -> str:
+        """Por que não há para onde trocar — dizendo QUAL linha quebrou a seleção.
+
+        "movimentações diferentes" não ajuda com 25 linhas marcadas: o operador não tem como
+        achar a intrusa. Aconteceu de verdade — 24 pax `TMIB → PCM-9` e um `TMIB → PCB-1` que
+        entrou junto no Shift+clique. Com a contagem por movimentação, a linha de 1 pax salta
+        aos olhos.
+        """
+        movimentos: dict = {}
+        for fr in frs:
+            chave = (f"{fr.dados_row.origem_raw or '?'} → "
+                     f"{fr.dados_row.destino_raw or '?'}")
+            movimentos[chave] = movimentos.get(chave, 0) + 1
+
+        if len(movimentos) == 1:
+            return ("A operação não programou nenhuma outra viagem para "
+                    + next(iter(movimentos)) + ".")
+
+        linhas = [f"Não há nenhuma viagem programada que atenda os {len(frs)} "
+                  f"selecionados de uma vez.", "", "A seleção tem movimentações diferentes:"]
+        for chave, n in sorted(movimentos.items(), key=lambda kv: (-kv[1], kv[0])):
+            linhas.append(f"    {chave}: {n} passageiro(s)")
+        linhas += ["", "Cada viagem atende uma movimentação. Deixe selecionada só uma "
+                       "delas — o filtro Destino ajuda a isolar o grupo."]
+        return "\n".join(linhas)
+
     def _trocar_viagem(self) -> None:
         """Move os pax selecionados para outra viagem programada.
 
@@ -4571,12 +4617,7 @@ class ManifestosDistribuicaoTab(QWidget):
 
         atuais, opcoes = resultado
         if not opcoes:
-            QMessageBox.information(
-                self, "Trocar Viagem",
-                "Não há nenhuma outra viagem que a operação tenha programado para "
-                + ("esta movimentação." if len(frs) == 1 else
-                   "todos os passageiros selecionados.\n\nSe eles têm movimentações "
-                   "diferentes, troque em grupos menores."))
+            QMessageBox.information(self, "Trocar Viagem", self._sem_opcoes_txt(frs))
             return
 
         dlg = _TrocarViagemDialog(frs, atuais, opcoes, parent=self)
