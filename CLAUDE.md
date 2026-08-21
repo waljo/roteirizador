@@ -892,6 +892,33 @@ linha correspondente no Dados.
 
 ---
 
+### Fix — o Shift+clique arrastava junto as linhas que o filtro escondeu
+
+**Sintoma relatado** (21/08): com `Embarcacao = SURFER 1905 · Destino = PCM-9 ·
+Nº Viagem = 2` na barra de filtros, o operador arrastou a seleção sobre as linhas visíveis e
+a janela de troca abriu com **88 passageiros**, incluindo movimentações `PCM-9 → TMIB` e
+`TMIB → PCM-8` — exatamente o que o filtro estava excluindo.
+
+**Causa**: o filtro é `setRowHidden`. A linha some da tela mas **continua no modelo**, e o
+Shift+clique do Qt seleciona o intervalo inteiro em coordenadas do modelo. Com os filtros da
+tela, as 24 linhas visíveis ocupavam um intervalo de **88 linhas** do modelo; as 64 escondidas
+entravam na seleção sem aparecer em lugar nenhum.
+
+**Solução** (`_linhas_selecionadas`): pular `self._table.isRowHidden(indice.row())`. É o funil
+único das duas trocas — a pareada e a que vai por viagem —, então uma linha só.
+
+**Verificado** com os arquivos de 21/08 e os mesmos filtros: `24 visíveis`, `88 linhas no
+intervalo do modelo`, `24 chegando na troca`, todas `TMIB → PCM-9`.
+
+Vale registrar que o defeito era mais perigoso no caminho **por viagem** do que na troca
+pareada. Lá a seleção escondida ou fazia a interseção do `batch_swap_options` esvaziar — e o
+operador via a recusa —, ou, se as linhas escondidas por acaso fossem compatíveis, elas seriam
+**movidas junto sem nada avisar**. Na pareada o operador ao menos via os 88 nomes na lista da
+esquerda, que foi como o problema apareceu.
+
+**Testes**: `SelecaoFiltradaTests` (2). Mutação que a suíte pega: tirar a guarda de linha
+escondida (1 falha).
+
 ### Fix — a sobra do diálogo saía da planilha parecendo meio programada
 
 **Sintoma relatado**: a operação programou 14 desembarques M9→TMIB na SURFER 1870 pela manhã e
@@ -1362,9 +1389,9 @@ Duas outras proteções, ambas descobertas apontando o seletor para `Downloads`,
 
 ### Testes
 
-193 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
+195 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
 `pip install` falha no certificado TLS do Netskope). Os do módulo de distribuição estão em
-`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (113).
+`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (115).
 
 ```bash
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
@@ -1389,7 +1416,7 @@ respectivamente). Um teste que não falha quando o bug volta não protege nada.
 
 ### Testes da classificação (`tests/test_distribuicao_filler.py`)
 
-113 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
+115 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
 para ligar a regra ao caso que a originou.
 
 | Grupo | O que protege |
@@ -1403,6 +1430,7 @@ para ligar a regra ao caso que a originou.
 | `OriginsConfigTests` | `suggest_origins` e `audit_origins` |
 | `FillRowsScenarioTests` | 11 cenários montados à mão: bate-volta/embarque na mesma viagem, legs concorrentes, teto do `pax_disembark`, viagem vazia não consumindo número, desempate por ordem da operação, uma viagem com um horário |
 | `FiltroDestinoTests` | a mensagem nomeando a linha intrusa e o filtro Destino isolando o lote |
+| `SelecaoFiltradaTests` | a linha escondida pelo filtro não entrar na seleção do Shift+clique |
 | `TrocaEmLoteTests` | interseção das viagens, vagas vindas de quem tinha viagem, emparelhamento máximo dos deslocados, recusa quando a troca não fecha, e o cenário dos 71 pax da GAD |
 | `ArredondamentoHorarioTests` | múltiplo de 10 mais próximo, empate intacto, virada de hora e de dia, e a numeração não reordenando |
 | `TabelaCompletaTests` | as linhas já preenchidas aparecem, o índice do UserRole aponta para a lista certa, e editar uma delas marca para gravar |
@@ -1480,7 +1508,7 @@ são erro do sistema:
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
 cd /mnt/c/Users/ka20/roteirizador/appDesktopV2
 
-# Suíte completa — 193 testes, em unittest (stdlib)
+# Suíte completa — 195 testes, em unittest (stdlib)
 $PY -m unittest discover -s tests -v
 
 # Um arquivo só

@@ -4868,10 +4868,19 @@ class ManifestosDistribuicaoTab(QWidget):
         A tabela aceita Ctrl+clique e Shift+clique, então o operador seleciona um bloco de
         uma vez — foi o que resolveu os 71 pax do TMIB para o M9, em que a GAD determina os
         48 das duas primeiras lanchas e antes era um por um.
+
+        **Linha escondida pelo filtro não entra.** O filtro é `setRowHidden`, que esconde a
+        linha mas a deixa no modelo, e o Shift+clique do Qt seleciona o intervalo inteiro em
+        coordenadas do modelo — as escondidas junto. Sem esta guarda, filtrar
+        `Embarcacao = SURFER 1905 · Destino = PCM-9 · Nº Viagem = 2` e arrastar sobre as
+        linhas visíveis levava 88 pax para a janela de troca, com destinos que o filtro
+        estava justamente excluindo.
         """
         modelo = self._table.selectionModel()
         escolhidas = []
         for indice in (modelo.selectedRows() if modelo else []):
+            if self._table.isRowHidden(indice.row()):
+                continue
             item = self._table.item(indice.row(), 0)
             if item is None:
                 continue

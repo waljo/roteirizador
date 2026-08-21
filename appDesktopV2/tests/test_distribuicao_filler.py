@@ -1707,5 +1707,64 @@ class TrocaPareadaUiTests(unittest.TestCase):
         self.assertEqual(dlg.modo, dlg._MODO_VIAGEM)
 
 
+class SelecaoFiltradaTests(unittest.TestCase):
+    """O Shift+clique não pode arrastar junto as linhas que o filtro escondeu.
+
+    O filtro é `setRowHidden`: a linha some da tela mas continua no modelo, e o Shift+clique
+    do Qt seleciona o intervalo em coordenadas do modelo. Relatado em 21/08 — com
+    `Embarcacao = SURFER 1905 · Destino = PCM-9 · Nº Viagem = 2` na tela, a janela de troca
+    abriu com 88 passageiros e movimentações `PCM-9 → TMIB` e `TMIB → PCM-8`, que o filtro
+    estava justamente excluindo.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        try:
+            from PySide6.QtWidgets import QApplication
+            from roteirizador_desktop import ui as ui_mod
+        except Exception as exc:                        # pragma: no cover
+            raise unittest.SkipTest(f"PySide6 indisponível: {exc}")
+        cls.app = QApplication.instance() or QApplication([])
+        cls.ui = ui_mod
+
+    def _aba(self):
+        from roteirizador_desktop.distribuicao.models import FilledRow
+        destinos = ["PCM-9", "TMIB", "PCM-9", "PCM-8", "PCM-9"]
+        feitas = []
+        for i, destino in enumerate(destinos, start=1):
+            dr = row(i, f"PAX{i}", "TMIB", "TMIB", destino)
+            feitas.append(FilledRow(
+                dados_row=dr, embarcacao="SURFER 1905", horario=time(6, 30),
+                n_viagem=2, tipo_viagem="EMBARQUE", status="auto"))
+        aba = self.ui.ManifestosDistribuicaoTab(None)
+        aba._filled_rows = feitas
+        aba._populate_table()
+        return aba, feitas
+
+    def _seleciona_tudo(self, aba):
+        """O que o Shift+clique faz: o intervalo inteiro, em coordenadas do modelo."""
+        from PySide6.QtCore import QItemSelectionModel
+        modelo = aba._table.selectionModel()
+        for r in range(aba._table.rowCount()):
+            modelo.select(aba._table.model().index(r, 0),
+                          QItemSelectionModel.Select | QItemSelectionModel.Rows)
+
+    def test_a_hidden_row_is_left_out_of_the_selection(self):
+        aba, feitas = self._aba()
+        aba._filter_destino.setCurrentText("PCM-9")
+        aba._apply_filters()
+        self._seleciona_tudo(aba)
+        self.assertEqual(
+            sorted(fr.dados_row.destino_raw for fr in aba._linhas_selecionadas()),
+            ["PCM-9", "PCM-9", "PCM-9"])
+
+    def test_without_a_filter_the_whole_selection_comes_through(self):
+        aba, feitas = self._aba()
+        self._seleciona_tudo(aba)
+        self.assertEqual(len(aba._linhas_selecionadas()), len(feitas))
+
+
 if __name__ == "__main__":
     unittest.main()
