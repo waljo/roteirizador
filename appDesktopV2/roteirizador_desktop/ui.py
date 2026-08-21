@@ -3905,6 +3905,292 @@ class _PermutaDialog(QDialog):
                 if _is_row_checked(self._table, r)]
 
 
+class _TrocaParesDialog(QDialog):
+    """Duas listas lado a lado: quem o operador selecionou e quem pode entrar no lugar.
+
+    Substitui, como caminho principal, a escolha da viagem de destino. O motivo veio do
+    operador: para trocar por viagem ele precisa saber em que lancha esta o pax que quer
+    trazer, e essa e exatamente a informacao que ele nao tem — acabava testando viagem por
+    viagem. Aqui ele escolhe a **pessoa**, e a viagem vem de onde ela ja esta.
+
+    Toda troca e 1 por 1, entao nenhuma viagem estoura nem esvazia e nao ha permuta para
+    negociar: a lista da direita ja e o agregado de todas as lanchas. O caminho antigo
+    continua a um botao de distancia, para o caso de mover alguem para uma viagem com vaga
+    livre, em que nao ha par.
+    """
+
+    _MODO_PARES = "pares"
+    _MODO_VIAGEM = "viagem"
+
+    _ATIVO_BG = "#fff3cd"      # amarelo — a linha da esquerda que espera um substituto
+    _PAR_BG = "#eafaf1"        # verde — par montado, o mesmo do check das outras janelas
+    _INVALIDO_FG = "#9aa0a6"
+
+    _COLS_ESQ = ["Nome Passageiro", "Orig → Dest", "Viagem atual", "Entra no lugar"]
+    _COLS_DIR = ["Nome Passageiro", "Orig → Dest", "Viagem atual", "Sai no lugar de"]
+
+    def __init__(self, frs: list, pool, parent=None):
+        super().__init__(parent)
+        self._frs = list(frs)
+        self._pool = pool
+        self._pares: dict = {}        # id(selecionado) -> candidato
+        self._usados: dict = {}       # id(candidato)   -> selecionado
+        self._ativo = None            # indice em self._frs
+        # Por identidade: FilledRow e dataclass com __eq__, entao list.index() pode
+        # devolver a posicao de uma linha equivalente em vez da propria.
+        self._pos_esq = {id(fr): i for i, fr in enumerate(self._frs)}
+        self._pos_dir = {id(fr): i for i, fr in enumerate(pool.candidatos)}
+        self.modo = self._MODO_PARES
+
+        self.setWindowTitle("Trocar Viagem")
+        self.setMinimumWidth(1020)
+        self.setMinimumHeight(560)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            f"<b>{len(frs)} passageiro(s) selecionado(s)</b> &nbsp;·&nbsp; "
+            f"{len(pool.candidatos)} disponível(is) para troca"))
+        self._hint = QLabel("")
+        self._hint.setStyleSheet("color: #475569;")
+        layout.addWidget(self._hint)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self._painel(
+            "1 · Selecionados — clique em quem <b>não</b> deveria estar aí",
+            self._COLS_ESQ, "esq"))
+        splitter.addWidget(self._painel(
+            "2 · Disponíveis (todas as lanchas) — clique em quem entra no lugar",
+            self._COLS_DIR, "dir"))
+        splitter.setSizes([500, 520])
+        layout.addWidget(splitter, 1)
+
+        rodape = QHBoxLayout()
+        self._contador = QLabel("")
+        self._contador.setStyleSheet("font-weight: bold;")
+        rodape.addWidget(self._contador)
+        rodape.addStretch()
+        btn_desfazer = QPushButton("Desfazer par")
+        btn_desfazer.clicked.connect(self._desfazer)
+        rodape.addWidget(btn_desfazer)
+        btn_limpar = QPushButton("Limpar todos")
+        btn_limpar.clicked.connect(self._limpar)
+        rodape.addWidget(btn_limpar)
+        btn_viagem = QPushButton("Mover para outra viagem...")
+        btn_viagem.setToolTip(
+            "Caminho antigo: escolher a viagem de destino em vez do passageiro.\n"
+            "Serve para mover alguém para uma viagem com vaga livre, sem par.")
+        btn_viagem.clicked.connect(self._ir_para_viagem)
+        rodape.addWidget(btn_viagem)
+        layout.addLayout(rodape)
+
+        self._btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self._btns.button(QDialogButtonBox.Ok).setText("Aplicar trocas")
+        self._btns.accepted.connect(self.accept)
+        self._btns.rejected.connect(self.reject)
+        layout.addWidget(self._btns)
+
+        self._render()
+
+    # ----- construcao -------------------------------------------------------------
+    def _painel(self, titulo: str, cols: list, lado: str):
+        caixa = QWidget()
+        v = QVBoxLayout(caixa)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.addWidget(QLabel(titulo))
+
+        busca = QLineEdit()
+        busca.setPlaceholderText("Buscar nome...")
+        busca.textChanged.connect(self._render)
+        v.addWidget(busca)
+
+        tabela = QTableWidget()
+        tabela.setColumnCount(len(cols))
+        tabela.setHorizontalHeaderLabels(cols)
+        tabela.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        # A marca de escolha e o fundo da linha, pintado por nos. A selecao nativa do Qt
+        # competiria com ela e o operador ja disse que o realce nativo e pouco visivel.
+        tabela.setSelectionMode(QAbstractItemView.NoSelection)
+        tabela.verticalHeader().setVisible(False)
+        tabela.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        tabela.horizontalHeader().setStretchLastSection(True)
+        tabela.cellClicked.connect(
+            self._clique_esq if lado == "esq" else self._clique_dir)
+        v.addWidget(tabela)
+
+        if lado == "esq":
+            self._tab_esq, self._busca_esq = tabela, busca
+        else:
+            self._tab_dir, self._busca_dir = tabela, busca
+        return caixa
+
+    # ----- texto ------------------------------------------------------------------
+    @staticmethod
+    def _mov_txt(fr) -> str:
+        dr = fr.dados_row
+        return f"{dr.origem_raw or '?'} → {dr.destino_raw or '?'}"
+
+    @staticmethod
+    def _viagem_txt(fr) -> str:
+        if not fr.embarcacao:
+            return "sem viagem"
+        hor = fr.horario.strftime("%H:%M") if fr.horario else "--:--"
+        n = f" · v{fr.n_viagem}" if fr.n_viagem else ""
+        return f"{fr.embarcacao} · {hor}{n}"
+
+    # ----- render -----------------------------------------------------------------
+    def _visiveis(self, frs: list, busca) -> list:
+        termo = busca.text().strip().lower()
+        if not termo:
+            return list(frs)
+        return [fr for fr in frs if termo in (fr.dados_row.name or "").lower()]
+
+    def _render(self) -> None:
+        from .distribuicao.filler import can_swap_pair
+
+        ativo = self._frs[self._ativo] if self._ativo is not None else None
+
+        visiveis = self._visiveis(self._frs, self._busca_esq)
+        self._tab_esq.setRowCount(len(visiveis))
+        for r, fr in enumerate(visiveis):
+            par = self._pares.get(id(fr))
+            valores = [fr.dados_row.name or "", self._mov_txt(fr), self._viagem_txt(fr),
+                       (f"{par.dados_row.name or ''} ({self._viagem_txt(par)})"
+                        if par else "")]
+            fundo = (self._ATIVO_BG if fr is ativo
+                     else self._PAR_BG if par else None)
+            self._preenche(self._tab_esq, r, valores, self._pos_esq[id(fr)],
+                           fundo, negrito=fr is ativo)
+
+        visiveis = self._visiveis(self._pool.candidatos, self._busca_dir)
+        self._tab_dir.setRowCount(len(visiveis))
+        for r, cand in enumerate(visiveis):
+            dono = self._usados.get(id(cand))
+            valores = [cand.dados_row.name or "", self._mov_txt(cand),
+                       self._viagem_txt(cand),
+                       (dono.dados_row.name or "") if dono else ""]
+            # Cinza = a operacao nao programou nenhuma viagem que sirva aos dois. O pax
+            # continua visivel, para o operador nao procurar por alguem que sumiu da lista.
+            invalido = ativo is not None and not can_swap_pair(self._pool, ativo, cand)
+            self._preenche(self._tab_dir, r, valores,
+                           self._pos_dir[id(cand)],
+                           self._PAR_BG if dono else None,
+                           cinza=invalido and not dono)
+
+        for tabela in (self._tab_esq, self._tab_dir):
+            tabela.resizeColumnsToContents()
+            tabela.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+
+        n = len(self._pares)
+        self._contador.setText(f"{n} troca(s) montada(s)")
+        self._btns.button(QDialogButtonBox.Ok).setEnabled(bool(n))
+        if ativo is None:
+            self._hint.setText("Escolha na lista da esquerda quem deve <b>sair</b> da viagem.")
+        else:
+            self._hint.setText(
+                f"<b>{ativo.dados_row.name or '(sem nome)'}</b> sai de "
+                f"{self._viagem_txt(ativo)} — escolha à direita quem entra no lugar. "
+                "Quem aparece em cinza não pode: a operação não programou viagem que sirva "
+                "aos dois.")
+
+    def _preenche(self, tabela, linha: int, valores: list, indice: int,
+                  fundo: str | None, negrito: bool = False, cinza: bool = False) -> None:
+        for col, val in enumerate(valores):
+            item = QTableWidgetItem(val)
+            item.setData(Qt.UserRole, indice)
+            if fundo:
+                item.setBackground(_make_color(fundo))
+            if cinza:
+                item.setForeground(_make_color(self._INVALIDO_FG))
+            if negrito:
+                fonte = item.font()
+                fonte.setBold(True)
+                item.setFont(fonte)
+            tabela.setItem(linha, col, item)
+
+    # ----- interacao --------------------------------------------------------------
+    @staticmethod
+    def _indice(tabela, linha: int):
+        item = tabela.item(linha, 0)
+        return None if item is None else item.data(Qt.UserRole)
+
+    def _clique_esq(self, linha: int, _col: int) -> None:
+        idx = self._indice(self._tab_esq, linha)
+        if idx is None:
+            return
+        self._ativo = None if idx == self._ativo else idx
+        self._render()
+
+    def _clique_dir(self, linha: int, _col: int) -> None:
+        from .distribuicao.filler import can_swap_pair
+
+        idx = self._indice(self._tab_dir, linha)
+        if idx is None:
+            return
+        cand = self._pool.candidatos[idx]
+        dono = self._usados.get(id(cand))
+
+        def desfaz() -> None:
+            self._pares.pop(id(dono), None)
+            self._usados.pop(id(cand), None)
+
+        if self._ativo is None:
+            if dono is not None:                 # sem ninguem ativo, clicar num par desfaz
+                desfaz()
+                self._render()
+                return
+            self._hint.setText(
+                "<b>Escolha primeiro, na lista da esquerda, quem deve sair.</b>")
+            return
+
+        atual = self._frs[self._ativo]
+        if dono is atual:                        # clicar no proprio par desfaz
+            desfaz()
+            self._render()
+            return
+        if not can_swap_pair(self._pool, atual, cand):
+            self._hint.setText(
+                f"<b style='color:#b91c1c'>A operação não programou nenhuma viagem que "
+                f"sirva a {atual.dados_row.name or '?'} e a "
+                f"{cand.dados_row.name or '?'} ao mesmo tempo.</b>")
+            return
+
+        # Com alguem ativo, clicar num candidato ja usado significa passa-lo para a linha
+        # ativa — nunca desfazer em silencio e deixar a linha ativa sem par.
+        if dono is not None:
+            desfaz()
+        anterior = self._pares.get(id(atual))
+        if anterior is not None:
+            self._usados.pop(id(anterior), None)
+        self._pares[id(atual)] = cand
+        self._usados[id(cand)] = atual
+        # Sem avanco automatico de propósito: com a lista da direita filtrada por busca, um
+        # avanco silencioso faria o proximo clique parear a linha errada.
+        self._ativo = None
+        self._render()
+
+    def _desfazer(self) -> None:
+        if self._ativo is None:
+            return
+        cand = self._pares.pop(id(self._frs[self._ativo]), None)
+        if cand is not None:
+            self._usados.pop(id(cand), None)
+        self._render()
+
+    def _limpar(self) -> None:
+        self._pares.clear()
+        self._usados.clear()
+        self._ativo = None
+        self._render()
+
+    def _ir_para_viagem(self) -> None:
+        self.modo = self._MODO_VIAGEM
+        self.accept()
+
+    def pares(self) -> list:
+        """[(quem sai, quem entra)] na ordem da lista da esquerda."""
+        return [(fr, self._pares[id(fr)]) for fr in self._frs if id(fr) in self._pares]
+
+
 class ManifestosDistribuicaoTab(QWidget):
     _STATUS_COLORS = {
         "auto":          "#d4edda",  # verde claro
@@ -3980,8 +4266,8 @@ class ManifestosDistribuicaoTab(QWidget):
         self._btn_add_trecho.setVisible(False)
         self._btn_trocar = QPushButton("Trocar Viagem")
         self._btn_trocar.setToolTip(
-            "Move o passageiro selecionado para outra viagem programada.\n"
-            "Se a viagem de destino estiver lotada, pede um passageiro para permutar."
+            "Abre as duas listas lado a lado: os passageiros selecionados e, agregados de\n"
+            "todas as lanchas, os que podem trocar de lugar com eles."
         )
         self._btn_trocar.clicked.connect(self._trocar_viagem)
         self._btn_trocar.setEnabled(False)
@@ -4044,6 +4330,11 @@ class ManifestosDistribuicaoTab(QWidget):
 
         # --- Preview table ---
         self._table = QTableWidget()
+        # O realce da selecao e definido por objectName na folha de estilo da janela: cada
+        # linha ja tem um fundo proprio (a cor do status) e, quando o foco sai da tabela —
+        # que e o que acontece assim que o operador clica em Trocar Viagem —, o Qt pinta a
+        # selecao com o grupo Inactive da paleta, um cinza que some sobre essas cores.
+        self._table.setObjectName("tabelaDistribuicao")
         self._table.setColumnCount(len(self._COLS))
         self._table.setHorizontalHeaderLabels(self._COLS)
         self._table.horizontalHeader().setStretchLastSection(True)
@@ -4583,19 +4874,36 @@ class ManifestosDistribuicaoTab(QWidget):
                        "delas — o filtro Destino ajuda a isolar o grupo."]
         return "\n".join(linhas)
 
-    def _trocar_viagem(self) -> None:
-        """Move os pax selecionados para outra viagem programada.
+    def _renumerar(self) -> None:
+        """Refaz a numeração depois de mover alguém, e recarrega a tabela.
 
-        Quando a viagem de destino não tem vaga para todos, a diferença sai por permuta: quem
-        sai assume as vagas que o lote está liberando, então nenhuma viagem estoura nem
-        esvazia. A decisão de quais viagens servem, quem está em cada uma, quem pode ceder o
-        lugar e para onde cada um vai fica toda no `filler` — aqui só entra a conversa.
+        A numeração conta as viagens que de fato levam pax de cada tipo, então o mapa que o
+        `fill_rows` devolveu fica velho depois de uma troca. Reaproveitá-lo deixaria o
+        Nº Viagem em branco — em silêncio — para quem entrou numa viagem que antes não
+        levava ninguém do tipo dele.
         """
         from .distribuicao import PLATFORM_EQUIVALENCES
-        from .distribuicao.filler import (
-            _assign_n_viagem, batch_swap_candidates, batch_swap_options,
-            match_displaced, rebuild_n_viagem, swap_vacancies,
-        )
+        from .distribuicao.filler import _assign_n_viagem, rebuild_n_viagem
+
+        self._n_viagem_map = rebuild_n_viagem(
+            self._filled_rows, self._trips, extra_aliases=PLATFORM_EQUIVALENCES)
+        _assign_n_viagem(self._filled_rows, self._n_viagem_map)
+        self._trocas_pendentes += 1
+        self._populate_table()
+
+    def _trocar_viagem(self) -> None:
+        """Troca pareada: duas listas lado a lado, escolhendo pessoa em vez de viagem.
+
+        O operador olha a lista do que selecionou e, para cada pax que não deveria estar ali,
+        escolhe na segunda lista quem entra no lugar. A segunda lista é o agregado de todas
+        as lanchas, que é o ponto: ele sabe o nome de quem quer trazer, não a lancha em que
+        essa pessoa está — antes tinha de ir testando viagem por viagem.
+
+        Como a troca é 1 por 1, nenhuma viagem estoura nem esvazia e não há permuta para
+        negociar. O caminho por viagem continua acessível de dentro da janela, para o caso de
+        mover alguém para uma viagem com vaga livre.
+        """
+        from .distribuicao.filler import apply_pairs, pair_swap_pool
 
         frs = self._linhas_selecionadas()
         if not frs:
@@ -4604,6 +4912,64 @@ class ManifestosDistribuicaoTab(QWidget):
                 "Selecione na tabela as linhas dos passageiros que vão mudar de viagem.\n"
                 "Use Ctrl+clique para escolher vários e Shift+clique para um bloco.")
             return
+
+        pool = pair_swap_pool(frs, self._filled_rows, self._trips,
+                              resolver=self._resolver())
+        if pool is None:
+            QMessageBox.warning(
+                self, "Trocar Viagem",
+                "Não foi possível identificar origem e destino de alguma das linhas "
+                "selecionadas, então não há como saber quais viagens as atendem.")
+            return
+
+        if not pool.candidatos:
+            QMessageBox.information(
+                self, "Trocar Viagem",
+                "Não há nenhum passageiro em outra viagem que possa trocar de lugar com os "
+                "selecionados.\n\nUse \"Mover para outra viagem\" se a intenção é levá-los "
+                "para uma viagem com vaga livre.")
+            self._mover_para_viagem(frs)
+            return
+
+        dlg = _TrocaParesDialog(frs, pool, parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        if dlg.modo == _TrocaParesDialog._MODO_VIAGEM:
+            self._mover_para_viagem(frs)
+            return
+
+        pares = dlg.pares()
+        if not pares:
+            return
+
+        apply_pairs(pares, pool)
+        self._renumerar()
+
+        linhas = [f"{sai.dados_row.name or '?'}  ⇄  {entra.dados_row.name or '?'}"
+                  for sai, entra in pares[:12]]
+        if len(pares) > 12:
+            linhas.append(f"... e mais {len(pares) - 12}")
+        QMessageBox.information(
+            self, "Trocar Viagem",
+            f"{len(pares)} troca(s) aplicada(s):\n\n" + "\n".join(linhas) +
+            "\n\nLembre de salvar na planilha: a troca vale só nesta sessão.")
+
+    def _mover_para_viagem(self, frs: list) -> None:
+        """Caminho por viagem: move os pax selecionados para outra viagem programada.
+
+        Deixou de ser o caminho principal — virou o botao "Mover para outra viagem..." de
+        dentro do `_TrocaParesDialog` — porque exige que o operador saiba de antemao em qual
+        viagem esta quem ele quer trazer. Continua sendo o unico caminho para mover alguem
+        para uma viagem com **vaga livre**, em que nao ha par para montar.
+
+        Quando a viagem de destino não tem vaga para todos, a diferença sai por permuta: quem
+        sai assume as vagas que o lote está liberando, então nenhuma viagem estoura nem
+        esvazia. A decisão de quais viagens servem, quem está em cada uma, quem pode ceder o
+        lugar e para onde cada um vai fica toda no `filler` — aqui só entra a conversa.
+        """
+        from .distribuicao.filler import (
+            batch_swap_candidates, batch_swap_options, match_displaced, swap_vacancies,
+        )
 
         resolver = self._resolver()
         resultado = batch_swap_options(frs, self._filled_rows, self._trips,
@@ -4697,16 +5063,7 @@ class ManifestosDistribuicaoTab(QWidget):
                 fr.horario = vaga.horario
                 fr.status = "auto"
 
-        # A numeração conta as viagens que levam pax de cada tipo, então depois de mover
-        # alguém ela tem de ser refeita — reaproveitar o mapa antigo deixaria o Nº Viagem em
-        # branco, sem aviso, para quem entrou numa viagem que antes não levava ninguém do
-        # tipo dele.
-        self._n_viagem_map = rebuild_n_viagem(
-            self._filled_rows, self._trips, extra_aliases=PLATFORM_EQUIVALENCES)
-        _assign_n_viagem(self._filled_rows, self._n_viagem_map)
-
-        self._trocas_pendentes += 1
-        self._populate_table()
+        self._renumerar()
 
         linhas = [f"{len(entram)} passageiro(s) → {self._viagem_txt(destino)}"]
         if saindo:
@@ -6142,6 +6499,11 @@ class MainWindow(QMainWindow):
                 gridline-color: #ecf0f1;
                 selection-background-color: #3498db;
                 border: 1px solid #dcdcdc;
+            }
+            QTableWidget#tabelaDistribuicao::item:selected,
+            QTableWidget#tabelaDistribuicao::item:selected:!active {
+                background-color: #1f618d;
+                color: #ffffff;
             }
             QHeaderView::section {
                 background-color: #ecf0f1;

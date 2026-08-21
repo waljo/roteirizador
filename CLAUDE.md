@@ -1060,11 +1060,155 @@ ocupação por viagem em vez de por trecho.
 da tabela e não podem mais ser trocados. O fluxo previsto é processar → trocar → salvar. Para
 mexer depois, limpe as colunas na planilha e processe de novo.
 
-**A troca não impede cruzar turno.** No par M6 a operação tem duas viagens (05:30 dia e 16:45
+**A troca não impede cruzar turno** — nem pelo caminho por viagem, nem pela troca pareada. No par M6 a operação tem duas viagens (05:30 dia e 16:45
 noite) e as duas atendem o mesmo movimento canônico, então as duas são oferecidas. O
 `_night_leg_position`, que resolve isso na alocação automática, **não** é aplicado aqui: a
 troca é um pedido explícito do operador e ele vê lancha e horário na lista. Mas nada avisa que
 aquela é a viagem da outra turma.
+
+---
+
+## Feature: troca pareada — duas listas lado a lado
+
+### O que estava lento
+
+O caminho por viagem (`Trocar Viagem` → escolher a viagem de destino) pede do operador
+exatamente a informação que ele não tem. Ele sabe o **nome** de quem o cliente mandou trazer;
+não sabe em qual lancha essa pessoa está. Acabava abrindo viagem por viagem para descobrir —
+e cada tentativa era uma janela inteira.
+
+Relato do operador, na íntegra do que importa: *"eu não sei em que barco o pax que eu quero
+trazer está, então tenho que ficar testando"*.
+
+### A inversão
+
+Escolher a **pessoa**, não a viagem. A viagem vem de onde ela já está.
+
+```
+Lista 1 (esquerda)                     Lista 2 (direita)
+os pax que o operador selecionou       todos os que podem trocar com eles,
+na tabela                              agregados de TODAS as lanchas
+```
+
+Para cada linha da esquerda que não deveria estar ali, o operador marca à esquerda e clica no
+substituto à direita. Duas listas, dois cliques por troca, quantas trocas quiser antes de
+confirmar.
+
+### Por que não há permuta a negociar
+
+A troca pareada é sempre **1 por 1**: cada um assume a viagem do outro. Logo toda viagem
+envolvida termina com exatamente a lotação que tinha — não há vaga para calcular, nem
+`match_displaced`, nem diálogo de permuta. Verificado com 21/08: 24 pax `TMIB → PCM-9` da
+SURFER 1905, dois pares montados (um para a 1931, outro para a 1870), `ocupação alterada:
+nenhuma`, `sem Nº Viagem com embarcação: 0`.
+
+### API (`filler.py`)
+
+```python
+@dataclass
+class PairPool:
+    slots: list[VoyageSlot]
+    atuais: dict[int, VoyageSlot | None]          # id(fr) -> viagem atual
+    movimentos: dict[int, tuple[str, str, str]]   # id(fr) -> (origem, destino, nota)
+    candidatos: list[FilledRow]
+
+pair_swap_pool(frs, filled, trips, ...) -> PairPool | None
+can_swap_pair(pool, a, b)               -> bool
+apply_pairs(pares, pool)                -> None
+```
+
+**`can_swap_pair` verifica os dois sentidos.** Cada um tem de caber na viagem do outro —
+mesma exigência do `swap_partners`, pelo mesmo motivo: sem ela a troca só empurraria o
+problema. O caso que prova a regra é o mesmo ANDERSON/PEDRO: as duas viagens vão `M9 → M8`,
+mas declaram origens de pax diferentes (o `TMIB:11, M9:8` da operação). ANDERSON, de nota
+TMIB, cabe nas duas; PEDRO, de nota M9, só na do M9. Verificar só um sentido mandaria PEDRO
+para uma viagem que a operação não programou para ele.
+
+Não são candidatos: quem já está na mesma viagem (não há o que trocar) e os pares em que os
+dois estão sob demanda. Um pax **sob demanda é candidato válido** — ele entra e o selecionado
+sai para sob demanda, que é a situação A do operador vista de trás para frente.
+
+**`apply_pairs` lê todas as viagens de origem antes de escrever qualquer uma.** Escrevendo par
+a par, um pax repetido levaria adiante o destino já alterado. A janela impede o par duplo, mas
+a função é a fonte da troca e não pode depender disso.
+
+### Interface (`_TrocaParesDialog`)
+
+Substitui o `_TrocarViagemDialog` como caminho principal. Duas tabelas num `QSplitter`, cada
+uma com busca por nome:
+
+| Esquerda | Direita |
+|---|---|
+| Nome · Orig → Dest · Viagem atual · **Entra no lugar** | Nome · Orig → Dest · Viagem atual · **Sai no lugar de** |
+
+- Clicar à esquerda marca a linha em **amarelo e negrito** — é quem sai.
+- Clicar à direita monta o par; as duas linhas ficam **verdes** e se nomeiam mutuamente.
+- Quem não pode trocar com a linha ativa aparece em **cinza**, com o motivo no rodapé. Cinza
+  em vez de sumir da lista: o operador procura por nome e não pode achar que a pessoa não está
+  no dia.
+- Clicar num candidato **já usado** o passa para a linha ativa. Desfazer em silêncio era o
+  comportamento inicial e deixava a linha ativa sem par nenhum — o operador clicava achando
+  que tinha montado a troca. Sem ninguém ativo, clicar num par desfaz.
+- **Sem avanço automático** depois de montar um par. Avançar sozinho parece útil, mas com a
+  lista da direita filtrada por busca o clique seguinte parearia a linha errada sem que nada
+  avisasse.
+- `Desfazer par`, `Limpar todos`, contador `N troca(s) montada(s)` e o OK só habilitado com
+  pelo menos um par.
+
+**O caminho antigo continua**, no botão `Mover para outra viagem...` de dentro da janela, e é
+para onde o `_trocar_viagem` cai sozinho quando não há nenhum candidato a par. É o único jeito
+de mover alguém para uma viagem com **vaga livre**, em que não existe par para montar; toda a
+máquina de `batch_swap_options` / `swap_vacancies` / `match_displaced` fica no
+`_mover_para_viagem(frs)`, inalterada.
+
+### Efeito colateral bom: a seleção misturada deixou de ser um beco
+
+Com a troca por viagem, 24 pax `TMIB → PCM-9` mais um `TMIB → PCB-1` na seleção davam
+interseção vazia e **nada** podia ser feito — era o erro reportado em 21/08. Na troca pareada
+a seleção mista funciona: os 24 pareiam normalmente e só o ABNADAB fica com a lista inteira em
+cinza, com o motivo escrito. Reproduzido com os arquivos reais: `45/45 em cinza` para ele,
+`0/45` para os outros.
+
+A mensagem por movimentação e o filtro **Destino** continuam valendo — são o que ajuda a
+montar um lote homogêneo quando a intenção é usar o caminho por viagem.
+
+### Fix — o realce da seleção sumia quando o foco saía da tabela
+
+**Sintoma relatado**: *"essa seleção está ruim de ver, não fica destacado"*.
+
+**Causa**: cada linha da tabela tem fundo próprio (a cor do status — verde, cinza, laranja) e,
+quando o foco sai da tabela — que é exatamente o que acontece assim que o operador clica em
+**Trocar Viagem** —, o Qt pinta a seleção com o grupo **Inactive** da paleta, um cinza claro
+que desaparece sobre essas cores.
+
+**Solução**: `objectName = "tabelaDistribuicao"` na tabela e, na folha de estilo da janela:
+
+```css
+QTableWidget#tabelaDistribuicao::item:selected,
+QTableWidget#tabelaDistribuicao::item:selected:!active {
+    background-color: #1f618d;
+    color: #ffffff;
+}
+```
+
+O `:!active` é a metade que resolve o problema relatado. Escopo por `objectName` para não
+alterar as tabelas de escolha de passageiro, cuja marca é o check verde.
+
+**Verificado por pixel**, com a tabela sem foco: linha selecionada `#1f618d`, linha vizinha
+`#d4edda` (a cor do status). Antes as duas ficavam na cor do status.
+
+### Testes
+
+`TrocaPareadaTests` (8) e `TrocaPareadaUiTests` (8) — 190 no total. Mutações que a suíte pega:
+
+| Mutação | Falhas |
+|---|---|
+| `can_swap_pair` verificando só um sentido | 2 |
+| `apply_pairs` escrevendo par a par | 1 |
+| candidatos da própria viagem entrando na lista | 2 |
+| candidato usado servindo a duas linhas | 1 |
+| a janela não validando o par antes de montar | 1 |
+| índice fora do `Qt.UserRole` (a busca pareia errado) | 1 |
 
 ---
 
@@ -1201,9 +1345,9 @@ Duas outras proteções, ambas descobertas apontando o seletor para `Downloads`,
 
 ### Testes
 
-174 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
+190 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
 `pip install` falha no certificado TLS do Netskope). Os do módulo de distribuição estão em
-`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (94).
+`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (110).
 
 ```bash
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
@@ -1228,7 +1372,7 @@ respectivamente). Um teste que não falha quando o bug volta não protege nada.
 
 ### Testes da classificação (`tests/test_distribuicao_filler.py`)
 
-94 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
+110 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
 para ligar a regra ao caso que a originou.
 
 | Grupo | O que protege |
@@ -1248,6 +1392,8 @@ para ligar a regra ao caso que a originou.
 | `SelecaoDesmarcadaTests` | desmarcar no diálogo não deixar rastro de embarcação |
 | `PlanilhaEscritaTests` | linha sem embarcação sai com as quatro colunas em branco; lixo antigo é limpo; a regra é a embarcação, não o status |
 | `TrocaViagemTests` | a troca manual: só viagens programadas são oferecidas, ocupação por trecho, o par da permuta tem de caber na origem, numeração refeita, o cenário M9→M8 manhã/tarde |
+| `TrocaPareadaTests` | a troca por pessoa: o agregado de todas as lanchas, o par nos dois sentidos, quem já está na viagem fora da lista, o sob demanda como candidato, e o `apply_pairs` lendo antes de escrever |
+| `TrocaPareadaUiTests` | a janela das duas listas: clique sem linha ativa, par montado e ativo limpo, candidato usado passando para a linha ativa, a busca não pareando errado, o par impossível recusado com o motivo |
 | `ReprocessTests` | o reprocessamento não gastar de novo as vagas ocupadas: nada de novo diálogo, o pax recusado não entra sozinho, nome curto e horário arredondado descontando, o par dia/noite do M6 nos dois sentidos, numeração preservada |
 | `GabaritoIntegrationTests` | as 244 de 263 linhas contra a planilha do operador, e a asserção de que as 19 restantes são exatamente 13 de horário + 5 de EMBARQUE + 1 de nº viagem. `skipUnless` |
 
@@ -1317,7 +1463,7 @@ são erro do sistema:
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
 cd /mnt/c/Users/ka20/roteirizador/appDesktopV2
 
-# Suíte completa — 174 testes, em unittest (stdlib)
+# Suíte completa — 190 testes, em unittest (stdlib)
 $PY -m unittest discover -s tests -v
 
 # Um arquivo só

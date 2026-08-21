@@ -609,6 +609,118 @@ def match_displaced(
     return destino_de
 
 
+@dataclass
+class PairPool:
+    """O material de uma troca pareada: quem esta onde e quem pode trocar com quem.
+
+    A troca pareada e sempre 1 por 1, entao a lotacao de toda viagem envolvida fica
+    exatamente como estava — nao ha vaga para calcular nem permuta para negociar. E a forma
+    que o operador pediu: olhando a lista que ele selecionou, para cada pax que nao deveria
+    estar ali ele escolhe na segunda lista quem entra no lugar.
+
+    A diferenca para o `batch_swap_options` e de ponto de partida. La o operador escolhe
+    primeiro a **viagem** de destino, e para isso precisa saber em que lancha esta o pax que
+    ele quer trazer — que e justamente o que ele nao sabe. Aqui ele escolhe a **pessoa**, e a
+    viagem sai de onde ela ja esta.
+    """
+    slots: list[VoyageSlot]
+    atuais: dict[int, VoyageSlot | None]              # id(fr) -> viagem atual
+    movimentos: dict[int, tuple[str, str, str]]       # id(fr) -> (origem, destino, nota)
+    candidatos: list[FilledRow]
+
+
+def can_swap_pair(pool: PairPool, a: FilledRow, b: FilledRow) -> bool:
+    """A troca 1 por 1 entre estes dois e uma troca que a operacao programou?
+
+    Cada um tem de caber na viagem do outro — mesma exigencia do `swap_partners`, pelo mesmo
+    motivo: sem ela a troca so empurraria o problema, mandando quem sai para uma viagem que
+    nao passa no destino dele.
+    """
+    if a is b:
+        return False
+    sa, sb = pool.atuais.get(id(a)), pool.atuais.get(id(b))
+    if sa is None and sb is None:
+        return False                     # os dois sob demanda: nao ha o que trocar
+    if _same_voyage(sa, sb):
+        return False                     # ja estao na mesma viagem
+    ma, mb = pool.movimentos.get(id(a)), pool.movimentos.get(id(b))
+    if ma is None or mb is None:
+        return False
+    if sb is not None and not _matches(sb.leg, *ma):
+        return False
+    if sa is not None and not _matches(sa.leg, *mb):
+        return False
+    return True
+
+
+def pair_swap_pool(
+    frs: list[FilledRow],
+    filled: list[FilledRow],
+    trips: list[VesselTrip],
+    resolver: AliasResolver | None = None,
+    extra_aliases: dict[str, str] | None = None,
+) -> PairPool | None:
+    """Os candidatos a troca com os selecionados, agregados de **todas** as viagens.
+
+    Agregar e o ponto: o operador sabe o nome de quem quer trazer, nao a lancha em que essa
+    pessoa esta. Devolve None quando alguma das linhas selecionadas nao da para casar.
+    """
+    if resolver is None:
+        resolver = AliasResolver(explicit=extra_aliases or {})
+    if not frs:
+        return None
+
+    slots = voyage_slots(trips)
+    pool = PairPool(slots=slots, atuais={}, movimentos={}, candidatos=[])
+
+    def registra(fr: FilledRow) -> bool:
+        movement = _row_platforms(fr.dados_row, resolver)
+        if movement is None:
+            return False
+        pool.movimentos[id(fr)] = movement
+        pool.atuais[id(fr)] = current_slot(fr, slots, movement)
+        return True
+
+    for fr in frs:
+        if not registra(fr):
+            return None
+
+    selecionados = {id(fr) for fr in frs}
+    for outro in filled:
+        if id(outro) in selecionados or not registra(outro):
+            continue
+        if any(can_swap_pair(pool, fr, outro) for fr in frs):
+            pool.candidatos.append(outro)
+    pool.candidatos.sort(key=lambda fr: _normalize_name(fr.dados_row.name))
+    return pool
+
+
+def apply_pairs(pares: list[tuple[FilledRow, FilledRow]], pool: PairPool) -> None:
+    """Executa as trocas: cada um dos dois assume a viagem do outro.
+
+    Le todas as viagens de origem **antes** de escrever qualquer uma. Escrevendo par a par,
+    um pax que aparecesse em dois pares levaria o destino ja alterado para o segundo. A UI
+    impede o par duplo, mas a funcao nao pode depender disso.
+    """
+    destinos: list[tuple[FilledRow, VoyageSlot | None]] = []
+    for a, b in pares:
+        destinos.append((a, pool.atuais.get(id(b))))
+        destinos.append((b, pool.atuais.get(id(a))))
+
+    for fr, slot in destinos:
+        if slot is None:
+            fr.embarcacao = None
+            fr.horario = None
+            fr.n_viagem = None
+            fr.status = "sob_demanda"
+        else:
+            fr.embarcacao = slot.vessel
+            fr.horario = slot.horario
+            fr.status = "auto"
+    for fr, slot in destinos:
+        pool.atuais[id(fr)] = slot
+
+
 def rebuild_n_viagem(
     filled: list[FilledRow],
     trips: list[VesselTrip],

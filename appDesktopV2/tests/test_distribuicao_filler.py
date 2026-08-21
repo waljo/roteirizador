@@ -21,6 +21,9 @@ from roteirizador_desktop.distribuicao import (
 )
 from roteirizador_desktop.distribuicao.filler import (
     _round_horario,
+    apply_pairs,
+    can_swap_pair,
+    pair_swap_pool,
     batch_swap_candidates,
     batch_swap_options,
     match_displaced,
@@ -1395,6 +1398,271 @@ class GabaritoIntegrationTests(unittest.TestCase):
                 outros.append(er)
         self.assertEqual((horario, embarque, viagem), (3, 5, 1))
         self.assertEqual(outros, [])
+
+
+class TrocaPareadaTests(unittest.TestCase):
+    """A troca escolhendo a PESSOA em vez da viagem.
+
+    O caminho por viagem exige que o operador saiba de antemão em qual lancha está quem ele
+    quer trazer — e é justamente isso que ele não sabe: acabava testando viagem por viagem.
+    Aqui as duas listas ficam lado a lado, a da direita agregando todas as lanchas, e a troca
+    é sempre 1 por 1, então nenhuma viagem estoura nem esvazia.
+    """
+
+    @staticmethod
+    def _tres_lanchas():
+        """6 pax M9 → M8 em três viagens de 2, para o agregado ter de fato o que agregar."""
+        rows = [row(i, f"PAX{i}", "PCM-9", "PCM-9", "PCM-8") for i in range(1, 7)]
+        trips = [
+            VesselTrip("SURFER 1870", [
+                leg("SURFER 1870", "PCM-09", "PCM-08", time(6, 0), pax_origin="PCM-09", pax=2)]),
+            VesselTrip("SURFER 1905", [
+                leg("SURFER 1905", "PCM-09", "PCM-08", time(10, 0), pax_origin="PCM-09", pax=2)]),
+            VesselTrip("SURFER 1931", [
+                leg("SURFER 1931", "PCM-09", "PCM-08", time(14, 0), pax_origin="PCM-09", pax=2)]),
+        ]
+        return rows, trips
+
+    @staticmethod
+    def _ocupacao(filled):
+        conta: dict = {}
+        for fr in filled:
+            if fr.embarcacao:
+                chave = (fr.embarcacao, fr.horario)
+                conta[chave] = conta.get(chave, 0) + 1
+        return conta
+
+    def test_the_pool_aggregates_candidates_from_every_vessel(self):
+        """O ponto da mudança: a lista da direita vem de todas as lanchas de uma vez."""
+        rows, trips = self._tres_lanchas()
+        filled, _, _ = run(rows, trips)
+        sel = [fr for fr in filled if fr.horario == time(6, 0)]
+        self.assertEqual(len(sel), 2)
+
+        pool = pair_swap_pool(sel, filled, trips)
+        self.assertEqual(
+            sorted(fr.embarcacao for fr in pool.candidatos),
+            ["SURFER 1905", "SURFER 1905", "SURFER 1931", "SURFER 1931"],
+        )
+
+    def test_a_pair_swaps_both_ways_and_no_voyage_changes_size(self):
+        rows, trips = self._tres_lanchas()
+        filled, _, _ = run(rows, trips)
+        antes = self._ocupacao(filled)
+        sel = [fr for fr in filled if fr.horario == time(6, 0)]
+        pool = pair_swap_pool(sel, filled, trips)
+
+        # Dois pares de uma vez, cada um para uma lancha diferente.
+        b = next(c for c in pool.candidatos if c.horario == time(10, 0))
+        d = next(c for c in pool.candidatos if c.horario == time(14, 0))
+        a, c = sel[0], sel[1]
+        apply_pairs([(a, b), (c, d)], pool)
+
+        self.assertEqual((a.embarcacao, a.horario), ("SURFER 1905", time(10, 0)))
+        self.assertEqual((b.embarcacao, b.horario), ("SURFER 1870", time(6, 0)))
+        self.assertEqual((c.embarcacao, c.horario), ("SURFER 1931", time(14, 0)))
+        self.assertEqual((d.embarcacao, d.horario), ("SURFER 1870", time(6, 0)))
+        self.assertEqual(self._ocupacao(filled), antes)
+
+    def test_who_is_already_in_the_same_voyage_is_not_a_candidate(self):
+        rows, trips = self._tres_lanchas()
+        filled, _, _ = run(rows, trips)
+        sel = [fr for fr in filled if fr.horario == time(6, 0)][:1]
+        pool = pair_swap_pool(sel, filled, trips)
+        companheiro = [fr for fr in filled
+                       if fr.horario == time(6, 0) and fr is not sel[0]][0]
+        self.assertNotIn(id(companheiro), {id(c) for c in pool.candidatos})
+
+    def test_the_pair_must_fit_the_other_voyage_in_both_directions(self):
+        """O mesmo filtro do `swap_partners`, pelo mesmo motivo.
+
+        As duas viagens vão de M9 para M8, mas declaram origens de pax diferentes — é o
+        `TMIB:11, M9:8` da operação. ANDERSON (nota TMIB) cabe nas duas; PEDRO (nota M9) só
+        cabe na do M9. Sem a verificação nos dois sentidos a troca mandaria PEDRO para uma
+        viagem que a operação não programou para ele.
+        """
+        anderson = row(1, "ANDERSON", "TMIB", "PCM-9", "PCM-8")
+        pedro = row(2, "PEDRO", "PCM-9", "PCM-9", "PCM-8")
+        trips = [
+            VesselTrip("SURFER 1870", [
+                leg("SURFER 1870", "PCM-09", "PCM-08", time(6, 0), pax_origin="TMIB", pax=1)]),
+            VesselTrip("SURFER 1905", [
+                leg("SURFER 1905", "PCM-09", "PCM-08", time(14, 0), pax_origin="PCM-09", pax=1)]),
+        ]
+        filled, _, _ = run([anderson, pedro], trips)
+        got = by_excel(filled)
+        self.assertEqual(got[1].embarcacao, "SURFER 1870")
+
+        pool = pair_swap_pool([got[1]], filled, trips)
+        self.assertFalse(can_swap_pair(pool, got[1], got[2]))
+        self.assertEqual(pool.candidatos, [])
+
+    def test_two_passengers_without_a_voyage_are_not_a_pair(self):
+        """Trocar dois sob demanda entre si não move nada — não é oferta."""
+        rows, trips = self._tres_lanchas()
+        filled, _, _ = run(rows[:2], trips[:1])          # 2 pax, 2 vagas
+        for fr in filled:                                 # tira os dois da programação
+            fr.embarcacao, fr.horario, fr.n_viagem = None, None, None
+            fr.status = "sob_demanda"
+        pool = pair_swap_pool(filled[:1], filled, trips[:1])
+        self.assertFalse(can_swap_pair(pool, filled[0], filled[1]))
+        self.assertEqual(pool.candidatos, [])
+
+    def test_an_unscheduled_passenger_can_take_the_place(self):
+        """3 pax para 2 vagas: quem ficou sob demanda entra e o escolhido sai."""
+        rows, trips = self._tres_lanchas()
+        filled, _, _ = run(rows[:3], trips[:1])
+        dentro = [fr for fr in filled if fr.embarcacao]
+        fora = [fr for fr in filled if not fr.embarcacao]
+        self.assertEqual((len(dentro), len(fora)), (2, 1))
+
+        pool = pair_swap_pool([dentro[0]], filled, trips[:1])
+        self.assertEqual([c.dados_row.name for c in pool.candidatos],
+                         [fora[0].dados_row.name])
+        apply_pairs([(dentro[0], fora[0])], pool)
+        self.assertEqual((dentro[0].embarcacao, dentro[0].status),
+                         (None, "sob_demanda"))
+        self.assertEqual((fora[0].embarcacao, fora[0].horario, fora[0].status),
+                         ("SURFER 1870", time(6, 0), "auto"))
+        self.assertIsNone(dentro[0].n_viagem)
+
+    def test_apply_pairs_reads_every_origin_before_writing(self):
+        """Escrevendo par a par, um pax repetido levaria o destino já alterado adiante.
+
+        A UI impede o par duplo — um candidato marcado sai da vez —, mas a função não pode
+        depender disso: ela é a fonte da troca, e é ela que os testes protegem.
+        """
+        rows, trips = self._tres_lanchas()
+        filled, _, _ = run(rows, trips)
+        a = [fr for fr in filled if fr.horario == time(6, 0)][0]
+        pool = pair_swap_pool([a], filled, trips)
+        b = next(c for c in pool.candidatos if c.horario == time(10, 0))
+        d = next(c for c in pool.candidatos if c.horario == time(14, 0))
+
+        apply_pairs([(a, b), (a, d)], pool)
+        # `a` acaba onde o último par mandou, e os dois outros assumem a viagem que `a`
+        # tinha ao entrar — 06:00 —, não a que ela teria depois do primeiro par.
+        self.assertEqual(a.horario, time(14, 0))
+        self.assertEqual((b.embarcacao, b.horario), ("SURFER 1870", time(6, 0)))
+        self.assertEqual((d.embarcacao, d.horario), ("SURFER 1870", time(6, 0)))
+
+    def test_the_numbering_is_rebuilt_after_the_pairs(self):
+        """Sem refazer a numeração o Nº Viagem sai errado — em silêncio."""
+        rows, trips = self._tres_lanchas()
+        filled, _, mapa = run(rows, trips)
+        _assign_n_viagem(filled, mapa)
+        a = [fr for fr in filled if fr.horario == time(6, 0)][0]
+        pool = pair_swap_pool([a], filled, trips)
+        b = next(c for c in pool.candidatos if c.horario == time(14, 0))
+        self.assertEqual((a.n_viagem, b.n_viagem), (1, 3))
+
+        apply_pairs([(a, b)], pool)
+        _assign_n_viagem(filled, rebuild_n_viagem(filled, trips))
+        self.assertEqual((a.n_viagem, b.n_viagem), (3, 1))
+
+
+class TrocaPareadaUiTests(unittest.TestCase):
+    """A janela das duas listas: o que o clique faz e o que ele recusa."""
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        try:
+            from PySide6.QtWidgets import QApplication
+            from roteirizador_desktop import ui as ui_mod
+        except Exception as exc:                        # pragma: no cover
+            raise unittest.SkipTest(f"PySide6 indisponível: {exc}")
+        cls.app = QApplication.instance() or QApplication([])
+        cls.ui = ui_mod
+
+    def _janela(self):
+        rows, trips = TrocaPareadaTests._tres_lanchas()
+        filled, _, mapa = run(rows, trips)
+        _assign_n_viagem(filled, mapa)
+        sel = [fr for fr in filled if fr.horario == time(6, 0)]
+        pool = pair_swap_pool(sel, filled, trips)
+        return self.ui._TrocaParesDialog(sel, pool), sel, pool, filled
+
+    def test_the_two_lists_start_filled_and_ok_disabled(self):
+        dlg, sel, pool, _ = self._janela()
+        self.assertEqual(dlg._tab_esq.rowCount(), len(sel))
+        self.assertEqual(dlg._tab_dir.rowCount(), len(pool.candidatos))
+        self.assertEqual(dlg.pares(), [])
+
+    def test_clicking_a_candidate_without_an_active_row_does_nothing(self):
+        """Senão o primeiro clique distraído pareia com quem estivesse ativo por acaso."""
+        dlg, _, _, _ = self._janela()
+        dlg._clique_dir(0, 0)
+        self.assertEqual(dlg.pares(), [])
+        self.assertIn("Escolha primeiro", dlg._hint.text())
+
+    def test_a_pair_is_built_and_the_active_row_is_cleared(self):
+        """Sem avanço automático: com a lista filtrada, avançar em silêncio pareia errado."""
+        dlg, sel, pool, _ = self._janela()
+        dlg._clique_esq(0, 0)
+        self.assertIsNotNone(dlg._ativo)
+        dlg._clique_dir(0, 0)
+        self.assertEqual([(a.dados_row.name, b.dados_row.name) for a, b in dlg.pares()],
+                         [(sel[0].dados_row.name, pool.candidatos[0].dados_row.name)])
+        self.assertIsNone(dlg._ativo)
+
+    def test_clicking_a_paired_candidate_undoes_the_pair(self):
+        dlg, _, _, _ = self._janela()
+        dlg._clique_esq(0, 0)
+        dlg._clique_dir(0, 0)
+        dlg._clique_dir(0, 0)
+        self.assertEqual(dlg.pares(), [])
+
+    def test_a_candidate_already_used_moves_to_the_active_row(self):
+        """Nunca serve a dois: passa para a linha ativa, em vez de desfazer em silêncio.
+
+        Desfazer era o comportamento antigo e deixava a linha ativa sem par nenhum — o
+        operador clicava achando que tinha montado a troca.
+        """
+        dlg, sel, pool, _ = self._janela()
+        dlg._clique_esq(0, 0)
+        dlg._clique_dir(0, 0)
+        dlg._clique_esq(1, 0)
+        dlg._clique_dir(0, 0)
+        pares = dlg.pares()
+        self.assertEqual([(a.dados_row.name, b.dados_row.name) for a, b in pares],
+                         [(sel[1].dados_row.name, pool.candidatos[0].dados_row.name)])
+
+    def test_the_search_keeps_the_index_pointing_at_the_right_person(self):
+        """A busca reordena as linhas; o índice mora no UserRole, não na posição."""
+        dlg, _, pool, _ = self._janela()
+        alvo = pool.candidatos[-1]
+        dlg._clique_esq(0, 0)
+        dlg._busca_dir.setText(alvo.dados_row.name)
+        self.assertEqual(dlg._tab_dir.rowCount(), 1)
+        dlg._clique_dir(0, 0)
+        self.assertIs(dlg.pares()[0][1], alvo)
+
+    def test_an_impossible_pair_is_refused_with_the_reason(self):
+        anderson = row(1, "ANDERSON", "TMIB", "PCM-9", "PCM-8")
+        pedro = row(2, "PEDRO", "PCM-9", "PCM-9", "PCM-8")
+        trips = [
+            VesselTrip("SURFER 1870", [
+                leg("SURFER 1870", "PCM-09", "PCM-08", time(6, 0), pax_origin="TMIB", pax=1)]),
+            VesselTrip("SURFER 1905", [
+                leg("SURFER 1905", "PCM-09", "PCM-08", time(14, 0), pax_origin="PCM-09", pax=2)]),
+        ]
+        filled, _, _ = run([anderson, pedro], trips)
+        got = by_excel(filled)
+        # Selecionando os dois, PEDRO entra na lista da direita por causa do ANDERSON.
+        pool = pair_swap_pool([got[1]], filled, trips)
+        pool.candidatos = [got[2]]
+        dlg = self.ui._TrocaParesDialog([got[1]], pool)
+        dlg._clique_esq(0, 0)
+        dlg._clique_dir(0, 0)
+        self.assertEqual(dlg.pares(), [])
+        self.assertIn("não programou", dlg._hint.text())
+
+    def test_the_old_flow_is_still_reachable(self):
+        dlg, _, _, _ = self._janela()
+        dlg._ir_para_viagem()
+        self.assertEqual(dlg.modo, dlg._MODO_VIAGEM)
 
 
 if __name__ == "__main__":
