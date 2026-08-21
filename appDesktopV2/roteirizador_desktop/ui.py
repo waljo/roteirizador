@@ -186,8 +186,131 @@ else:
     IMPORT_ERROR = None
 
 
+_APP_STYLESHEET = """
+            QMainWindow, QWidget {
+                background-color: #f4f6f9;
+                font-family: "Segoe UI", "Helvetica Neue", "Arial", sans-serif;
+                font-size: 9pt;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #dcdcdc;
+                border-radius: 6px;
+                margin-top: 12px;
+                background-color: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 5px;
+                color: #2c3e50;
+            }
+            QPushButton {
+                background-color: #3498db;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #2980b9;
+            }
+            QPushButton:disabled {
+                background-color: #bdc3c7;
+            }
+            QTableWidget {
+                background-color: #ffffff;
+                alternate-background-color: #f9f9f9;
+                gridline-color: #ecf0f1;
+                selection-background-color: #3498db;
+                border: 1px solid #dcdcdc;
+            }
+            QTableWidget#tabelaDistribuicao::item:selected,
+            QTableWidget#tabelaDistribuicao::item:selected:!active {
+                background-color: #1f618d;
+                color: #ffffff;
+            }
+            QHeaderView::section {
+                background-color: #ecf0f1;
+                padding: 4px;
+                border: 1px solid #dcdcdc;
+                font-weight: bold;
+                color: #2c3e50;
+            }
+            QLineEdit, QTextEdit {
+                border: 1px solid #bdc3c7;
+                border-radius: 4px;
+                padding: 4px;
+                background-color: #ffffff;
+            }
+            /* O indicador da caixa de marcar TEM de ser desenhado por nos. A regra
+               `QMainWindow, QWidget` acima casa tambem o QCheckBox (o seletor de tipo do Qt
+               pega as subclasses), e ai o QStyleSheetStyle assume o desenho e o indicador
+               nativo simplesmente nao aparece. Medido com o estilo `windows11`, que e o do
+               Windows 11: com a folha aplicada o indicador fica com UMA cor — a do fundo.
+               Verde cheio = marcado, branco vazio = desmarcado; nao ha como desenhar o tique
+               por folha de estilo sem imagem, e o contraste cheio/vazio basta. */
+            QCheckBox::indicator {
+                width: 14px;
+                height: 14px;
+                border: 1px solid #9aa0a6;
+                border-radius: 3px;
+                background-color: #ffffff;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #1e8449;
+                border-color: #145a32;
+            }
+            QCheckBox::indicator:hover {
+                border-color: #2980b9;
+            }
+            QCheckBox::indicator:disabled {
+                background-color: #ecf0f1;
+                border-color: #cfd4d8;
+            }
+            QListWidget {
+                border: 1px solid #dcdcdc;
+                background-color: #ffffff;
+            }
+            QListWidget::item {
+                padding: 8px;
+            }
+            QListWidget::item:selected {
+                background-color: #3498db;
+                color: white;
+            }
+            QTabWidget::pane {
+                border: 1px solid #dcdcdc;
+                background-color: #ffffff;
+            }
+            QTabBar::tab {
+                background: #ecf0f1;
+                padding: 8px 16px;
+                margin-right: 2px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }
+            QTabBar::tab:selected {
+                background: #ffffff;
+                border-bottom: 2px solid #3498db;
+            }
+"""
+
 def _make_color(hex_color: str):
     return QBrush(QColor(hex_color))
+
+
+def _sem_acento(texto: str) -> str:
+    """Texto em caixa alta e sem acento, para buscar e ordenar nomes.
+
+    Os dois usos vem do mesmo defeito: 8 dos nomes de 21/08 tem acento, e o operador digita
+    sem. Buscar `joao bispo` nao achava `JOÃO BISPO DOS SANTOS FILHO` — e, pior, `joao`
+    achava o `JOAO FERREIRA` sem acento, dando a impressao de que a busca funcionava e de que
+    o pax procurado nao estava na lista.
+    """
+    decomposto = unicodedata.normalize("NFKD", texto or "")
+    return "".join(c for c in decomposto if not unicodedata.combining(c)).upper()
 
 
 # Marca de selecao das tabelas de escolha de passageiro. O indicador nativo do Qt e um
@@ -4124,9 +4247,8 @@ class _TrocaParesDialog(QDialog):
     # ----- ordenacao ----------------------------------------------------------------
     @staticmethod
     def _chave_ordem(texto: str) -> str:
-        """Sem acento e em caixa alta: senao ANDRÉ cai depois de ANTONIO."""
-        sem_acento = unicodedata.normalize("NFKD", texto or "")
-        return "".join(c for c in sem_acento if not unicodedata.combining(c)).upper()
+        """Sem acento: a letra acentuada vale mais que Z e joga o nome para o fim."""
+        return _sem_acento(texto)
 
     def _ordenar(self, lado: str, col: int) -> None:
         atual = self._ordem_esq if lado == "esq" else self._ordem_dir
@@ -4146,9 +4268,9 @@ class _TrocaParesDialog(QDialog):
 
     # ----- render -----------------------------------------------------------------
     def _visiveis(self, frs: list, busca, ordem, valores) -> list:
-        termo = busca.text().strip().lower()
+        termo = _sem_acento(busca.text().strip())
         if termo:
-            frs = [fr for fr in frs if termo in (fr.dados_row.name or "").lower()]
+            frs = [fr for fr in frs if termo in _sem_acento(fr.dados_row.name)]
         return self._ordenados(list(frs), ordem, valores)
 
     def _render(self) -> None:
@@ -4706,7 +4828,8 @@ class ManifestosDistribuicaoTab(QWidget):
             combo.blockSignals(False)
 
     def _apply_filters(self) -> None:
-        nome_filter = self._filter_nome.text().strip().lower()
+        # Mesmo tratamento da busca da janela de troca: o operador digita sem acento.
+        nome_filter = _sem_acento(self._filter_nome.text().strip())
         emb_filter = self._filter_embarcacao.currentText()
         dest_filter = self._filter_destino.currentText()
         tipo_filter = self._filter_tipo.currentText()
@@ -4718,7 +4841,7 @@ class ManifestosDistribuicaoTab(QWidget):
                 return item.text() if item else ""
 
             show = True
-            if nome_filter and nome_filter not in cell(0).lower():
+            if nome_filter and nome_filter not in _sem_acento(cell(0)):
                 show = False
             if emb_filter != "(Todas)" and cell(3) != emb_filter:
                 show = False
@@ -6594,91 +6717,7 @@ class MainWindow(QMainWindow):
 
     def _apply_styles(self) -> None:
         # Premium / Modern Style Sheet
-        self.setStyleSheet("""
-            QMainWindow, QWidget {
-                background-color: #f4f6f9;
-                font-family: "Segoe UI", "Helvetica Neue", "Arial", sans-serif;
-                font-size: 9pt;
-            }
-            QGroupBox {
-                font-weight: bold;
-                border: 1px solid #dcdcdc;
-                border-radius: 6px;
-                margin-top: 12px;
-                background-color: #ffffff;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                subcontrol-position: top left;
-                padding: 0 5px;
-                color: #2c3e50;
-            }
-            QPushButton {
-                background-color: #3498db;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 8px 14px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #2980b9;
-            }
-            QPushButton:disabled {
-                background-color: #bdc3c7;
-            }
-            QTableWidget {
-                background-color: #ffffff;
-                alternate-background-color: #f9f9f9;
-                gridline-color: #ecf0f1;
-                selection-background-color: #3498db;
-                border: 1px solid #dcdcdc;
-            }
-            QTableWidget#tabelaDistribuicao::item:selected,
-            QTableWidget#tabelaDistribuicao::item:selected:!active {
-                background-color: #1f618d;
-                color: #ffffff;
-            }
-            QHeaderView::section {
-                background-color: #ecf0f1;
-                padding: 4px;
-                border: 1px solid #dcdcdc;
-                font-weight: bold;
-                color: #2c3e50;
-            }
-            QLineEdit, QTextEdit {
-                border: 1px solid #bdc3c7;
-                border-radius: 4px;
-                padding: 4px;
-                background-color: #ffffff;
-            }
-            QListWidget {
-                border: 1px solid #dcdcdc;
-                background-color: #ffffff;
-            }
-            QListWidget::item {
-                padding: 8px;
-            }
-            QListWidget::item:selected {
-                background-color: #3498db;
-                color: white;
-            }
-            QTabWidget::pane {
-                border: 1px solid #dcdcdc;
-                background-color: #ffffff;
-            }
-            QTabBar::tab {
-                background: #ecf0f1;
-                padding: 8px 16px;
-                margin-right: 2px;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
-            }
-            QTabBar::tab:selected {
-                background: #ffffff;
-                border-bottom: 2px solid #3498db;
-            }
-        """)
+        self.setStyleSheet(_APP_STYLESHEET)
 
     def reload_config(self) -> None:
         app_config = self.service.load_app_config()

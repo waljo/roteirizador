@@ -892,6 +892,64 @@ linha correspondente no Dados.
 
 ---
 
+### Fix — a busca por nome não achava quem tem acento
+
+**Sintoma relatado** (21/08): com 10 pax da SURFER 1931 selecionados, o operador buscou
+`joao bispo` na lista de candidatos e não veio nada — mas JOÃO BISPO DOS SANTOS FILHO
+(SURFER 1870 · 10:30) **estava** no pool. Conferido: `pair_swap_pool` o traz entre os 45
+candidatos.
+
+**Causa**: a busca comparava texto cru (`termo in nome.lower()`), e `joao bispo` não está
+dentro de `joão bispo dos santos filho`. São 8 nomes com acento no dia.
+
+**Pior que não achar**: buscar `joao` trazia **um** resultado — o JOAO FERREIRA DA SILVA, que
+é outra pessoa e não tem acento. A busca parecia funcionar e dava a impressão de que o pax
+procurado não estava na lista.
+
+**Solução**: `_sem_acento(texto)` no nível do módulo, aplicada aos **dois** lados da
+comparação. Usada pelas duas buscas da janela de troca, pela chave de ordenação (que já fazia
+isso por conta própria e agora delega) e pelo **filtro Nome da barra da aba**, que tinha o
+mesmo defeito pelo mesmo motivo.
+
+Depois: `joao bispo` → 1, `joao` → 2 (os dois Joões).
+
+### Fix — as caixas de marcar não apareciam no Windows 11
+
+**Sintoma**: na barra `Mostrar:` das lanchas o operador via só os nomes, sem caixa nenhuma —
+não havia como saber o que estava ligado. Confirmado ampliando a captura de tela: o espaço do
+indicador existe e nada é desenhado nele.
+
+**Causa**: a regra `QMainWindow, QWidget { background-color: ... }` da folha de estilo casa
+**também** o QCheckBox — o seletor de tipo do Qt pega as subclasses. Com isso o
+`QStyleSheetStyle` assume o desenho do widget e o indicador nativo deixa de ser pintado, a
+menos que a folha diga como desenhá-lo.
+
+Medido com o estilo `windows11`, que é o do Windows 11 do operador:
+
+| Estilo | Sem a folha | Com a folha |
+|---|---|---|
+| `windows11` | 8 cores no indicador | **1 cor** — a do fundo |
+| `windowsvista` | 2 cores | 2 cores |
+| `fusion` (é o do headless) | 30 cores | 29 cores |
+
+Só o `windows11` some, e é justamente o estilo em uso — o que explica o defeito não ter
+aparecido em nenhum teste headless.
+
+**Alcance**: era **global**. Toda caixa de marcar do aplicativo estava invisível no
+Windows 11, não só as novas.
+
+**Solução**: regra própria para `QCheckBox::indicator` na folha — **verde cheio** quando
+marcado, **branco vazio** quando não. Não há como desenhar o tique por folha de estilo sem
+imagem, e o contraste cheio/vazio basta.
+
+A folha saiu de dentro do `MainWindow._setup_ui` para a constante de módulo
+`_APP_STYLESHEET`, para o teste poder aplicá-la e medir o pixel do indicador.
+
+**Testes**: `BuscaComAcentoTests` (5), 207 no total. Mutações que a suíte pega: busca da janela
+sensível a acento (3 falhas), filtro Nome da aba sensível a acento (1), e remover a regra do
+indicador (1) — este último renderiza a caixa com o estilo `windows11` e compara a cor
+dominante do indicador marcado (`#1e8449`) e desmarcado (`#ffffff`).
+
 ### Fix — a linha única da esquerda precisava de um clique que nada indicava
 
 **Sintoma relatado** (21/08): com **um** passageiro selecionado, o operador buscou o
@@ -1290,7 +1348,7 @@ alterar as tabelas de escolha de passageiro, cuja marca é o check verde.
 
 ### Testes
 
-`TrocaPareadaTests` (8) e `TrocaPareadaUiTests` (18) — 202 no total. Mutações que a suíte pega:
+`TrocaPareadaTests` (8) e `TrocaPareadaUiTests` (18) — 207 no total. Mutações que a suíte pega:
 
 | Mutação | Falhas |
 |---|---|
@@ -1439,9 +1497,9 @@ Duas outras proteções, ambas descobertas apontando o seletor para `Downloads`,
 
 ### Testes
 
-202 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
+207 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
 `pip install` falha no certificado TLS do Netskope). Os do módulo de distribuição estão em
-`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (122).
+`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (127).
 
 ```bash
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
@@ -1466,7 +1524,7 @@ respectivamente). Um teste que não falha quando o bug volta não protege nada.
 
 ### Testes da classificação (`tests/test_distribuicao_filler.py`)
 
-122 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
+127 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
 para ligar a regra ao caso que a originou.
 
 | Grupo | O que protege |
@@ -1481,6 +1539,7 @@ para ligar a regra ao caso que a originou.
 | `FillRowsScenarioTests` | 11 cenários montados à mão: bate-volta/embarque na mesma viagem, legs concorrentes, teto do `pax_disembark`, viagem vazia não consumindo número, desempate por ordem da operação, uma viagem com um horário |
 | `FiltroDestinoTests` | a mensagem nomeando a linha intrusa e o filtro Destino isolando o lote |
 | `SelecaoFiltradaTests` | a linha escondida pelo filtro não entrar na seleção do Shift+clique |
+| `BuscaComAcentoTests` | a busca achar quem tem acento no nome, e o indicador da caixa de marcar ser desenhado no estilo do Windows 11 |
 | `TrocaEmLoteTests` | interseção das viagens, vagas vindas de quem tinha viagem, emparelhamento máximo dos deslocados, recusa quando a troca não fecha, e o cenário dos 71 pax da GAD |
 | `ArredondamentoHorarioTests` | múltiplo de 10 mais próximo, empate intacto, virada de hora e de dia, e a numeração não reordenando |
 | `TabelaCompletaTests` | as linhas já preenchidas aparecem, o índice do UserRole aponta para a lista certa, e editar uma delas marca para gravar |
@@ -1558,7 +1617,7 @@ são erro do sistema:
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
 cd /mnt/c/Users/ka20/roteirizador/appDesktopV2
 
-# Suíte completa — 202 testes, em unittest (stdlib)
+# Suíte completa — 207 testes, em unittest (stdlib)
 $PY -m unittest discover -s tests -v
 
 # Um arquivo só

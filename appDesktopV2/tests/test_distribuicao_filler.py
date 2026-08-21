@@ -1845,5 +1845,123 @@ class SelecaoFiltradaTests(unittest.TestCase):
         self.assertEqual(len(aba._linhas_selecionadas()), len(feitas))
 
 
+class BuscaComAcentoTests(unittest.TestCase):
+    """O operador digita sem acento, e 8 dos nomes de 21/08 têm acento.
+
+    Relatado: buscando `joao bispo` na lista de candidatos, a janela não trazia nada — e
+    JOÃO BISPO DOS SANTOS FILHO estava no pool. Pior que não achar: `joao` achava o
+    JOAO FERREIRA, que é outra pessoa, dando a impressão de que a busca funcionava e de que
+    o procurado não estava na lista.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        try:
+            from PySide6.QtWidgets import QApplication
+            from roteirizador_desktop import ui as ui_mod
+        except Exception as exc:                        # pragma: no cover
+            raise unittest.SkipTest(f"PySide6 indisponível: {exc}")
+        cls.app = QApplication.instance() or QApplication([])
+        cls.ui = ui_mod
+
+    @staticmethod
+    def _com_acento():
+        """Os dois Joões reais de 21/08: o procurado tem acento, o outro não."""
+        return ["JOÃO BISPO DOS SANTOS FILHO", "JOAO FERREIRA DA SILVA"]
+
+    def _janela(self, nomes):
+        from roteirizador_desktop.distribuicao.filler import pair_swap_pool
+        rows, trips = TrocaPareadaTests._tres_lanchas()
+        for r, nome in zip(rows[2:], nomes):            # os candidatos, nao os selecionados
+            r.name = nome
+            r.desc = f"PCM-9: {nome}"
+        filled, _, mapa = run(rows, trips)
+        _assign_n_viagem(filled, mapa)
+        sel = [fr for fr in filled if fr.horario == time(6, 0)]
+        pool = pair_swap_pool(sel, filled, trips)
+        return self.ui._TrocaParesDialog(sel, pool)
+
+    def test_searching_without_the_accent_finds_the_accented_name(self):
+        dlg = self._janela(self._com_acento())
+        dlg._busca_dir.setText("joao bispo")
+        self.assertEqual([dlg._tab_dir.item(r, 0).text()
+                          for r in range(dlg._tab_dir.rowCount())],
+                         ["JOÃO BISPO DOS SANTOS FILHO"])
+
+    def test_the_unaccented_namesake_is_not_the_only_hit(self):
+        """`joao` tem de trazer os dois — antes trazia só o sem acento."""
+        dlg = self._janela(self._com_acento())
+        dlg._busca_dir.setText("joao")
+        self.assertEqual(dlg._tab_dir.rowCount(), 2)
+
+    def test_the_left_list_search_does_the_same(self):
+        from roteirizador_desktop.distribuicao.filler import pair_swap_pool
+        rows, trips = TrocaPareadaTests._tres_lanchas()
+        rows[0].name = "JOÃO BISPO DOS SANTOS FILHO"
+        rows[0].desc = "PCM-9: JOÃO BISPO DOS SANTOS FILHO"
+        filled, _, mapa = run(rows, trips)
+        _assign_n_viagem(filled, mapa)
+        sel = [fr for fr in filled if fr.horario == time(6, 0)]
+        dlg = self.ui._TrocaParesDialog(sel, pair_swap_pool(sel, filled, trips))
+        dlg._busca_esq.setText("joao bispo")
+        self.assertEqual(dlg._tab_esq.rowCount(), 1)
+
+    def test_the_name_filter_of_the_main_table_does_the_same(self):
+        """Mesmo defeito, mesma classe: o operador digita sem acento nos dois lugares."""
+        from roteirizador_desktop.distribuicao.models import FilledRow
+        feitas = []
+        for i, nome in enumerate(self._com_acento(), start=1):
+            dr = row(i, nome, "TMIB", "TMIB", "PCM-9")
+            feitas.append(FilledRow(dados_row=dr, embarcacao="SURFER 1905",
+                                    horario=time(6, 30), n_viagem=2,
+                                    tipo_viagem="EMBARQUE", status="auto"))
+        aba = self.ui.ManifestosDistribuicaoTab(None)
+        aba._filled_rows = feitas
+        aba._populate_table()
+        aba._filter_nome.setText("joao bispo")
+        aba._apply_filters()
+        visiveis = [aba._table.item(r, 0).text() for r in range(aba._table.rowCount())
+                    if not aba._table.isRowHidden(r)]
+        self.assertEqual(visiveis, ["JOÃO BISPO DOS SANTOS FILHO"])
+
+    def test_the_checkbox_indicator_is_drawn_by_the_stylesheet(self):
+        """Sem regra própria o indicador some no Windows 11.
+
+        A regra `QMainWindow, QWidget` da folha casa também o QCheckBox — o seletor de tipo
+        do Qt pega as subclasses — e aí o QStyleSheetStyle assume o desenho e o indicador
+        nativo não aparece. Medido com o estilo `windows11`: sem a regra o indicador fica com
+        UMA cor, a do fundo. O operador via só os nomes das lanchas, sem caixa nenhuma.
+        """
+        from PySide6.QtWidgets import QCheckBox, QStyleFactory
+        if "windows11" not in QStyleFactory.keys():     # pragma: no cover
+            raise unittest.SkipTest("estilo windows11 indisponível")
+        anterior = self.app.style().objectName()
+        self.app.setStyle("windows11")
+        self.app.setStyleSheet(self.ui._APP_STYLESHEET)
+        try:
+            cores = {}
+            for marcada in (True, False):
+                caixa = QCheckBox("SURFER 1905")
+                caixa.setChecked(marcada)
+                caixa.resize(caixa.sizeHint())
+                caixa.show()
+                self.app.processEvents()
+                imagem = caixa.grab().toImage()
+                conta: dict = {}
+                for x in range(min(18, imagem.width())):
+                    for y in range(imagem.height()):
+                        nome = imagem.pixelColor(x, y).name()
+                        conta[nome] = conta.get(nome, 0) + 1
+                cores[marcada] = max(conta.items(), key=lambda kv: kv[1])[0]
+                caixa.close()
+            self.assertEqual(cores[True], "#1e8449")    # verde cheio
+            self.assertEqual(cores[False], "#ffffff")   # branco vazio
+        finally:
+            self.app.setStyleSheet("")
+            self.app.setStyle(anterior)
+
+
 if __name__ == "__main__":
     unittest.main()
