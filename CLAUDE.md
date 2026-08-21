@@ -733,6 +733,62 @@ não branco: com `SolidPattern` ela ignoraria o `alternate-background-color` da 
 `_ManifestoPaxDialog` (aba Recolhimento) **não** foi alterado — ali são `QCheckBox` de verdade
 com rótulo ao lado, que já têm o alvo de clique grande e o texto associado.
 
+### Troca em lote
+
+**Motivação**: 71 pax do TMIB para o M9 e a GAD determina os 48 que vêm nas duas primeiras
+lanchas. Como os totais fecham, **não há excesso e o sistema não pergunta nada** — aloca pela
+ordem das linhas. Corrigir isso um por um no Trocar Viagem era o gargalo.
+
+A tabela já aceitava Ctrl+clique e Shift+clique (o Qt usa `ExtendedSelection` por padrão);
+faltava a troca operar sobre a seleção inteira.
+
+**A conta que fecha a troca**: a viagem de destino tem `livre = limite - ocupação`. Entrando
+`N`, precisam sair `precisa = max(0, N - livre)`. Quem sai assume as **vagas que o lote está
+liberando** (`swap_vacancies`) — uma por pax do lote que tinha viagem. Assim nenhuma viagem
+estoura nem esvazia, e a soma por lancha continua a que a operação programou.
+
+**API** (`filler.py`):
+
+```python
+batch_swap_options(frs, filled, trips, ...)      -> ({id(fr): viagem atual}, [(viagem, ocupação)])
+swap_vacancies(frs, atuais, destino)             -> [VoyageSlot]   # uma por pax que tinha viagem
+batch_swap_candidates(frs, vagas, destino, ...)  -> [FilledRow]    # quem pode ceder o lugar
+match_displaced(saindo, vagas, ...)              -> {id(fr): vaga | None} | None
+```
+
+**`batch_swap_options` faz a interseção**, não a união: só oferece viagens que a operação
+programou para **todos** os selecionados. Mover um lote para uma viagem que atende só parte
+dele deixaria o resto para trás sem que nada avisasse. Quando o operador seleciona pax com
+movimentações diferentes e não sobra nenhuma viagem comum, a janela diz para trocar em grupos
+menores.
+
+**`match_displaced` é emparelhamento máximo (Kuhn), não guloso.** Guloso erra: ANDERSON (nota
+TMIB) cabe em duas vagas e PEDRO (nota M9) só na do M9 — servir ANDERSON pela vaga do M9, que
+é a primeira da lista, deixaria PEDRO de fora à toa. São ~20 linhas de caminho aumentante e o
+resultado é exato.
+
+Duas saídas diferentes, de propósito:
+
+- **Havia vaga para todos e mesmo assim alguém ficou sem** → devolve `None` e a troca é
+  recusada com explicação. Melhor do que desprogramar alguém em silêncio.
+- **Havia menos vagas do que gente saindo** (parte do lote estava sob demanda e não liberou
+  nada) → devolve o mapa com `None` para quem sobrou, e o diálogo **avisa antes de confirmar**
+  quantos vão ficar sob demanda.
+
+**Interface**: o `_PermutaDialog` passou a ser multi-seleção com o mesmo check verde da janela
+de escolha de passageiros — linha inteira clicável, busca por nome, contador `N / precisa`, e
+os botões **Marcar os filtrados** / **Desmarcar os filtrados**, que agem só sobre o que a busca
+está mostrando. Escolher 24 numa lista de 24 na mão era exatamente o que estava lento.
+
+O `_TrocarViagemDialog` mostra o tamanho do lote, de quais viagens ele sai (com a contagem de
+cada uma) e, na coluna Situação, `N vaga(s) livre(s)`, `N livre(s) — permuta de M` ou
+`lotada — permuta de N`, conforme o tamanho da seleção.
+
+**Verificado** com 17/08: bloco de 8 pax da SURFER 1930 movido para a SURFER 1905, que estava
+`8/8`; os 8 deslocados ocuparam exatamente as 8 vagas liberadas; nenhuma viagem acima do
+programado, ninguém sem viagem e ninguém sem Nº Viagem. Mutações que a suíte pega: união em vez
+de interseção, emparelhamento guloso, nunca recusar, e contar como vaga quem estava sob demanda.
+
 ### Horário arredondado para o múltiplo de 10 (`_round_horario`)
 
 **Motivação**: o operador escreve os horários redondos. Em 16/08, dos 12 horários que ele usou
@@ -1117,9 +1173,9 @@ Duas outras proteções, ambas descobertas apontando o seletor para `Downloads`,
 
 ### Testes
 
-162 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
+169 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
 `pip install` falha no certificado TLS do Netskope). Os do módulo de distribuição estão em
-`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (82).
+`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (89).
 
 ```bash
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
@@ -1144,7 +1200,7 @@ respectivamente). Um teste que não falha quando o bug volta não protege nada.
 
 ### Testes da classificação (`tests/test_distribuicao_filler.py`)
 
-82 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
+89 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
 para ligar a regra ao caso que a originou.
 
 | Grupo | O que protege |
@@ -1157,6 +1213,7 @@ para ligar a regra ao caso que a originou.
 | `NightLegTests` | noite na leg mais tardia na ida, mais cedo na volta |
 | `OriginsConfigTests` | `suggest_origins` e `audit_origins` |
 | `FillRowsScenarioTests` | 11 cenários montados à mão: bate-volta/embarque na mesma viagem, legs concorrentes, teto do `pax_disembark`, viagem vazia não consumindo número, desempate por ordem da operação, uma viagem com um horário |
+| `TrocaEmLoteTests` | interseção das viagens, vagas vindas de quem tinha viagem, emparelhamento máximo dos deslocados, recusa quando a troca não fecha, e o cenário dos 71 pax da GAD |
 | `ArredondamentoHorarioTests` | múltiplo de 10 mais próximo, empate intacto, virada de hora e de dia, e a numeração não reordenando |
 | `TabelaCompletaTests` | as linhas já preenchidas aparecem, o índice do UserRole aponta para a lista certa, e editar uma delas marca para gravar |
 | `SelecaoDesmarcadaTests` | desmarcar no diálogo não deixar rastro de embarcação |
@@ -1231,7 +1288,7 @@ são erro do sistema:
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
 cd /mnt/c/Users/ka20/roteirizador/appDesktopV2
 
-# Suíte completa — 162 testes, em unittest (stdlib)
+# Suíte completa — 169 testes, em unittest (stdlib)
 $PY -m unittest discover -s tests -v
 
 # Um arquivo só

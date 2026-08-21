@@ -3692,7 +3692,7 @@ class _TrocarViagemDialog(QDialog):
 
     _COLS = ["Embarcacao", "Horario", "Tipo", "Ocupacao", "Situacao"]
 
-    def __init__(self, fr, atual, opcoes: list, parent=None):
+    def __init__(self, frs: list, atuais: dict, opcoes: list, parent=None):
         super().__init__(parent)
         self._opcoes = opcoes
         self.setWindowTitle("Trocar Viagem")
@@ -3701,18 +3701,38 @@ class _TrocarViagemDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
-        dr = fr.dados_row
-        layout.addWidget(QLabel(
-            f"<b>{dr.name or '(sem nome)'}</b> &nbsp;·&nbsp; "
-            f"{dr.origem_raw or '?'} → {dr.destino_raw or '?'}"
-        ))
-        if atual is None:
-            atual_txt = "<i>sem viagem (sob demanda)</i>"
+        if len(frs) == 1:
+            dr = frs[0].dados_row
+            layout.addWidget(QLabel(
+                f"<b>{dr.name or '(sem nome)'}</b> &nbsp;·&nbsp; "
+                f"{dr.origem_raw or '?'} → {dr.destino_raw or '?'}"
+            ))
         else:
-            hor = atual.horario.strftime("%H:%M") if atual.horario else "--:--"
-            atual_txt = f"{atual.vessel} · {hor} · {atual.tipo_viagem}"
-        layout.addWidget(QLabel(f"Viagem atual: {atual_txt}"))
-        layout.addWidget(QLabel("<small>Escolha a nova viagem:</small>"))
+            movimentos = sorted({
+                f"{fr.dados_row.origem_raw or '?'} → {fr.dados_row.destino_raw or '?'}"
+                for fr in frs})
+            layout.addWidget(QLabel(
+                f"<b>{len(frs)} passageiros selecionados</b> &nbsp;·&nbsp; "
+                + ", ".join(movimentos)))
+
+        # De onde o lote sai. Com várias viagens de origem, mostra a conta de cada uma.
+        origens: dict = {}
+        for fr in frs:
+            atual = atuais.get(id(fr))
+            chave = ((atual.vessel, atual.horario) if atual else None)
+            origens[chave] = origens.get(chave, 0) + 1
+        partes = []
+        for chave, n in sorted(origens.items(), key=lambda kv: str(kv[0])):
+            if chave is None:
+                partes.append(f"sem viagem ({n})" if len(frs) > 1 else "sem viagem")
+            else:
+                vessel, hor = chave
+                h = hor.strftime("%H:%M") if hor else "--:--"
+                partes.append(f"{vessel} · {h}" + (f" ({n})" if len(frs) > 1 else ""))
+        layout.addWidget(QLabel("Viagem atual: " + ", ".join(partes)))
+        layout.addWidget(QLabel(
+            "<small>Só aparecem as viagens que a operação programou para "
+            "<b>todos</b> os selecionados.</small>"))
 
         self._table = QTableWidget()
         self._table.setColumnCount(len(self._COLS))
@@ -3723,15 +3743,20 @@ class _TrocarViagemDialog(QDialog):
         self._table.setSelectionMode(QAbstractItemView.SingleSelection)
         self._table.setRowCount(len(opcoes))
 
+        n = len(frs)
         for i, (slot, ocupados) in enumerate(opcoes):
             hor = slot.horario.strftime("%H:%M") if slot.horario else "--:--"
-            livre = slot.limit - ocupados
-            situacao = (f"{livre} vaga(s) livre(s)" if livre > 0
-                        else "lotada — exige permuta")
+            livre = max(0, slot.limit - ocupados)
+            if livre >= n:
+                situacao = f"{livre} vaga(s) livre(s)"
+            elif livre:
+                situacao = f"{livre} livre(s) — permuta de {n - livre}"
+            else:
+                situacao = f"lotada — permuta de {n}"
             for col, val in enumerate([slot.vessel, hor, slot.tipo_viagem,
                                        f"{ocupados}/{slot.limit}", situacao]):
                 item = QTableWidgetItem(val)
-                if livre <= 0:
+                if livre < n:
                     item.setForeground(_make_color("#b9770e"))
                 self._table.setItem(i, col, item)
 
@@ -3752,64 +3777,132 @@ class _TrocarViagemDialog(QDialog):
 
 
 class _PermutaDialog(QDialog):
-    """A viagem de destino esta lotada: escolhe com quem o pax troca de lugar.
+    """A viagem de destino nao tem vaga para todos: escolhe quem cede o lugar.
 
-    Os candidatos sao os pax que estao na viagem de destino **e** que a operacao permite
-    colocar na viagem de origem, senao a troca so empurraria o problema para o outro lado.
+    Os candidatos sao os pax que estao na viagem de destino **e** que cabem em alguma das
+    vagas que o lote esta liberando, senao a troca so empurraria o problema para o outro
+    lado. Usa a mesma marca de selecao da janela de escolha de passageiros: check verde,
+    linha inteira clicavel e busca por nome, porque escolher 24 numa lista de 24 na mao e
+    exatamente o que estava lento.
     """
 
-    def __init__(self, nome_entra: str, destino_txt: str, origem_txt: str | None,
-                 candidatos: list, parent=None):
+    def __init__(self, entram: list, destino_txt: str, vagas_txt: str,
+                 precisa: int, candidatos: list, sem_vaga: int = 0, parent=None):
         super().__init__(parent)
         self._candidatos = candidatos
+        self._precisa = precisa
         self.setWindowTitle("Permutar Passageiros")
-        self.setMinimumWidth(560)
-        self.setMinimumHeight(360)
+        self.setMinimumWidth(620)
+        self.setMinimumHeight(440)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(
-            f"A viagem <b>{destino_txt}</b> está lotada — a operação já programou todas as "
-            f"vagas dela."
-        ))
-        if origem_txt:
-            texto = (f"Para <b>{nome_entra}</b> entrar, um passageiro tem de sair e assumir "
-                     f"a viagem <b>{origem_txt}</b>:")
-        else:
-            texto = (f"Para <b>{nome_entra}</b> entrar, um passageiro tem de sair. "
-                     f"Como {nome_entra} não tinha viagem, quem sair fica "
-                     f"<b>Sob demanda</b>:")
-        lbl = QLabel(texto)
-        lbl.setWordWrap(True)
-        layout.addWidget(lbl)
+
+        quem = (entram[0].dados_row.name or "(sem nome)" if len(entram) == 1
+                else f"os {len(entram)} selecionados")
+        cabecalho = QLabel(
+            f"A viagem <b>{destino_txt}</b> não tem vaga para {quem}: a operação já "
+            f"programou todas. Escolha <b>{precisa}</b> passageiro(s) para sair."
+        )
+        cabecalho.setWordWrap(True)
+        layout.addWidget(cabecalho)
+
+        destino_lbl = QLabel(
+            f"<small>Quem sair assume as vagas que o lote está liberando: "
+            f"{vagas_txt}</small>" if vagas_txt else
+            "<small>Nenhuma vaga está sendo liberada, então quem sair fica "
+            "<b>Sob demanda</b>.</small>"
+        )
+        destino_lbl.setWordWrap(True)
+        layout.addWidget(destino_lbl)
+
+        if sem_vaga:
+            aviso = QLabel(
+                f"<small><font color='#b9770e'>Atenção: {sem_vaga} do(s) que saírem "
+                f"ficarão <b>Sob demanda</b> — há menos vagas liberadas do que gente "
+                f"saindo.</font></small>")
+            aviso.setWordWrap(True)
+            layout.addWidget(aviso)
+
+        busca_row = QHBoxLayout()
+        busca_row.addWidget(QLabel("Buscar:"))
+        self._busca = QLineEdit()
+        self._busca.setPlaceholderText("Filtrar por nome…")
+        self._busca.textChanged.connect(self._filtrar)
+        busca_row.addWidget(self._busca)
+        layout.addLayout(busca_row)
+
+        self._contador = QLabel()
+        layout.addWidget(self._contador)
 
         self._table = QTableWidget()
-        self._table.setColumnCount(3)
-        self._table.setHorizontalHeaderLabels(["Nome Passageiro", "Orig → Dest", "Tipo"])
-        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self._table.setColumnCount(4)
+        self._table.setHorizontalHeaderLabels(
+            [_CHECK_MARK, "Nome Passageiro", "Orig → Dest", "Tipo"])
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._table.setSelectionMode(QAbstractItemView.NoSelection)
         self._table.setRowCount(len(candidatos))
         for i, fr in enumerate(candidatos):
             dr = fr.dados_row
-            self._table.setItem(i, 0, QTableWidgetItem(dr.name or ""))
-            self._table.setItem(i, 1, QTableWidgetItem(
+            mark = QTableWidgetItem()
+            mark.setFlags(Qt.ItemIsEnabled)
+            mark.setTextAlignment(Qt.AlignCenter)
+            self._table.setItem(i, 0, mark)
+            self._table.setItem(i, 1, QTableWidgetItem(dr.name or ""))
+            self._table.setItem(i, 2, QTableWidgetItem(
                 f"{dr.origem_raw or ''} → {dr.destino_raw or ''}"))
-            self._table.setItem(i, 2, QTableWidgetItem(fr.tipo_viagem or ""))
-        self._table.resizeColumnToContents(1)
-        self._table.doubleClicked.connect(self.accept)
+            self._table.setItem(i, 3, QTableWidgetItem(fr.tipo_viagem or ""))
+            _set_row_checked(self._table, i, i < precisa)
+        _setup_check_column(self._table)
+        self._table.resizeColumnToContents(2)
+        self._table.cellClicked.connect(self._clicou)
         layout.addWidget(self._table)
+        self._atualizar_contador()
+
+        btn_row = QHBoxLayout()
+        btn_filtrados = QPushButton("Marcar os filtrados")
+        btn_filtrados.setToolTip(
+            "Marca todos os que a busca está mostrando, sem mexer nos escondidos")
+        btn_filtrados.clicked.connect(lambda: self._marcar_visiveis(True))
+        btn_limpar = QPushButton("Desmarcar os filtrados")
+        btn_limpar.clicked.connect(lambda: self._marcar_visiveis(False))
+        btn_row.addWidget(btn_filtrados)
+        btn_row.addWidget(btn_limpar)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
-    def escolhido(self):
-        rows = self._table.selectionModel().selectedRows() if self._table.selectionModel() else []
-        if not rows:
-            return None
-        return self._candidatos[rows[0].row()]
+    def _filtrar(self, texto: str) -> None:
+        alvo = texto.strip().lower()
+        for r in range(self._table.rowCount()):
+            item = self._table.item(r, 1)
+            nome = item.text().lower() if item else ""
+            self._table.setRowHidden(r, bool(alvo) and alvo not in nome)
+
+    def _marcar_visiveis(self, marcar: bool) -> None:
+        for r in range(self._table.rowCount()):
+            if not self._table.isRowHidden(r):
+                _set_row_checked(self._table, r, marcar)
+        self._atualizar_contador()
+
+    def _clicou(self, row: int, _col: int) -> None:
+        _set_row_checked(self._table, row, not _is_row_checked(self._table, row))
+        self._atualizar_contador()
+
+    def _atualizar_contador(self) -> None:
+        n = sum(1 for r in range(self._table.rowCount())
+                if _is_row_checked(self._table, r))
+        cor = "green" if n == self._precisa else "red"
+        self._contador.setText(
+            f'<font color="{cor}"><b>{n}</b></font> / {self._precisa} selecionados')
+
+    def escolhidos(self) -> list:
+        return [self._candidatos[r] for r in range(self._table.rowCount())
+                if _is_row_checked(self._table, r)]
 
 
 class ManifestosDistribuicaoTab(QWidget):
@@ -4415,62 +4508,78 @@ class ManifestosDistribuicaoTab(QWidget):
         dlg.exec()
 
     # ── Troca / permuta de viagem ──────────────────────────────────────
-    def _linha_selecionada(self):
-        """A FilledRow da linha selecionada na tabela, atravessando a ordenação."""
-        sel = self._table.selectionModel().selectedRows() if self._table.selectionModel() else []
-        if not sel:
-            return None
-        item = self._table.item(sel[0].row(), 0)
-        if item is None:
-            return None
-        idx = item.data(Qt.UserRole)
-        if idx is None or idx >= len(self._visible_rows):
-            return None
-        return self._visible_rows[idx]
+    def _linhas_selecionadas(self) -> list:
+        """As FilledRow das linhas selecionadas, atravessando a ordenação da tabela.
+
+        A tabela aceita Ctrl+clique e Shift+clique, então o operador seleciona um bloco de
+        uma vez — foi o que resolveu os 71 pax do TMIB para o M9, em que a GAD determina os
+        48 das duas primeiras lanchas e antes era um por um.
+        """
+        modelo = self._table.selectionModel()
+        escolhidas = []
+        for indice in (modelo.selectedRows() if modelo else []):
+            item = self._table.item(indice.row(), 0)
+            if item is None:
+                continue
+            idx = item.data(Qt.UserRole)
+            if idx is None or idx >= len(self._visible_rows):
+                continue
+            escolhidas.append(self._visible_rows[idx])
+        return escolhidas
 
     def _resolver(self):
         from .distribuicao import PLATFORM_EQUIVALENCES
         from .offshore_pd.aliases import AliasResolver
         return AliasResolver(explicit=dict(PLATFORM_EQUIVALENCES))
 
-    def _trocar_viagem(self) -> None:
-        """Move o pax selecionado para outra viagem programada, permutando se estiver cheia.
+    @staticmethod
+    def _viagem_txt(slot) -> str:
+        hor = slot.horario.strftime("%H:%M") if slot and slot.horario else "--:--"
+        return f"{slot.vessel} · {hor}" if slot else "sem viagem"
 
-        A decisão de quais viagens são possíveis, quem está em cada uma e quem pode ceder o
-        lugar vem toda do `filler`, que é a mesma fonte que o processamento usa — aqui só
-        entra a conversa com o operador.
+    def _trocar_viagem(self) -> None:
+        """Move os pax selecionados para outra viagem programada.
+
+        Quando a viagem de destino não tem vaga para todos, a diferença sai por permuta: quem
+        sai assume as vagas que o lote está liberando, então nenhuma viagem estoura nem
+        esvazia. A decisão de quais viagens servem, quem está em cada uma, quem pode ceder o
+        lugar e para onde cada um vai fica toda no `filler` — aqui só entra a conversa.
         """
         from .distribuicao import PLATFORM_EQUIVALENCES
         from .distribuicao.filler import (
-            _assign_n_viagem, rebuild_n_viagem, swap_options, swap_partners,
+            _assign_n_viagem, batch_swap_candidates, batch_swap_options,
+            match_displaced, rebuild_n_viagem, swap_vacancies,
         )
 
-        fr = self._linha_selecionada()
-        if fr is None:
+        frs = self._linhas_selecionadas()
+        if not frs:
             QMessageBox.information(
                 self, "Trocar Viagem",
-                "Selecione na tabela a linha do passageiro que vai mudar de viagem.")
+                "Selecione na tabela as linhas dos passageiros que vão mudar de viagem.\n"
+                "Use Ctrl+clique para escolher vários e Shift+clique para um bloco.")
             return
 
         resolver = self._resolver()
-        resultado = swap_options(fr, self._filled_rows, self._trips, resolver=resolver)
+        resultado = batch_swap_options(frs, self._filled_rows, self._trips,
+                                       resolver=resolver)
         if resultado is None:
             QMessageBox.warning(
                 self, "Trocar Viagem",
-                "Não foi possível identificar origem e destino desta linha, então não há "
-                "como saber quais viagens a atendem.")
+                "Não foi possível identificar origem e destino de alguma das linhas "
+                "selecionadas, então não há como saber quais viagens as atendem.")
             return
 
-        atual, opcoes = resultado
+        atuais, opcoes = resultado
         if not opcoes:
             QMessageBox.information(
                 self, "Trocar Viagem",
-                f"A operação programou apenas uma viagem para o movimento "
-                f"{fr.dados_row.origem_raw} → {fr.dados_row.destino_raw}, então não há para "
-                f"onde trocar.")
+                "Não há nenhuma outra viagem que a operação tenha programado para "
+                + ("esta movimentação." if len(frs) == 1 else
+                   "todos os passageiros selecionados.\n\nSe eles têm movimentações "
+                   "diferentes, troque em grupos menores."))
             return
 
-        dlg = _TrocarViagemDialog(fr, atual, opcoes, parent=self)
+        dlg = _TrocarViagemDialog(frs, atuais, opcoes, parent=self)
         if dlg.exec() != QDialog.Accepted:
             return
         escolha = dlg.escolhido()
@@ -4479,49 +4588,73 @@ class ManifestosDistribuicaoTab(QWidget):
             return
 
         destino, ocupados = escolha
-        sai = None
+        # Quem já está na viagem de destino não entra na conta.
+        entram = [fr for fr in frs
+                  if not (atuais.get(id(fr)) and
+                          (atuais[id(fr)].vessel, atuais[id(fr)].horario)
+                          == (destino.vessel, destino.horario))]
+        if not entram:
+            QMessageBox.information(
+                self, "Trocar Viagem", "Os selecionados já estão nessa viagem.")
+            return
 
-        if ocupados >= destino.limit:
-            # Lotada pelo que a operação programou: só entra quem trocar de lugar.
-            candidatos = swap_partners(
-                fr, atual, destino, self._filled_rows, resolver=resolver)
-            if not candidatos:
+        livre = max(0, destino.limit - ocupados)
+        precisa = max(0, len(entram) - livre)
+        vagas = swap_vacancies(entram, atuais, destino)
+        saindo: list = []
+        destino_de: dict = {}
+
+        if precisa:
+            candidatos = batch_swap_candidates(
+                entram, vagas, destino, self._filled_rows, resolver=resolver)
+            if len(candidatos) < precisa:
                 QMessageBox.warning(
                     self, "Trocar Viagem",
-                    f"A viagem está lotada ({ocupados}/{destino.limit}) e nenhum dos "
-                    f"passageiros dela pode assumir a viagem de origem, então não há "
-                    f"permuta possível.")
+                    f"A viagem tem {livre} vaga(s) para {len(entram)} passageiro(s), então "
+                    f"{precisa} teriam de sair — mas só {len(candidatos)} dos que estão "
+                    f"nela podem assumir as vagas que o lote libera. A troca não fecha.")
                 return
-            hor_d = destino.horario.strftime("%H:%M") if destino.horario else "--:--"
-            hor_a = atual.horario.strftime("%H:%M") if atual and atual.horario else "--:--"
+
+            vagas_txt = ", ".join(sorted(
+                f"{self._viagem_txt(v)}" for v in {(v.vessel, v.horario): v
+                                                   for v in vagas}.values()))
             perm = _PermutaDialog(
-                fr.dados_row.name or "(sem nome)",
-                f"{destino.vessel} · {hor_d}",
-                f"{atual.vessel} · {hor_a}" if atual else None,
-                candidatos, parent=self,
-            )
+                entram, self._viagem_txt(destino), vagas_txt, precisa, candidatos,
+                sem_vaga=max(0, precisa - len(vagas)), parent=self)
             if perm.exec() != QDialog.Accepted:
                 return
-            sai = perm.escolhido()
-            if sai is None:
-                QMessageBox.warning(self, "Trocar Viagem", "Nenhum passageiro foi selecionado.")
+            saindo = perm.escolhidos()
+            if len(saindo) != precisa:
+                QMessageBox.warning(
+                    self, "Trocar Viagem",
+                    f"É preciso escolher exatamente {precisa} passageiro(s) para sair; "
+                    f"você marcou {len(saindo)}.")
                 return
 
-        fr.embarcacao = destino.vessel
-        fr.horario = destino.horario
-        fr.status = "auto"
+            destino_de = match_displaced(saindo, vagas, resolver=resolver) or {}
+            if not destino_de:
+                QMessageBox.warning(
+                    self, "Trocar Viagem",
+                    "Não há como distribuir quem sai pelas vagas liberadas respeitando a "
+                    "programação da operação. Escolha outros passageiros para sair.")
+                return
 
-        if sai is not None:
-            if atual is None:
-                # Quem entrou não tinha viagem, então não há lugar para o outro assumir.
-                sai.embarcacao = None
-                sai.horario = None
-                sai.n_viagem = None
-                sai.status = "sob_demanda"
+        for fr in entram:
+            fr.embarcacao = destino.vessel
+            fr.horario = destino.horario
+            fr.status = "auto"
+
+        for fr in saindo:
+            vaga = destino_de.get(id(fr))
+            if vaga is None:
+                fr.embarcacao = None
+                fr.horario = None
+                fr.n_viagem = None
+                fr.status = "sob_demanda"
             else:
-                sai.embarcacao = atual.vessel
-                sai.horario = atual.horario
-                sai.status = "auto"
+                fr.embarcacao = vaga.vessel
+                fr.horario = vaga.horario
+                fr.status = "auto"
 
         # A numeração conta as viagens que levam pax de cada tipo, então depois de mover
         # alguém ela tem de ser refeita — reaproveitar o mapa antigo deixaria o Nº Viagem em
@@ -4534,19 +4667,18 @@ class ManifestosDistribuicaoTab(QWidget):
         self._trocas_pendentes += 1
         self._populate_table()
 
-        hor_d = destino.horario.strftime("%H:%M") if destino.horario else "--:--"
-        if sai is None:
-            msg = f"{fr.dados_row.name} passou para {destino.vessel} · {hor_d}."
-        elif atual is None:
-            msg = (f"{fr.dados_row.name} entrou em {destino.vessel} · {hor_d} e "
-                   f"{sai.dados_row.name} ficou Sob demanda.")
-        else:
-            hor_a = atual.horario.strftime("%H:%M") if atual.horario else "--:--"
-            msg = (f"{fr.dados_row.name} → {destino.vessel} · {hor_d}\n"
-                   f"{sai.dados_row.name} → {atual.vessel} · {hor_a}")
+        linhas = [f"{len(entram)} passageiro(s) → {self._viagem_txt(destino)}"]
+        if saindo:
+            por_vaga: dict = {}
+            for fr in saindo:
+                por_vaga.setdefault(self._viagem_txt(destino_de.get(id(fr))), 0)
+                por_vaga[self._viagem_txt(destino_de.get(id(fr)))] += 1
+            for txt, n in sorted(por_vaga.items()):
+                linhas.append(f"{n} passageiro(s) → {txt}")
         QMessageBox.information(
             self, "Trocar Viagem",
-            msg + "\n\nLembre de salvar na planilha: a troca vale só nesta sessão.")
+            "\n".join(linhas) +
+            "\n\nLembre de salvar na planilha: a troca vale só nesta sessão.")
 
     def _adicionar_trecho(self) -> None:
         sob_demanda = [fr for fr in self._filled_rows if fr.status == "sob_demanda"]

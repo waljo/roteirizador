@@ -458,6 +458,157 @@ def swap_partners(
     return candidatos
 
 
+def _same_voyage(a: VoyageSlot | None, b: VoyageSlot | None) -> bool:
+    """Duas legs podem ser a mesma viagem: mesmo par (embarcacao, horario)."""
+    if a is None or b is None:
+        return a is b
+    return (a.vessel, a.horario) == (b.vessel, b.horario)
+
+
+def batch_swap_options(
+    frs: list[FilledRow],
+    filled: list[FilledRow],
+    trips: list[VesselTrip],
+    resolver: AliasResolver | None = None,
+    extra_aliases: dict[str, str] | None = None,
+) -> tuple[dict[int, VoyageSlot | None], list[tuple[VoyageSlot, int]]] | None:
+    """Viagens que atendem **todos** os pax selecionados, com a ocupacao de cada uma.
+
+    Devolve `({id(fr): viagem atual}, [(viagem, ocupacao)])`, ou None se alguma das linhas
+    nao der para casar. A intersecao e proposital: mover um lote para uma viagem que atende
+    so parte dele deixaria o resto para tras sem que nada avisasse.
+    """
+    if resolver is None:
+        resolver = AliasResolver(explicit=extra_aliases or {})
+    if not frs:
+        return None
+
+    slots = voyage_slots(trips)
+    atuais: dict[int, VoyageSlot | None] = {}
+    servem: list[set[tuple[str, time | None]]] = []
+    por_chave: dict[tuple[str, time | None], VoyageSlot] = {}
+
+    for fr in frs:
+        movement = _row_platforms(fr.dados_row, resolver)
+        if movement is None:
+            return None
+        atuais[id(fr)] = current_slot(fr, slots, movement)
+        chaves = set()
+        for slot in slots:
+            if _matches(slot.leg, *movement):
+                chave = (slot.vessel, slot.horario)
+                chaves.add(chave)
+                por_chave.setdefault(chave, slot)
+        servem.append(chaves)
+
+    comuns = set.intersection(*servem)
+    # Tira as viagens em que TODO o lote ja esta — nao ha o que fazer nelas.
+    comuns = {
+        chave for chave in comuns
+        if not all(_same_voyage(atuais[id(fr)], por_chave[chave]) for fr in frs)
+    }
+
+    opcoes = [(por_chave[c], len(slot_occupants(por_chave[c], filled, resolver)))
+              for c in comuns]
+    opcoes.sort(key=lambda o: (o[0].horario or time(23, 59), o[0].vessel))
+    return atuais, opcoes
+
+
+def swap_vacancies(
+    frs: list[FilledRow],
+    atuais: dict[int, VoyageSlot | None],
+    destino: VoyageSlot,
+) -> list[VoyageSlot]:
+    """As vagas que o lote deixa para tras ao sair — uma por pax que tinha viagem.
+
+    Sao elas que os pax deslocados da viagem de destino vao ocupar, e por isso a troca fecha
+    sem estourar nem esvaziar nenhuma viagem. Quem estava sob demanda nao libera vaga
+    nenhuma, entao pode faltar lugar para alguem — o chamador tem de tratar.
+    """
+    vagas: list[VoyageSlot] = []
+    for fr in frs:
+        atual = atuais.get(id(fr))
+        if atual is not None and not _same_voyage(atual, destino):
+            vagas.append(atual)
+    return vagas
+
+
+def batch_swap_candidates(
+    frs: list[FilledRow],
+    vagas: list[VoyageSlot],
+    destino: VoyageSlot,
+    filled: list[FilledRow],
+    resolver: AliasResolver | None = None,
+    extra_aliases: dict[str, str] | None = None,
+) -> list[FilledRow]:
+    """Quem, na viagem de destino, pode ceder o lugar ocupando uma das vagas liberadas."""
+    if resolver is None:
+        resolver = AliasResolver(explicit=extra_aliases or {})
+    entrando = {id(fr) for fr in frs}
+    candidatos: list[FilledRow] = []
+    for outro in slot_occupants(destino, filled, resolver):
+        if id(outro) in entrando:
+            continue
+        movement = _row_platforms(outro.dados_row, resolver)
+        if movement is None:
+            continue
+        # Sem vaga nenhuma liberada quem sair fica sob demanda, e ai qualquer um serve.
+        if not vagas or any(_matches(v.leg, *movement) for v in vagas):
+            candidatos.append(outro)
+    return candidatos
+
+
+def match_displaced(
+    saindo: list[FilledRow],
+    vagas: list[VoyageSlot],
+    resolver: AliasResolver | None = None,
+    extra_aliases: dict[str, str] | None = None,
+) -> dict[int, VoyageSlot | None] | None:
+    """Distribui quem sai pelas vagas liberadas, respeitando o que a operacao programou.
+
+    Emparelhamento maximo (algoritmo de Kuhn) porque guloso erra: se o primeiro pax da lista
+    cabe em duas vagas e o segundo so numa, servir o primeiro pela vaga disputada deixa o
+    segundo de fora sem necessidade. Devolve `{id(fr): vaga ou None}` — None e quem fica sob
+    demanda, o que so acontece quando ha menos vagas do que gente saindo.
+    """
+    if resolver is None:
+        resolver = AliasResolver(explicit=extra_aliases or {})
+
+    elegivel: list[list[int]] = []
+    for fr in saindo:
+        movement = _row_platforms(fr.dados_row, resolver)
+        if movement is None:
+            return None
+        elegivel.append([j for j, v in enumerate(vagas)
+                         if _matches(v.leg, *movement)])
+
+    dono: dict[int, int] = {}       # vaga -> indice de quem sai
+
+    def tenta(i: int, vistos: set[int]) -> bool:
+        for j in elegivel[i]:
+            if j in vistos:
+                continue
+            vistos.add(j)
+            if j not in dono or tenta(dono[j], vistos):
+                dono[j] = i
+                return True
+        return False
+
+    for i in range(len(saindo)):
+        tenta(i, set())
+
+    destino_de: dict[int, VoyageSlot | None] = {id(fr): None for fr in saindo}
+    for j, i in dono.items():
+        destino_de[id(saindo[i])] = vagas[j]
+
+    # So falha quando havia vaga para todos e mesmo assim alguem ficou de fora: ai a troca
+    # nao fecha e e melhor recusar do que desprogramar alguem em silencio.
+    sem_vaga = sum(1 for v in destino_de.values() if v is None)
+    if len(vagas) >= len(saindo) and sem_vaga:
+        return None
+    return destino_de
+
+
 def rebuild_n_viagem(
     filled: list[FilledRow],
     trips: list[VesselTrip],

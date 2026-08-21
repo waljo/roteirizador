@@ -21,6 +21,10 @@ from roteirizador_desktop.distribuicao import (
 )
 from roteirizador_desktop.distribuicao.filler import (
     _round_horario,
+    batch_swap_candidates,
+    batch_swap_options,
+    match_displaced,
+    swap_vacancies,
     current_slot,
     rebuild_n_viagem,
     row_movement,
@@ -406,6 +410,172 @@ _CONFIG = (Path(__file__).resolve().parents[1]
     _DADOS_16.exists() and _OPERACAO_16.exists(),
     "arquivos de referência de 16/08 não disponíveis nesta máquina",
 )
+class TrocaEmLoteTests(unittest.TestCase):
+    """Mover vários passageiros de uma vez.
+
+    71 pax do TMIB para o M9 e a GAD determina os 48 das duas primeiras lanchas. Como os
+    totais fecham, o sistema não pergunta nada — aloca pela ordem das linhas — e corrigir um
+    por um no Trocar Viagem era o que estava lento.
+    """
+
+    @staticmethod
+    def _tmib_m9(n_pax=6, vagas=(3, 3)):
+        rows = [row(i, f"PAX{i:02d}", "TMIB", "TMIB", "PCM-9") for i in range(1, n_pax + 1)]
+        trips = [
+            VesselTrip(f"LANCHA {i}", [
+                leg(f"LANCHA {i}", "TMIB", "PCM-09", time(6, 0 + i * 10),
+                    pax_origin="TMIB", pax=v)])
+            for i, v in enumerate(vagas)
+        ]
+        return rows, trips
+
+    def test_only_voyages_serving_every_selected_pax_are_offered(self):
+        """Uma viagem que atende só parte do lote não pode ser oferecida: mover para ela
+        deixaria o resto para trás sem que nada avisasse."""
+        tmib = row(1, "DO_TMIB", "TMIB", "TMIB", "PCM-9")
+        m5 = row(2, "DO_M5", "PCM-5", "PCM-5", "PCM-9")
+        trips = [
+            VesselTrip("LANCHA A", [
+                leg("LANCHA A", "TMIB", "PCM-09", time(6, 0), pax_origin="TMIB", pax=2)]),
+            VesselTrip("LANCHA B", [
+                leg("LANCHA B", "PCM-05", "PCM-09", time(7, 0), pax_origin="PCM-05", pax=2)]),
+        ]
+        filled, _, _ = run([tmib, m5], trips)
+        got = by_excel(filled)
+        _, so_tmib = batch_swap_options([got[1]], filled, trips)
+        self.assertEqual(so_tmib, [])   # ele ja esta na unica que o atende
+        _, juntos = batch_swap_options([got[1], got[2]], filled, trips)
+        self.assertEqual(juntos, [])     # nenhuma viagem atende os dois
+
+    def test_a_block_moves_into_a_full_voyage_by_swapping(self):
+        """3 pax da lancha 2 para a lancha 1, que está lotada: permuta de 3."""
+        rows, trips = self._tmib_m9()
+        filled, _, _ = run(rows, trips)
+        na_2 = [fr for fr in filled if fr.embarcacao == "LANCHA 1"]
+        self.assertEqual(len(na_2), 3)
+
+        atuais, opcoes = batch_swap_options(na_2, filled, trips)
+        self.assertEqual(len(opcoes), 1)
+        destino, ocupados = opcoes[0]
+        self.assertEqual((destino.vessel, ocupados, destino.limit), ("LANCHA 0", 3, 3))
+
+        vagas = swap_vacancies(na_2, atuais, destino)
+        self.assertEqual(len(vagas), 3)
+        candidatos = batch_swap_candidates(na_2, vagas, destino, filled)
+        self.assertEqual(len(candidatos), 3)
+
+        destino_de = match_displaced(candidatos, vagas)
+        self.assertIsNotNone(destino_de)
+        self.assertTrue(all(v is not None for v in destino_de.values()))
+
+    def test_vacancies_come_only_from_who_had_a_voyage(self):
+        rows, trips = self._tmib_m9(n_pax=4, vagas=(2, 1))
+        filled, _, _ = run(rows, trips)
+        solto = [fr for fr in filled if not fr.embarcacao]
+        self.assertEqual(len(solto), 1)          # 4 pax para 3 vagas
+        programado = [fr for fr in filled if fr.embarcacao == "LANCHA 1"]
+        lote = solto + programado
+        atuais, opcoes = batch_swap_options(lote, filled, trips)
+        destino = [s for s, _ in opcoes if s.vessel == "LANCHA 0"][0]
+        # Só o que já tinha viagem libera vaga; o sob demanda não libera nada.
+        self.assertEqual(len(swap_vacancies(lote, atuais, destino)), 1)
+
+    def test_the_displaced_are_matched_not_served_greedily(self):
+        """Guloso erra: quem cabe em duas vagas não pode tomar a que o outro só tem.
+
+        ANDERSON (nota TMIB) cabe nas duas vagas; PEDRO (nota M9) só cabe na do M9. Servindo
+        ANDERSON pela vaga do M9 — a primeira da lista — PEDRO ficaria de fora à toa.
+        """
+        anderson = row(1, "ANDERSON", "TMIB", "PCM-9", "PCM-8")
+        pedro = row(2, "PEDRO", "PCM-9", "PCM-9", "PCM-8")
+        trips = [
+            VesselTrip("VAGA M9", [
+                leg("VAGA M9", "PCM-09", "PCM-08", time(6, 0), pax_origin="PCM-09", pax=1)]),
+            VesselTrip("VAGA TMIB", [
+                leg("VAGA TMIB", "PCM-09", "PCM-08", time(7, 0), pax_origin="TMIB", pax=1)]),
+        ]
+        filled, _, _ = run([anderson, pedro], trips)
+        got = by_excel(filled)
+        vagas = voyage_slots(trips)
+        self.assertEqual([v.vessel for v in vagas], ["VAGA M9", "VAGA TMIB"])
+
+        destino_de = match_displaced([got[1], got[2]], vagas)
+        self.assertIsNotNone(destino_de)
+        self.assertEqual(destino_de[id(got[1])].vessel, "VAGA TMIB")
+        self.assertEqual(destino_de[id(got[2])].vessel, "VAGA M9")
+
+    def test_it_refuses_when_the_exchange_cannot_close(self):
+        """Havia vaga para todos e mesmo assim alguém ficou de fora: recusar é melhor do
+        que desprogramar em silêncio."""
+        pedro = row(1, "PEDRO", "PCM-9", "PCM-9", "PCM-8")
+        joao = row(2, "JOAO", "PCM-9", "PCM-9", "PCM-8")
+        trips = [
+            VesselTrip("VAGA M9", [
+                leg("VAGA M9", "PCM-09", "PCM-08", time(6, 0), pax_origin="PCM-09", pax=1)]),
+            VesselTrip("VAGA TMIB", [
+                leg("VAGA TMIB", "PCM-09", "PCM-08", time(7, 0), pax_origin="TMIB", pax=1)]),
+        ]
+        filled, _, _ = run([pedro, joao], trips)
+        got = by_excel(filled)
+        # Os dois só cabem na vaga do M9, que é uma só.
+        self.assertIsNone(match_displaced([got[1], got[2]], voyage_slots(trips)))
+
+    def test_fewer_vacancies_than_people_leaves_the_rest_sob_demanda(self):
+        """Sem vaga para todos não é recusa — é aviso: o resto fica sob demanda."""
+        pedro = row(1, "PEDRO", "PCM-9", "PCM-9", "PCM-8")
+        joao = row(2, "JOAO", "PCM-9", "PCM-9", "PCM-8")
+        trips = [VesselTrip("VAGA M9", [
+            leg("VAGA M9", "PCM-09", "PCM-08", time(6, 0), pax_origin="PCM-09", pax=1)])]
+        filled, _, _ = run([pedro, joao], trips)
+        got = by_excel(filled)
+        destino_de = match_displaced([got[1], got[2]], voyage_slots(trips))
+        self.assertIsNotNone(destino_de)
+        self.assertEqual(sum(1 for v in destino_de.values() if v is None), 1)
+
+    def test_the_gad_scenario_end_to_end(self):
+        """71 pax, 4 lanchas, e a GAD determina os 48 das duas primeiras."""
+        rows, trips = self._tmib_m9(n_pax=71, vagas=(24, 24, 12, 11))
+        filled, _, _ = run(rows, trips)
+        self.assertEqual(sum(1 for fr in filled if fr.embarcacao), 71)
+
+        # A GAD quer, nas duas primeiras, gente que caiu nas duas últimas.
+        tardios = [fr for fr in filled
+                   if fr.embarcacao in ("LANCHA 2", "LANCHA 3")]
+        self.assertEqual(len(tardios), 23)
+        atuais, opcoes = batch_swap_options(tardios, filled, trips)
+        destino, ocupados = [(s, o) for s, o in opcoes if s.vessel == "LANCHA 0"][0]
+
+        # A mesma conta que a interface faz: só sai quem não couber nas vagas livres.
+        livre = max(0, destino.limit - ocupados)
+        precisa = max(0, len(tardios) - livre)
+        self.assertEqual((livre, precisa), (0, 23))
+
+        vagas = swap_vacancies(tardios, atuais, destino)
+        self.assertEqual(len(vagas), 23)
+        candidatos = batch_swap_candidates(tardios, vagas, destino, filled)
+        saindo = candidatos[:precisa]
+        destino_de = match_displaced(saindo, vagas)
+        self.assertIsNotNone(destino_de)
+
+        for fr in tardios:
+            fr.embarcacao, fr.horario = destino.vessel, destino.horario
+        for fr in saindo:
+            v = destino_de[id(fr)]
+            fr.embarcacao, fr.horario = v.vessel, v.horario
+
+        from collections import Counter
+        por_lancha = Counter(fr.embarcacao for fr in filled if fr.embarcacao)
+        self.assertEqual(por_lancha["LANCHA 0"], 24)   # 23 que entraram + 1 que ficou
+        self.assertEqual(sum(por_lancha.values()), 71)
+        # Todos os 24 escolhidos estão na primeira lancha.
+        self.assertTrue(all(fr.embarcacao == "LANCHA 0" for fr in tardios))
+        # E nenhuma lancha estourou o programado.
+        resolver = AliasResolver(explicit=dict(PLATFORM_EQUIVALENCES))
+        for slot in voyage_slots(trips):
+            self.assertLessEqual(
+                len(slot_occupants(slot, filled, resolver)), slot.limit, slot.vessel)
+
+
 class TabelaCompletaTests(unittest.TestCase):
     """A tabela mostra a programação do dia inteira, inclusive o que veio pronto.
 
