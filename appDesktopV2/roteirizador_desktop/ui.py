@@ -4444,12 +4444,14 @@ class ManifestosDistribuicaoTab(QWidget):
         "ambiguous":     "#fff3cd",  # amarelo
         "sob_demanda":   "#fde8d8",  # laranja claro
         "already_filled":"#eceff1",  # cinza — veio pronto da planilha
+        "sem_nota":      "#fdecea",  # vermelho claro — nao da nem para rotear
     }
     _STATUS_LABELS = {
         "auto":          "Auto",
         "ambiguous":     "Ambiguo",
         "sob_demanda":   "Sob demanda",
         "already_filled":"Ja preenchido",
+        "sem_nota":      "Nota sem prefixo",
     }
     _COLS = ["Nome Passageiro", "Origem", "Destino",
              "Embarcacao", "Horario", "Nº Viagem", "Tipo", "Status"]
@@ -4518,6 +4520,13 @@ class ManifestosDistribuicaoTab(QWidget):
         )
         self._btn_trocar.clicked.connect(self._trocar_viagem)
         self._btn_trocar.setEnabled(False)
+        self._btn_gad = QPushButton("Programação da GAD")
+        self._btn_gad.setToolTip(
+            "Lê o PDF LANCHAS_<ORIGEM> da GAD e põe cada passageiro na viagem que ele\n"
+            "nomeia. Mostra o que vai mudar antes de aplicar."
+        )
+        self._btn_gad.clicked.connect(self._aplicar_gad)
+        self._btn_gad.setEnabled(False)
         self._btn_comparar = QPushButton("Comparar com PDFs")
         self._btn_comparar.clicked.connect(self._comparar_pdfs)
         self._btn_comparar.setEnabled(False)
@@ -4526,6 +4535,7 @@ class ManifestosDistribuicaoTab(QWidget):
         btn_row.addWidget(self._btn_salvar)
         btn_row.addWidget(self._btn_add_trecho)
         btn_row.addWidget(self._btn_trocar)
+        btn_row.addWidget(self._btn_gad)
         btn_row.addWidget(self._btn_comparar)
         btn_row.addStretch()
         btn_row.addWidget(self._lbl_status)
@@ -4694,6 +4704,7 @@ class ManifestosDistribuicaoTab(QWidget):
         self._populate_table()
         self._btn_salvar.setEnabled(True)
         self._btn_trocar.setEnabled(True)
+        self._btn_gad.setEnabled(True)
         self._btn_comparar.setEnabled(True)
 
         self._lbl_status.setText(self._status_text())
@@ -4703,10 +4714,14 @@ class ManifestosDistribuicaoTab(QWidget):
         amb = sum(1 for fr in self._filled_rows if fr.status == "ambiguous")
         sob = sum(1 for fr in self._filled_rows if fr.status == "sob_demanda")
         ja = sum(1 for fr in self._filled_rows if fr.status == "already_filled")
+        sem = sum(1 for fr in self._filled_rows if fr.status == "sem_nota")
         # "Ja preenchido" so aparece quando existe: numa rodada do zero nao ha nenhuma.
         ja_txt = f"  Ja preenchido: {ja}" if ja else ""
+        # Idem para as linhas sem prefixo na nota: elas nao dao para rotear e o operador
+        # precisa saber que existem, mas na maioria dos dias sao zero.
+        sem_txt = f"  Nota sem prefixo: {sem}" if sem else ""
         return (f"{len(self._filled_rows)} linhas | Auto: {auto}  Ambiguo: {amb}  "
-                f"Sob demanda: {sob}{ja_txt}")
+                f"Sob demanda: {sob}{ja_txt}{sem_txt}")
 
     @staticmethod
     def _apply_selection_group(group, selected_frs: list) -> None:
@@ -5147,6 +5162,84 @@ class ManifestosDistribuicaoTab(QWidget):
         _assign_n_viagem(self._filled_rows, self._n_viagem_map)
         self._trocas_pendentes += 1
         self._populate_table()
+
+    def _aplicar_gad(self) -> None:
+        """Aplica a programação nominal da GAD, lida de um PDF `LANCHAS_<ORIGEM>`.
+
+        O PDF é a única fonte que diz **quem** vai em cada viagem: a operação diz quantos, e
+        o sistema aloca pela ordem das linhas. Como o PDF é uma atribuição completa, não há
+        permuta a negociar — cada pax nomeado vai para a viagem indicada e a lotação fecha
+        sozinha.
+
+        Nada é alterado antes da confirmação: o PDF pode ser de outro dia, pode nomear gente
+        que não está no Dados, e a operação pode não ter programado a viagem que ele indica.
+        A janela mostra os três casos.
+        """
+        from .distribuicao import PLATFORM_EQUIVALENCES, parse_lanchas_pdf
+        from .distribuicao.gad import aplicar_gad, formatar_plano, planejar_gad
+
+        if not self._filled_rows:
+            QMessageBox.information(
+                self, "Programação da GAD", "Processe as planilhas antes.")
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Selecionar o PDF da programação da GAD", "", "PDF (*.pdf)")
+        if not path:
+            return
+
+        try:
+            viagens = parse_lanchas_pdf(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Erro ao ler o PDF", str(exc))
+            return
+        if not viagens:
+            QMessageBox.warning(
+                self, "Programação da GAD",
+                "Nenhuma viagem foi reconhecida nesse PDF.\n\nO arquivo esperado é do tipo "
+                "LANCHAS_<ORIGEM>, com a lista nominal de cada viagem.")
+            return
+
+        data_planilha = self._dados_date([fr.dados_row for fr in self._filled_rows])
+        plano = planejar_gad(self._filled_rows, viagens, self._trips, data_planilha,
+                             extra_aliases=PLATFORM_EQUIVALENCES)
+
+        if not plano.viagens_lidas:
+            QMessageBox.warning(
+                self, "Programação da GAD",
+                f"Nenhuma viagem do PDF é de "
+                f"{data_planilha.strftime('%d/%m/%Y') if data_planilha else 'hoje'}, "
+                "a data da planilha Dados.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Programação da GAD")
+        dlg.setMinimumSize(780, 560)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel(f"<b>{Path(path).name}</b>"))
+        texto = QTextEdit()
+        texto.setReadOnly(True)
+        texto.setStyleSheet("font-family: Consolas, monospace;")
+        texto.setPlainText(formatar_plano(plano))
+        layout.addWidget(texto)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        aplicar = btns.button(QDialogButtonBox.Ok)
+        aplicar.setText(f"Aplicar {len(plano.mudancas)} mudança(s)")
+        aplicar.setEnabled(bool(plano.mudancas))
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+
+        if dlg.exec() != QDialog.Accepted or not plano.mudancas:
+            return
+
+        aplicar_gad(plano)
+        self._renumerar()
+        QMessageBox.information(
+            self, "Programação da GAD",
+            f"{len(plano.mudancas)} passageiro(s) movido(s) conforme o PDF."
+            "\n\nLembre de salvar na planilha: a alteração vale só nesta sessão.")
 
     def _trocar_viagem(self) -> None:
         """Troca pareada: duas listas lado a lado, escolhendo pessoa em vez de viagem.

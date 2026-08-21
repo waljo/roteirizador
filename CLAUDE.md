@@ -1364,6 +1364,130 @@ alterar as tabelas de escolha de passageiro, cuja marca é o check verde.
 
 ---
 
+## Feature: aplicar a programação nominal da GAD (PDF `LANCHAS_<ORIGEM>`)
+
+### Por que ela existe
+
+O PDF da GAD é a **única** fonte que diz **quem** vai em cada viagem. A planilha de operação
+diz *quantos*; o Dados não diz nada a respeito. Quando os totais fecham, o sistema não
+pergunta nada e aloca pela ordem das linhas — então *quem* sai por acaso, e o operador
+corrigia um por um.
+
+Em 21/08 isso custou a manhã inteira: 54 trocas à mão para pôr os 24 da 1905 e os 24 da 1931
+nos nomes que a GAD determinou.
+
+### A rotina reproduz o trabalho manual, linha a linha
+
+O teste que fecha o caso, e que virou `GadIntegrationTests`: partindo da distribuição
+automática do zero, aplicar o PDF de 21/08 dá **54 mudanças** e o resultado é **idêntico à
+planilha que o operador salvou à mão — 209 de 209 linhas**, sem nenhuma viagem mudando de
+tamanho.
+
+### Por que não há permuta a negociar
+
+O PDF é uma atribuição **completa**: ele nomeia todo mundo de cada viagem. Então cada pax
+nomeado vai direto para a viagem indicada e a lotação fecha sozinha — não há vaga a calcular,
+nem `swap_vacancies`, nem `match_displaced`. É a diferença para a troca manual, onde o
+operador move uma pessoa e alguém tem de ceder o lugar.
+
+### O parser já existia
+
+`parse_lanchas_pdf`, escrito para o "Comparar com PDFs", lê esse arquivo **sem nenhuma
+alteração**: 8 viagens, 145 nomes, com lancha, horário, roteiro e data.
+
+### API (`distribuicao/gad.py`)
+
+```python
+planejar_gad(filled, viagens, trips, data_planilha, resolver=None, extra_aliases=None) -> PlanoGad
+aplicar_gad(plano) -> int
+formatar_plano(plano, limite=40) -> str
+```
+
+`PlanoGad` separa cinco situações, e **nenhuma delas altera nada antes da confirmação**:
+
+| Campo | O que é |
+|---|---|
+| `mudancas` | o pax está numa viagem e o PDF o põe em outra |
+| `ja_certos` | já está onde o PDF manda |
+| `sem_linha` | nomeado no PDF e ausente na planilha Dados |
+| `sem_viagem` | o PDF manda para uma viagem que a operação não programou para ele |
+| `fora_do_pdf` | está numa viagem que o PDF cobre e o PDF não o nomeia |
+| `outras_datas` | viagem descartada por ser de outro dia |
+
+Quatro regras que custaram um teste cada:
+
+- **A operação é a autoridade sobre o que existe.** A viagem do PDF é casada por
+  `(embarcação, horário)` — nunca pelo número, que o PDF numera como ordinal por origem — e
+  o pax só é movido se a perna **atende a movimentação dele** (`slot_matches_row`). Sem essa
+  segunda metade, um pax de destino B1 nomeado na 1905 06:30 (que vai ao M9) iria para uma
+  lancha que não passa no destino dele.
+- **Filtro por data**, como na comparação: na pasta convivem PDFs de dias diferentes.
+- **Uma linha do Dados é reivindicada por uma única viagem.** Sem isso um homônimo — ou uma
+  grafia que casa com dois — poria a mesma pessoa em duas viagens.
+- **Casamento de nome pelo `_same_person`** do `comparar`, que já resolve ordem trocada,
+  truncamento e as grafias divergentes das duas fontes.
+
+**`fora_do_pdf` é reportado e não movido**: tirar alguém da viagem exigiria decidir para onde,
+e essa decisão é do operador.
+
+### Interface
+
+Botão **Programação da GAD** na aba, habilitado depois de Processar. Seletor de **arquivo**
+— escolha do operador, e não de pasta como na comparação: são um ou dois PDFs por dia e ele
+sabe qual acabou de receber. A janela mostra o relatório completo e o botão diz
+`Aplicar N mudança(s)`, desabilitado quando não há nenhuma. Depois de aplicar, a numeração é
+refeita pelo `_renumerar` e a alteração conta como troca pendente — vale só na sessão, quem a
+guarda é a planilha.
+
+### Fix — a linha sem prefixo na Descrição da Nota sumia
+
+Achado por esta análise: dos 145 nomes do PDF, um não foi encontrado —
+`THIAGO DOS SANTOS SANTANA`, `TMIB → PCM-05`.
+
+Ele **está** no Dados (L11 e L12), mas a Descrição da Nota veio **sem o prefixo de
+plataforma**: `'THIAGO DOS SANTOS SANTANA'` em vez de `'TMIB: THIAGO DOS SANTOS SANTANA'`.
+Sem prefixo, `_nota_origin` devolve `None`, `_row_platforms` devolve `None` e o
+`fill_rows` fazia `continue` — a linha **desaparecia**, nem como `sob_demanda`.
+
+O custo era operacional e silencioso:
+
+```
+SURFER 1870 06:30 → PCM-05
+   a operação programou:  11
+   o PDF da GAD nomeia:   11
+   o aplicativo mostrava: 10      ← THIAGO fora do manifesto
+```
+
+**Solução**: `_platforms_only(row, resolver)` canoniza origem e destino sem exigir o prefixo.
+Quando só o prefixo falta, a linha entra no resultado com o status novo **`sem_nota`**
+("Nota sem prefixo", vermelho claro na tabela), com o tipo derivado de origem e destino. Ela
+não casa com leg nenhuma — sem a origem do pax não há como casar — mas fica visível, e o
+rodapé passa a contar `Nota sem prefixo: N` quando existe.
+
+**Escopo deliberado**: só o prefixo da nota. A plataforma desconhecida continua na pendência
+separada (o `_canonical_from_raw` cai no `return raw`), e há um teste que pina esse
+comportamento para a correção não tê-lo mudado sem querer.
+
+### Testes
+
+`NotaSemPrefixoTests` (4), `GadPdfTests` (11) e `GadIntegrationTests` (4) — 226 no total.
+Mutações que a suíte pega:
+
+| Mutação | Falhas |
+|---|---|
+| não checar se a operação atende a movimentação | 1 |
+| sem filtro de data | 1 |
+| uma linha reivindicada por duas viagens | 1 |
+| casamento de nome por igualdade exata | 3 |
+| voltar a descartar a linha sem prefixo | 3 |
+
+A primeira mutação **passou na primeira tentativa**: o teste original mandava o pax para uma
+lancha que nem existia no horário, e aí qualquer implementação recusa. Foi reescrito com a
+viagem existindo e não servindo à movimentação, que é o caso que a regra protege.
+
+
+---
+
 ## Feature: comparação com as programações oficiais em PDF
 
 ### Motivação
@@ -1497,9 +1621,9 @@ Duas outras proteções, ambas descobertas apontando o seletor para `Downloads`,
 
 ### Testes
 
-207 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
+226 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
 `pip install` falha no certificado TLS do Netskope). Os do módulo de distribuição estão em
-`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (127).
+`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (146).
 
 ```bash
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
@@ -1524,7 +1648,7 @@ respectivamente). Um teste que não falha quando o bug volta não protege nada.
 
 ### Testes da classificação (`tests/test_distribuicao_filler.py`)
 
-127 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
+146 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
 para ligar a regra ao caso que a originou.
 
 | Grupo | O que protege |
@@ -1540,6 +1664,9 @@ para ligar a regra ao caso que a originou.
 | `FiltroDestinoTests` | a mensagem nomeando a linha intrusa e o filtro Destino isolando o lote |
 | `SelecaoFiltradaTests` | a linha escondida pelo filtro não entrar na seleção do Shift+clique |
 | `BuscaComAcentoTests` | a busca achar quem tem acento no nome, e o indicador da caixa de marcar ser desenhado no estilo do Windows 11 |
+| `NotaSemPrefixoTests` | a linha sem prefixo na nota aparecer em vez de sumir, sem consumir vaga |
+| `GadPdfTests` | a rotina do PDF da GAD: a operação como autoridade, filtro de data, uma linha por viagem, grafias divergentes |
+| `GadIntegrationTests` | as 54 mudanças de 21/08 reproduzindo a planilha do operador linha a linha. `skipUnless` |
 | `TrocaEmLoteTests` | interseção das viagens, vagas vindas de quem tinha viagem, emparelhamento máximo dos deslocados, recusa quando a troca não fecha, e o cenário dos 71 pax da GAD |
 | `ArredondamentoHorarioTests` | múltiplo de 10 mais próximo, empate intacto, virada de hora e de dia, e a numeração não reordenando |
 | `TabelaCompletaTests` | as linhas já preenchidas aparecem, o índice do UserRole aponta para a lista certa, e editar uma delas marca para gravar |
@@ -1617,7 +1744,7 @@ são erro do sistema:
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
 cd /mnt/c/Users/ka20/roteirizador/appDesktopV2
 
-# Suíte completa — 207 testes, em unittest (stdlib)
+# Suíte completa — 226 testes, em unittest (stdlib)
 $PY -m unittest discover -s tests -v
 
 # Um arquivo só

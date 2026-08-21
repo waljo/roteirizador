@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import json
 import unittest
-from datetime import time
+from collections import Counter
+from datetime import date, time
 from pathlib import Path
 
 from roteirizador_desktop.distribuicao import (
@@ -1961,6 +1962,304 @@ class BuscaComAcentoTests(unittest.TestCase):
         finally:
             self.app.setStyleSheet("")
             self.app.setStyle(anterior)
+
+
+class NotaSemPrefixoTests(unittest.TestCase):
+    """A linha sem prefixo na Descrição da Nota não pode sumir — e sumia.
+
+    Em 21/08 o THIAGO DOS SANTOS SANTANA veio com a descrição `'THIAGO DOS SANTOS SANTANA'`
+    em vez de `'TMIB: THIAGO DOS SANTOS SANTANA'`. Sem o prefixo o sistema não canoniza a
+    linha e ela era descartada em silêncio: a perna do SURFER 1870 06:30 ficou com 10 pax
+    onde a operação programou 11 e o PDF da GAD nomeia 11, sem nada avisar.
+    """
+
+    @staticmethod
+    def _cenario():
+        bom = row(1, "PAX BOM", "TMIB", "TMIB", "PCM-5")
+        mudo = row(2, "THIAGO DOS SANTOS SANTANA", "TMIB", "TMIB", "PCM-5")
+        mudo.desc = "THIAGO DOS SANTOS SANTANA"          # sem o prefixo de plataforma
+        trips = [VesselTrip("SURFER 1870", [
+            leg("SURFER 1870", "TMIB", "PCM-05", time(6, 30), pax_origin="TMIB", pax=2)])]
+        return [bom, mudo], trips
+
+    def test_the_row_shows_up_instead_of_vanishing(self):
+        rows, trips = self._cenario()
+        filled, _, _ = run(rows, trips)
+        self.assertEqual(len(filled), 2)
+        mudo = by_excel(filled)[2]
+        self.assertEqual(mudo.status, "sem_nota")
+        # O tipo ainda sai de origem e destino, que é o que a linha tem de legível.
+        self.assertEqual(mudo.tipo_viagem, "EMBARQUE")
+
+    def test_it_is_not_assigned_to_any_voyage(self):
+        """Sem o prefixo não há como saber a origem do pax, então não se casa com leg."""
+        rows, trips = self._cenario()
+        filled, _, _ = run(rows, trips)
+        mudo = by_excel(filled)[2]
+        self.assertIsNone(mudo.embarcacao)
+        self.assertIsNone(mudo.horario)
+
+    def test_it_does_not_consume_a_seat_of_the_leg(self):
+        rows, trips = self._cenario()
+        filled, _, _ = run(rows, trips)
+        self.assertEqual(by_excel(filled)[1].embarcacao, "SURFER 1870")
+
+    def test_an_unknown_platform_keeps_its_own_known_behaviour(self):
+        """Escopo desta correção: só o prefixo da nota.
+
+        A plataforma desconhecida é a pendência separada e continua como estava: o
+        `_canonical_from_raw` cai no `return raw`, a linha entra como `sob_demanda` com um
+        canônico inventado (`PLATAFORMAQUENAOEXISTE`) e não casa com leg nenhuma. Fica
+        pinado aqui para a correção do prefixo não ter mudado isso sem querer.
+        """
+        r = row(1, "PAX", "TMIB", "TMIB", "PLATAFORMA QUE NAO EXISTE")
+        filled, _, _ = run([r], [])
+        self.assertEqual(len(filled), 1)
+        self.assertEqual(filled[0].status, "sob_demanda")
+        self.assertEqual(filled[0].destino_canonical, "PLATAFORMAQUENAOEXISTE")
+
+
+class GadPdfTests(unittest.TestCase):
+    """A rotina que aplica a programação nominal da GAD, lida do PDF `LANCHAS_<ORIGEM>`.
+
+    O PDF é a única fonte que diz **quem** vai em cada viagem: a operação diz quantos, e o
+    sistema aloca pela ordem das linhas. Como é uma atribuição completa, não há permuta a
+    negociar — cada pax nomeado vai para a viagem indicada e a lotação fecha sozinha.
+    """
+
+    @staticmethod
+    def _cenario():
+        """4 pax TMIB → M9 em duas viagens de 2. O PDF inverte quem vai em cada uma."""
+        rows = [row(i, f"PAX{i}", "TMIB", "TMIB", "PCM-9") for i in range(1, 5)]
+        trips = [
+            VesselTrip("SURFER 1905", [
+                leg("SURFER 1905", "TMIB", "PCM-09", time(6, 30), pax_origin="TMIB", pax=2)]),
+            VesselTrip("SURFER 1931", [
+                leg("SURFER 1931", "TMIB", "PCM-09", time(6, 40), pax_origin="TMIB", pax=2)]),
+        ]
+        return rows, trips
+
+    @staticmethod
+    def _viagem(vessel, horario, nomes, data=None):
+        from roteirizador_desktop.distribuicao.pdf_lanchas import PdfMovement, PdfVoyage
+        return PdfVoyage(
+            source="LANCHAS_TMIB.pdf", base="TMIB", ordinal=1, vessel=vessel,
+            horario=horario, roteiro="TMIB X PCM-09", data=data,
+            movements=[PdfMovement(origem="TMIB", destino="PCM-09", nome=n) for n in nomes])
+
+    def _plano(self, filled, viagens, trips, data=None):
+        from roteirizador_desktop.distribuicao.gad import planejar_gad
+        return planejar_gad(filled, viagens, trips, data,
+                            extra_aliases=PLATFORM_EQUIVALENCES)
+
+    def test_the_pdf_reassigns_who_goes_on_each_voyage(self):
+        from roteirizador_desktop.distribuicao.gad import aplicar_gad
+        rows, trips = self._cenario()
+        filled, _, _ = run(rows, trips)
+        got = by_excel(filled)
+        self.assertEqual([got[i].embarcacao for i in (1, 2, 3, 4)],
+                         ["SURFER 1905", "SURFER 1905", "SURFER 1931", "SURFER 1931"])
+
+        plano = self._plano(filled, [
+            self._viagem("SURFER 1905", time(6, 30), ["PAX3", "PAX4"]),
+            self._viagem("SURFER 1931", time(6, 40), ["PAX1", "PAX2"]),
+        ], trips)
+        self.assertEqual(len(plano.mudancas), 4)
+        self.assertEqual(plano.ja_certos, 0)
+        aplicar_gad(plano)
+        self.assertEqual([got[i].embarcacao for i in (1, 2, 3, 4)],
+                         ["SURFER 1931", "SURFER 1931", "SURFER 1905", "SURFER 1905"])
+
+    def test_no_voyage_changes_size(self):
+        """O PDF é uma atribuição completa, então a lotação fecha sozinha."""
+        from roteirizador_desktop.distribuicao.gad import aplicar_gad
+        rows, trips = self._cenario()
+        filled, _, _ = run(rows, trips)
+        antes = Counter((fr.embarcacao, fr.horario) for fr in filled if fr.embarcacao)
+        aplicar_gad(self._plano(filled, [
+            self._viagem("SURFER 1905", time(6, 30), ["PAX3", "PAX4"]),
+            self._viagem("SURFER 1931", time(6, 40), ["PAX1", "PAX2"]),
+        ], trips))
+        self.assertEqual(
+            Counter((fr.embarcacao, fr.horario) for fr in filled if fr.embarcacao), antes)
+
+    def test_running_it_twice_moves_nobody_the_second_time(self):
+        from roteirizador_desktop.distribuicao.gad import aplicar_gad
+        rows, trips = self._cenario()
+        filled, _, _ = run(rows, trips)
+        viagens = [self._viagem("SURFER 1905", time(6, 30), ["PAX3", "PAX4"]),
+                   self._viagem("SURFER 1931", time(6, 40), ["PAX1", "PAX2"])]
+        aplicar_gad(self._plano(filled, viagens, trips))
+        segundo = self._plano(filled, viagens, trips)
+        self.assertEqual(len(segundo.mudancas), 0)
+        self.assertEqual(segundo.ja_certos, 4)
+
+    def test_a_voyage_from_another_day_is_discarded(self):
+        """Na pasta convivem PDFs de dias diferentes; cruzá-los não pode ser silencioso."""
+        rows, trips = self._cenario()
+        filled, _, _ = run(rows, trips)
+        plano = self._plano(
+            filled,
+            [self._viagem("SURFER 1905", time(6, 30), ["PAX3", "PAX4"], date(2026, 8, 20))],
+            trips, date(2026, 8, 21))
+        self.assertEqual(len(plano.mudancas), 0)
+        self.assertEqual(len(plano.outras_datas), 1)
+
+    def test_a_voyage_that_does_not_exist_is_refused(self):
+        rows, trips = self._cenario()
+        filled, _, _ = run(rows, trips)
+        plano = self._plano(
+            filled, [self._viagem("SURFER 1870", time(14, 0), ["PAX1"])], trips)
+        self.assertEqual(len(plano.mudancas), 0)
+        self.assertEqual([n for n, *_ in plano.sem_viagem], ["PAX1"])
+
+    def test_the_operacao_is_the_authority_on_who_that_voyage_carries(self):
+        """A viagem existe, mas não atende a movimentação daquele pax.
+
+        Este é o caso que a checagem `slot_matches_row` protege, e o anterior não protegia:
+        lá a lancha nem existe no horário, então qualquer implementação recusa. Aqui a
+        SURFER 1905 06:30 existe e vai para o M9 — mandar nela um pax de destino B1 poria
+        alguém numa lancha que não passa no destino dele.
+        """
+        from roteirizador_desktop.distribuicao.pdf_lanchas import PdfMovement
+
+        rows, trips = self._cenario()
+        rows[0].destino_raw = "PCB-1"
+        filled, _, _ = run(rows, trips)
+        viagem = self._viagem("SURFER 1905", time(6, 30), [])
+        viagem.movements = [PdfMovement(origem="TMIB", destino="PCB-01", nome="PAX1")]
+
+        plano = self._plano(filled, [viagem], trips)
+        self.assertEqual(len(plano.mudancas), 0)
+        self.assertEqual([n for n, *_ in plano.sem_viagem], ["PAX1"])
+
+    def test_a_name_only_in_the_pdf_is_reported(self):
+        rows, trips = self._cenario()
+        filled, _, _ = run(rows, trips)
+        plano = self._plano(
+            filled, [self._viagem("SURFER 1931", time(6, 40), ["FULANO DE TAL"])], trips)
+        self.assertEqual([n for n, *_ in plano.sem_linha], ["FULANO DE TAL"])
+
+    def test_spelling_differences_still_match(self):
+        """As duas fontes grafam o mesmo pax de formas diferentes."""
+        rows, trips = self._cenario()
+        rows[0].name = "MANOEL MESSIAS DOS SANTOS PORTELA"
+        filled, _, _ = run(rows, trips)
+        plano = self._plano(filled, [
+            self._viagem("SURFER 1931", time(6, 40),
+                         ["MANOEL MESSIAS SANTOS PORTELA"])], trips)
+        self.assertEqual(plano.sem_linha, [])
+        self.assertEqual(len(plano.mudancas), 1)
+
+    def test_one_row_is_claimed_by_a_single_voyage(self):
+        """Sem isso um nome que casa em duas viagens seria posto nas duas."""
+        rows, trips = self._cenario()
+        filled, _, _ = run(rows, trips)
+        plano = self._plano(filled, [
+            self._viagem("SURFER 1931", time(6, 40), ["PAX1"]),
+            self._viagem("SURFER 1905", time(6, 30), ["PAX1"]),
+        ], trips)
+        self.assertEqual(len(plano.mudancas), 1)
+        self.assertEqual([n for n, *_ in plano.sem_linha], ["PAX1"])
+
+    def test_who_the_pdf_does_not_name_is_reported_and_not_moved(self):
+        """Sair da viagem exigiria decidir para onde, e essa decisão é do operador."""
+        from roteirizador_desktop.distribuicao.gad import aplicar_gad
+        rows, trips = self._cenario()
+        filled, _, _ = run(rows, trips)
+        got = by_excel(filled)
+        plano = self._plano(
+            filled, [self._viagem("SURFER 1905", time(6, 30), ["PAX1"])], trips)
+        self.assertIn("PAX2", [fr.dados_row.name for fr in plano.fora_do_pdf])
+        aplicar_gad(plano)
+        self.assertEqual(got[2].embarcacao, "SURFER 1905")
+
+    def test_the_report_names_what_will_change(self):
+        from roteirizador_desktop.distribuicao.gad import formatar_plano
+        rows, trips = self._cenario()
+        filled, _, _ = run(rows, trips)
+        texto = formatar_plano(self._plano(filled, [
+            self._viagem("SURFER 1931", time(6, 40), ["PAX1"])], trips))
+        self.assertIn("Serão movidos: 1", texto)
+        self.assertIn("PAX1: SURFER 1905 06:30  →  SURFER 1931 06:40", texto)
+
+
+_PDF_GAD = _DOWNLOADS / "LANCHAS_TMIB - 21_08_2026.pdf"
+_MANIFESTOS = (Path.home() / "PETROBRAS" / "LOEP LPM ONNE TMCP - Roteirizador"
+               / "1. Arquivos Manifestos")
+_DADOS_21 = _MANIFESTOS / "Cópia de Tabela roteiro dia 21.08.2026.xlsx"
+_OPERACAO_21 = _MANIFESTOS / "2026_08_21_PROGRAMAÇÃO.xlsx"
+
+
+@unittest.skipUnless(
+    _PDF_GAD.exists() and _DADOS_21.exists() and _OPERACAO_21.exists(),
+    "arquivos de referência de 21/08 não disponíveis nesta máquina",
+)
+class GadIntegrationTests(unittest.TestCase):
+    """A rotina contra o dia real: ela tem de reproduzir o trabalho manual do operador.
+
+    A planilha de 21/08 foi salva com as 54 trocas que o operador fez à mão a partir do PDF
+    da GAD. Zerando as quatro colunas voltamos à distribuição automática, que é o estado em
+    que a rotina entraria — e o resultado dela tem de ser a planilha de volta, linha a linha.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from dataclasses import replace
+        from roteirizador_desktop.distribuicao import parse_operacao, read_dados
+        from roteirizador_desktop.distribuicao.pdf_lanchas import parse_lanchas_pdf
+
+        cls.trips = parse_operacao(str(_OPERACAO_21))
+        salvo = read_dados(str(_DADOS_21))
+        cls.gabarito = {r.excel_row: (r.embarcacao, r.horario) for r in salvo}
+        cls.zerado = [replace(r, embarcacao=None, horario=None, n_viagem=None,
+                              tipo_viagem=None) for r in salvo]
+        cls.viagens = parse_lanchas_pdf(str(_PDF_GAD))
+
+    def _distribuicao(self):
+        filled, _, mapa = run(self.zerado, self.trips)
+        _assign_n_viagem(filled, mapa)
+        return filled
+
+    def test_the_pdf_is_read_whole(self):
+        self.assertEqual(len(self.viagens), 8)
+        self.assertEqual(sum(len(v.movements) for v in self.viagens), 145)
+        self.assertTrue(all(v.data == date(2026, 8, 21) for v in self.viagens))
+
+    def test_it_reproduces_the_operator_sheet_row_by_row(self):
+        from roteirizador_desktop.distribuicao.gad import aplicar_gad, planejar_gad
+        filled = self._distribuicao()
+        plano = planejar_gad(filled, self.viagens, self.trips, date(2026, 8, 21),
+                             extra_aliases=PLATFORM_EQUIVALENCES)
+        self.assertEqual(len(plano.mudancas), 54)
+        aplicar_gad(plano)
+        _assign_n_viagem(filled, rebuild_n_viagem(
+            filled, self.trips, extra_aliases=PLATFORM_EQUIVALENCES))
+        difs = [fr.dados_row.excel_row for fr in filled
+                if self.gabarito.get(fr.dados_row.excel_row)
+                != (fr.embarcacao, fr.horario)]
+        self.assertEqual(difs, [])
+
+    def test_no_voyage_changes_size_on_the_real_day(self):
+        from roteirizador_desktop.distribuicao.gad import aplicar_gad, planejar_gad
+        filled = self._distribuicao()
+        antes = Counter((fr.embarcacao, fr.horario) for fr in filled if fr.embarcacao)
+        aplicar_gad(planejar_gad(filled, self.viagens, self.trips, date(2026, 8, 21),
+                                 extra_aliases=PLATFORM_EQUIVALENCES))
+        self.assertEqual(
+            Counter((fr.embarcacao, fr.horario) for fr in filled if fr.embarcacao), antes)
+
+    def test_the_only_unmatched_name_is_the_row_without_a_note_prefix(self):
+        """THIAGO DOS SANTOS SANTANA: está no Dados, mas a nota veio sem o prefixo."""
+        from roteirizador_desktop.distribuicao.gad import planejar_gad
+        filled = self._distribuicao()
+        plano = planejar_gad(filled, self.viagens, self.trips, date(2026, 8, 21),
+                             extra_aliases=PLATFORM_EQUIVALENCES)
+        self.assertEqual([n for n, *_ in plano.sem_linha], ["THIAGO DOS SANTOS SANTANA"])
+        self.assertEqual(plano.sem_viagem, [])
+        sem_nota = [fr for fr in filled if fr.status == "sem_nota"]
+        self.assertIn("THIAGO DOS SANTOS SANTANA",
+                      [fr.dados_row.name for fr in sem_nota])
 
 
 if __name__ == "__main__":

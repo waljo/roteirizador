@@ -63,7 +63,8 @@ class DadosRow:
     tipo_viagem: str | None
 
 
-FilledStatus = Literal["auto", "ambiguous", "sob_demanda", "already_filled"]
+FilledStatus = Literal["auto", "ambiguous", "sob_demanda", "already_filled",
+                       "sem_nota"]
 
 
 @dataclass

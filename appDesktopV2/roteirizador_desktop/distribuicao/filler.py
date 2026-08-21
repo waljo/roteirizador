@@ -254,21 +254,29 @@ def _matches(
     return False
 
 
+def _platforms_only(
+    row: DadosRow, resolver: AliasResolver
+) -> tuple[str, str] | None:
+    """(origem, destino) canonicos, sem exigir o prefixo da nota."""
+    if not row.origem_raw or not row.destino_raw:
+        return None
+    try:
+        return resolver.canonical(row.origem_raw), resolver.canonical(row.destino_raw)
+    except (ValueError, AttributeError):
+        return None
+
+
 def _row_platforms(
     row: DadosRow, resolver: AliasResolver
 ) -> tuple[str, str, str] | None:
     """(origem, destino, nota_origin) canonicos, ou None se a linha nao da para casar."""
-    if not row.origem_raw or not row.destino_raw:
-        return None
-    try:
-        origem_c = resolver.canonical(row.origem_raw)
-        destino_c = resolver.canonical(row.destino_raw)
-    except (ValueError, AttributeError):
+    plataformas = _platforms_only(row, resolver)
+    if plataformas is None:
         return None
     nota_origin = _nota_origin(row.desc, resolver)
     if nota_origin is None:
         return None
-    return origem_c, destino_c, nota_origin
+    return plataformas[0], plataformas[1], nota_origin
 
 
 def _same_vessel(a: str | None, b: str | None) -> bool:
@@ -807,6 +815,26 @@ def fill_rows(
             continue
 
         if keys is None:
+            # Sem o prefixo de plataforma na Descricao da Nota a linha nao casa com leg
+            # nenhuma — mas ela nao pode sumir, e sumia. Em 21/08 o THIAGO DOS SANTOS
+            # SANTANA veio com a descricao `'THIAGO DOS SANTOS SANTANA'` em vez de
+            # `'TMIB: THIAGO DOS SANTOS SANTANA'`, e a perna do 1870 06:30 ficou com 10 pax
+            # onde a operacao programou 11 e o PDF da GAD nomeia 11. Nada avisava.
+            plataformas = _platforms_only(row, resolver)
+            if plataformas is None:
+                continue
+            origem_c, destino_c = plataformas
+            filled.append(FilledRow(
+                dados_row=row,
+                embarcacao=None,
+                horario=None,
+                n_viagem=None,
+                tipo_viagem=_classify(
+                    origem_c, destino_c, _normalize_name(row.name) in returning),
+                status="sem_nota",
+                destino_canonical=destino_c,
+                pax_origin=None,
+            ))
             continue
         origem_c, destino_c, nota_origin = keys
 
