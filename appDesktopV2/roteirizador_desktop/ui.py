@@ -3936,6 +3936,11 @@ class _TrocaParesDialog(QDialog):
         self._pares: dict = {}        # id(selecionado) -> candidato
         self._usados: dict = {}       # id(candidato)   -> selecionado
         self._ativo = None            # indice em self._frs
+        # (coluna, crescente) por lado, ou None para a ordem de entrada. A ordenacao e
+        # nossa, nao a do Qt: o `_render` reconstroi as duas tabelas a cada clique e o
+        # `setSortingEnabled` perderia a ordem justamente ai.
+        self._ordem_esq = None
+        self._ordem_dir = None
         # Por identidade: FilledRow e dataclass com __eq__, entao list.index() pode
         # devolver a posicao de uma linha equivalente em vez da propria.
         self._pos_esq = {id(fr): i for i, fr in enumerate(self._frs)}
@@ -4015,6 +4020,12 @@ class _TrocaParesDialog(QDialog):
         tabela.horizontalHeader().setStretchLastSection(True)
         tabela.cellClicked.connect(
             self._clique_esq if lado == "esq" else self._clique_dir)
+        cabecalho = tabela.horizontalHeader()
+        cabecalho.setToolTip("Clique no cabeçalho para ordenar por esta coluna.")
+        cabecalho.setSortIndicatorShown(True)
+        cabecalho.setSectionsClickable(True)
+        cabecalho.sectionClicked.connect(
+            lambda col, l=lado: self._ordenar(l, col))
         v.addWidget(tabela)
 
         if lado == "esq":
@@ -4037,48 +4048,81 @@ class _TrocaParesDialog(QDialog):
         n = f" · v{fr.n_viagem}" if fr.n_viagem else ""
         return f"{fr.embarcacao} · {hor}{n}"
 
+    def _valores_esq(self, fr) -> list:
+        par = self._pares.get(id(fr))
+        return [fr.dados_row.name or "", self._mov_txt(fr), self._viagem_txt(fr),
+                (f"{par.dados_row.name or ''} ({self._viagem_txt(par)})" if par else "")]
+
+    def _valores_dir(self, cand) -> list:
+        dono = self._usados.get(id(cand))
+        return [cand.dados_row.name or "", self._mov_txt(cand), self._viagem_txt(cand),
+                (dono.dados_row.name or "") if dono else ""]
+
+    # ----- ordenacao ----------------------------------------------------------------
+    @staticmethod
+    def _chave_ordem(texto: str) -> str:
+        """Sem acento e em caixa alta: senao ANDRÉ cai depois de ANTONIO."""
+        sem_acento = unicodedata.normalize("NFKD", texto or "")
+        return "".join(c for c in sem_acento if not unicodedata.combining(c)).upper()
+
+    def _ordenar(self, lado: str, col: int) -> None:
+        atual = self._ordem_esq if lado == "esq" else self._ordem_dir
+        nova = (col, not atual[1]) if atual and atual[0] == col else (col, True)
+        if lado == "esq":
+            self._ordem_esq = nova
+        else:
+            self._ordem_dir = nova
+        self._render()
+
+    def _ordenados(self, frs: list, ordem, valores) -> list:
+        if ordem is None:
+            return frs
+        col, crescente = ordem
+        return sorted(frs, key=lambda fr: self._chave_ordem(valores(fr)[col]),
+                      reverse=not crescente)
+
     # ----- render -----------------------------------------------------------------
-    def _visiveis(self, frs: list, busca) -> list:
+    def _visiveis(self, frs: list, busca, ordem, valores) -> list:
         termo = busca.text().strip().lower()
-        if not termo:
-            return list(frs)
-        return [fr for fr in frs if termo in (fr.dados_row.name or "").lower()]
+        if termo:
+            frs = [fr for fr in frs if termo in (fr.dados_row.name or "").lower()]
+        return self._ordenados(list(frs), ordem, valores)
 
     def _render(self) -> None:
         from .distribuicao.filler import can_swap_pair
 
         ativo = self._frs[self._ativo] if self._ativo is not None else None
 
-        visiveis = self._visiveis(self._frs, self._busca_esq)
+        visiveis = self._visiveis(self._frs, self._busca_esq, self._ordem_esq,
+                                  self._valores_esq)
         self._tab_esq.setRowCount(len(visiveis))
         for r, fr in enumerate(visiveis):
-            par = self._pares.get(id(fr))
-            valores = [fr.dados_row.name or "", self._mov_txt(fr), self._viagem_txt(fr),
-                       (f"{par.dados_row.name or ''} ({self._viagem_txt(par)})"
-                        if par else "")]
             fundo = (self._ATIVO_BG if fr is ativo
-                     else self._PAR_BG if par else None)
-            self._preenche(self._tab_esq, r, valores, self._pos_esq[id(fr)],
+                     else self._PAR_BG if self._pares.get(id(fr)) else None)
+            self._preenche(self._tab_esq, r, self._valores_esq(fr), self._pos_esq[id(fr)],
                            fundo, negrito=fr is ativo)
 
-        visiveis = self._visiveis(self._pool.candidatos, self._busca_dir)
+        visiveis = self._visiveis(self._pool.candidatos, self._busca_dir, self._ordem_dir,
+                                  self._valores_dir)
         self._tab_dir.setRowCount(len(visiveis))
         for r, cand in enumerate(visiveis):
             dono = self._usados.get(id(cand))
-            valores = [cand.dados_row.name or "", self._mov_txt(cand),
-                       self._viagem_txt(cand),
-                       (dono.dados_row.name or "") if dono else ""]
             # Cinza = a operacao nao programou nenhuma viagem que sirva aos dois. O pax
             # continua visivel, para o operador nao procurar por alguem que sumiu da lista.
             invalido = ativo is not None and not can_swap_pair(self._pool, ativo, cand)
-            self._preenche(self._tab_dir, r, valores,
+            self._preenche(self._tab_dir, r, self._valores_dir(cand),
                            self._pos_dir[id(cand)],
                            self._PAR_BG if dono else None,
                            cinza=invalido and not dono)
 
-        for tabela in (self._tab_esq, self._tab_dir):
+        for tabela, ordem in ((self._tab_esq, self._ordem_esq),
+                              (self._tab_dir, self._ordem_dir)):
             tabela.resizeColumnsToContents()
-            tabela.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+            cabecalho = tabela.horizontalHeader()
+            cabecalho.setSectionResizeMode(0, QHeaderView.Stretch)
+            if ordem is not None:
+                cabecalho.setSortIndicator(
+                    ordem[0], Qt.AscendingOrder if ordem[1] else Qt.DescendingOrder)
 
         n = len(self._pares)
         self._contador.setText(f"{n} troca(s) montada(s)")

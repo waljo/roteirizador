@@ -1154,6 +1154,20 @@ uma com busca por nome:
   avisasse.
 - `Desfazer par`, `Limpar todos`, contador `N troca(s) montada(s)` e o OK só habilitado com
   pelo menos um par.
+- **Clicar no cabeçalho ordena por aquela coluna**, e clicar de novo inverte. Cada lado tem a
+  sua ordem, com o indicador de seta no cabeçalho. Pedido do operador ao ver a janela com 88
+  selecionados: a ordem de entrada é a da tabela principal, que não ajuda a achar ninguém.
+  Ordenar por `Viagem atual` agrupa as lanchas; por `Entra no lugar`, junta o que já foi
+  montado.
+
+  A ordenação é nossa, não o `setSortingEnabled` do Qt: o `_render` reconstrói as duas
+  tabelas a cada clique e a ordem do Qt se perderia exatamente aí. O estado é
+  `(coluna, crescente)` por lado, e `_visiveis` filtra pela busca e ordena. O índice da linha
+  continua no `Qt.UserRole`, então mudar a ordem não faz o clique parear a pessoa errada.
+
+  A chave descarta acentos. A letra acentuada vale mais que Z em bruto, então `Ô` (212) manda
+  ANTÔNIO CRUZ para depois de ANTONIO DIAS e `Á` (193) manda ÁLVARO para depois de tudo que
+  começa com A — o nome fica fora do lugar onde o operador procura.
 
 **O caminho antigo continua**, no botão `Mover para outra viagem...` de dentro da janela, e é
 para onde o `_trocar_viagem` cai sozinho quando não há nenhum candidato a par. É o único jeito
@@ -1199,7 +1213,7 @@ alterar as tabelas de escolha de passageiro, cuja marca é o check verde.
 
 ### Testes
 
-`TrocaPareadaTests` (8) e `TrocaPareadaUiTests` (8) — 190 no total. Mutações que a suíte pega:
+`TrocaPareadaTests` (8) e `TrocaPareadaUiTests` (11) — 193 no total. Mutações que a suíte pega:
 
 | Mutação | Falhas |
 |---|---|
@@ -1209,6 +1223,9 @@ alterar as tabelas de escolha de passageiro, cuja marca é o check verde.
 | candidato usado servindo a duas linhas | 1 |
 | a janela não validando o par antes de montar | 1 |
 | índice fora do `Qt.UserRole` (a busca pareia errado) | 1 |
+| clicar de novo no cabeçalho não inverter | 1 |
+| os dois lados compartilharem uma ordem só | 1 |
+| a chave de ordem não descartar acentos | 1 |
 
 ---
 
@@ -1345,9 +1362,9 @@ Duas outras proteções, ambas descobertas apontando o seletor para `Downloads`,
 
 ### Testes
 
-190 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
+193 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
 `pip install` falha no certificado TLS do Netskope). Os do módulo de distribuição estão em
-`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (110).
+`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (113).
 
 ```bash
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
@@ -1372,7 +1389,7 @@ respectivamente). Um teste que não falha quando o bug volta não protege nada.
 
 ### Testes da classificação (`tests/test_distribuicao_filler.py`)
 
-110 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
+113 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
 para ligar a regra ao caso que a originou.
 
 | Grupo | O que protege |
@@ -1393,7 +1410,7 @@ para ligar a regra ao caso que a originou.
 | `PlanilhaEscritaTests` | linha sem embarcação sai com as quatro colunas em branco; lixo antigo é limpo; a regra é a embarcação, não o status |
 | `TrocaViagemTests` | a troca manual: só viagens programadas são oferecidas, ocupação por trecho, o par da permuta tem de caber na origem, numeração refeita, o cenário M9→M8 manhã/tarde |
 | `TrocaPareadaTests` | a troca por pessoa: o agregado de todas as lanchas, o par nos dois sentidos, quem já está na viagem fora da lista, o sob demanda como candidato, e o `apply_pairs` lendo antes de escrever |
-| `TrocaPareadaUiTests` | a janela das duas listas: clique sem linha ativa, par montado e ativo limpo, candidato usado passando para a linha ativa, a busca não pareando errado, o par impossível recusado com o motivo |
+| `TrocaPareadaUiTests` | a janela das duas listas: clique sem linha ativa, par montado e ativo limpo, a ordenação por cabeçalho, candidato usado passando para a linha ativa, a busca não pareando errado, o par impossível recusado com o motivo |
 | `ReprocessTests` | o reprocessamento não gastar de novo as vagas ocupadas: nada de novo diálogo, o pax recusado não entra sozinho, nome curto e horário arredondado descontando, o par dia/noite do M6 nos dois sentidos, numeração preservada |
 | `GabaritoIntegrationTests` | as 244 de 263 linhas contra a planilha do operador, e a asserção de que as 19 restantes são exatamente 13 de horário + 5 de EMBARQUE + 1 de nº viagem. `skipUnless` |
 
@@ -1463,7 +1480,7 @@ são erro do sistema:
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
 cd /mnt/c/Users/ka20/roteirizador/appDesktopV2
 
-# Suíte completa — 190 testes, em unittest (stdlib)
+# Suíte completa — 193 testes, em unittest (stdlib)
 $PY -m unittest discover -s tests -v
 
 # Um arquivo só

@@ -1659,6 +1659,48 @@ class TrocaPareadaUiTests(unittest.TestCase):
         self.assertEqual(dlg.pares(), [])
         self.assertIn("não programou", dlg._hint.text())
 
+    def test_clicking_a_header_sorts_and_clicking_again_reverses(self):
+        """Com 88 selecionados a ordem da tabela não ajuda a achar ninguém."""
+        dlg, _, _, _ = self._janela()
+        col = lambda t: [t.item(r, 0).text() for r in range(t.rowCount())]
+        original = col(dlg._tab_esq)
+
+        dlg._ordenar("esq", 0)
+        crescente = col(dlg._tab_esq)
+        self.assertEqual(crescente, sorted(original))
+
+        dlg._ordenar("esq", 0)
+        self.assertEqual(col(dlg._tab_esq), sorted(original, reverse=True))
+        # A da direita nao se mexe: cada lado tem a sua ordem.
+        self.assertIsNone(dlg._ordem_dir)
+
+    def test_sorting_ignores_accents(self):
+        """A letra acentuada vale mais que Z em bruto, e joga o nome para o fim da lista.
+
+        O que decide é a letra acentuada estar na posição que desempata: `Ô` (212) contra
+        `O` (79) manda ANTÔNIO CRUZ para depois de ANTONIO DIAS, e `Á` (193) manda ÁLVARO
+        para depois de tudo que começa com A. Com os dois na lista, ordenar sem normalizar
+        deixa o operador procurando um nome que não está onde deveria.
+        """
+        chave = self.ui._TrocaParesDialog._chave_ordem
+        nomes = ["ANTONIO DIAS", "ANTÔNIO CRUZ", "ÁLVARO SOUZA", "AZEVEDO LIMA"]
+        self.assertEqual(
+            sorted(nomes, key=chave),
+            ["ÁLVARO SOUZA", "ANTÔNIO CRUZ", "ANTONIO DIAS", "AZEVEDO LIMA"])
+        self.assertNotEqual(sorted(nomes, key=str.upper), sorted(nomes, key=chave))
+
+    def test_sorting_keeps_the_pairs_pointing_at_the_right_people(self):
+        """A ordem muda as linhas de lugar; o índice mora no UserRole, não na posição."""
+        dlg, sel, pool, _ = self._janela()
+        dlg._ordenar("esq", 2)                       # ordena por Viagem atual
+        dlg._ordenar("dir", 0)
+        primeiro = dlg._tab_esq.item(0, 0).text()
+        dlg._clique_esq(0, 0)
+        dlg._clique_dir(0, 0)
+        par = dlg.pares()[0]
+        self.assertEqual(par[0].dados_row.name, primeiro)
+        self.assertEqual(par[1].dados_row.name, dlg._tab_dir.item(0, 0).text())
+
     def test_the_old_flow_is_still_reachable(self):
         dlg, _, _, _ = self._janela()
         dlg._ir_para_viagem()
