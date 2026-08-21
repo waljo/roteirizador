@@ -733,6 +733,70 @@ não branco: com `SolidPattern` ela ignoraria o `alternate-background-color` da 
 `_ManifestoPaxDialog` (aba Recolhimento) **não** foi alterado — ali são `QCheckBox` de verdade
 com rótulo ao lado, que já têm o alvo de clique grande e o texto associado.
 
+### Horário arredondado para o múltiplo de 10 (`_round_horario`)
+
+**Motivação**: o operador escreve os horários redondos. Em 16/08, dos 12 horários que ele usou
+no dia inteiro, **11 são múltiplos de 10** — e as 13 divergências de horário contra o sistema
+eram exatamente os três horários quebrados da operação.
+
+| Operação | Colega | Linhas |
+|---|---|---|
+| 07:12 | 07:10 | 1 |
+| 07:25 | 07:20 | 3 |
+| 07:29 | 07:30 | 9 |
+
+**Empates ficam intactos, de propósito.** O 07:25 ele desceu para 07:20, mas o **16:45 do mesmo
+dia ele manteve** — e os dois estão a 5 minutos dos dois vizinhos. Nenhuma regra que dependa só
+do horário explica os dois casos, então qualquer arredondamento de empate consertaria as 3
+linhas do 07:25 e **quebraria as 12** do 16:45. Com o empate preservado o ganho é limpo: das 13
+divergências, 10 somem e nenhuma nova aparece.
+
+*(Correção de um registro anterior deste arquivo, que dizia que o arredondamento do colega era
+"inconsistente, um para cima e outro para baixo". Com os números na mão, 07:12→07:10 e
+07:29→07:30 são o múltiplo de 10 mais próximo, perfeitamente consistente. A inconsistência real
+está só nos empates.)*
+
+Aplicado na **fonte**, não na exibição: `_voyage_horarios` devolve os valores já arredondados e
+o fallback `dep_leg.departure_time` também passa pelo `_round_horario`. Assim a tabela, a
+planilha, a numeração e o casamento de reprocessamento veem todos o mesmo horário.
+
+O arredondamento acontece **depois** do mínimo entre as legs da viagem: o que interessa é o
+horário da viagem, não o de cada leg.
+
+**Efeito no gabarito de 16/08**: de 244 para **254 linhas idênticas** de 263. As 9 restantes são
+3 do empate (07:25), 5 do tipo EMBARQUE que não existia quando a planilha foi feita, e 1
+inconsistência do próprio gabarito.
+
+### A tabela mostra a programação do dia inteira
+
+Antes, `_populate_table` escondia as linhas `already_filled`, e a tabela era "o que esta rodada
+preencheu". Como a troca de viagem trabalha em cima da linha selecionada, depois de salvar e
+reprocessar não havia mais nada para trocar: os pax voltavam da planilha preenchidos e sumiam
+da tela. No teste com 15/08 a tabela ia de 148 linhas para 10.
+
+Agora mostra todas, com o status `Ja preenchido` em cinza (`#eceff1`) e a contagem no rodapé —
+que só aparece quando existe alguma, para não poluir a rodada do zero.
+
+Três consequências que precisaram de tratamento:
+
+- **`_salvar` tem de usar a MESMA lista do `_populate_table`.** O índice guardado em
+  `Qt.UserRole` aponta para uma posição nessa lista; listas diferentes gravariam o dado no pax
+  errado. Agora as duas usam `self._visible_rows`.
+- **`write_dados` pula as linhas `already_filled`**, porque vieram prontas e reescrevê-las seria
+  à toa. Só que agora elas podem ser trocadas ou editadas à mão — então o `_salvar` compara os
+  valores antes e depois da leitura da tabela e vira o status para `auto` quando mudou. Sem
+  isso a alteração se perderia **em silêncio**.
+- **`slot_occupants` e `current_slot` passaram a usar `_same_horario`** em vez de igualdade
+  exata. Uma linha que veio da planilha pode trazer o horário arredondado à mão (07:20 contra
+  07:25 da operação) e a lotação mostrada no diálogo TEM de ser a mesma que o `fill_rows` usou
+  para descontar as vagas — o `fill_rows` já casava com tolerância. Conferido em 15, 16 e 17/08:
+  **nenhuma viagem da mesma lancha fica a menos de 20 minutos de outra**, então a tolerância não
+  funde viagens.
+
+**Verificado ponta a ponta** com 15/08: processar do zero → salvar → reprocessar (138 linhas
+voltam como já preenchidas, 0 diálogos) → trocar uma delas → salvar de novo, e a troca chegou à
+planilha nos dois lados.
+
 ### Legs de recolhimento dentro da operação
 
 A operação contém legs cujo movimento é recolhimento e que por isso não recebem pax aqui:
@@ -1053,9 +1117,9 @@ Duas outras proteções, ambas descobertas apontando o seletor para `Downloads`,
 
 ### Testes
 
-148 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
+162 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
 `pip install` falha no certificado TLS do Netskope). Os do módulo de distribuição estão em
-`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (68).
+`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (82).
 
 ```bash
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
@@ -1080,7 +1144,7 @@ respectivamente). Um teste que não falha quando o bug volta não protege nada.
 
 ### Testes da classificação (`tests/test_distribuicao_filler.py`)
 
-68 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
+82 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
 para ligar a regra ao caso que a originou.
 
 | Grupo | O que protege |
@@ -1093,6 +1157,8 @@ para ligar a regra ao caso que a originou.
 | `NightLegTests` | noite na leg mais tardia na ida, mais cedo na volta |
 | `OriginsConfigTests` | `suggest_origins` e `audit_origins` |
 | `FillRowsScenarioTests` | 11 cenários montados à mão: bate-volta/embarque na mesma viagem, legs concorrentes, teto do `pax_disembark`, viagem vazia não consumindo número, desempate por ordem da operação, uma viagem com um horário |
+| `ArredondamentoHorarioTests` | múltiplo de 10 mais próximo, empate intacto, virada de hora e de dia, e a numeração não reordenando |
+| `TabelaCompletaTests` | as linhas já preenchidas aparecem, o índice do UserRole aponta para a lista certa, e editar uma delas marca para gravar |
 | `SelecaoDesmarcadaTests` | desmarcar no diálogo não deixar rastro de embarcação |
 | `PlanilhaEscritaTests` | linha sem embarcação sai com as quatro colunas em branco; lixo antigo é limpo; a regra é a embarcação, não o status |
 | `TrocaViagemTests` | a troca manual: só viagens programadas são oferecidas, ocupação por trecho, o par da permuta tem de caber na origem, numeração refeita, o cenário M9→M8 manhã/tarde |
@@ -1145,16 +1211,17 @@ entregas ao mesmo destino para turmas diferentes sem código próprio, volta a e
 
 ### 5. Divergências residuais contra o gabarito de 16/08
 
-De 263 linhas, **244 batem exatamente** (144 preenchidas + 100 em branco). As 19 restantes não
+De 263 linhas, **254 batem exatamente** (154 preenchidas + 100 em branco). As 9 restantes não
 são erro do sistema:
 
 | Qtd | Divergência | Avaliação |
 |---|---|---|
-| 13 | horário: gabarito 07:30/07:20/07:10 contra 07:29/07:25/07:12 | arredondamento manual do colega, inconsistente (um para cima, outro para baixo). A operação traz os valores do sistema. Não é a chegada ao M9 — conferido, são 07:08/07:38, 07:22/07:32, 07:04/07:19 |
+| 3 | horário: gabarito 07:20 contra 07:25 | empate de arredondamento. O `_round_horario` resolveu as outras 10; o empate fica intacto porque o colega desceu o 07:25 mas manteve o 16:45 |
 | 5 | TIPO: gabarito BATE VOLTA, sistema EMBARQUE | esperado: a planilha do colega antecede a criação do tipo EMBARQUE |
 | 1 | L202 Nº VIAGEM: gabarito v4, sistema v2 | inconsistência do gabarito — AQUA HELIX 06:30 aparece como v2 para 8 pax e v4 para 1 |
 
-Decidir se o horário deve seguir a operação (atual) ou ser arredondado como o colega faz.
+**Resolvido**: o horário passou a ser arredondado como o colega faz — veja
+`_round_horario`.
 
 ---
 
@@ -1164,7 +1231,7 @@ Decidir se o horário deve seguir a operação (atual) ou ser arredondado como o
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
 cd /mnt/c/Users/ka20/roteirizador/appDesktopV2
 
-# Suíte completa — 148 testes, em unittest (stdlib)
+# Suíte completa — 162 testes, em unittest (stdlib)
 $PY -m unittest discover -s tests -v
 
 # Um arquivo só

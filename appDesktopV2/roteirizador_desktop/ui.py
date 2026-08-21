@@ -3814,14 +3814,16 @@ class _PermutaDialog(QDialog):
 
 class ManifestosDistribuicaoTab(QWidget):
     _STATUS_COLORS = {
-        "auto":       "#d4edda",  # verde claro
-        "ambiguous":  "#fff3cd",  # amarelo
-        "sob_demanda":"#fde8d8",  # laranja claro
+        "auto":          "#d4edda",  # verde claro
+        "ambiguous":     "#fff3cd",  # amarelo
+        "sob_demanda":   "#fde8d8",  # laranja claro
+        "already_filled":"#eceff1",  # cinza — veio pronto da planilha
     }
     _STATUS_LABELS = {
-        "auto":       "Auto",
-        "ambiguous":  "Ambiguo",
-        "sob_demanda":"Sob demanda",
+        "auto":          "Auto",
+        "ambiguous":     "Ambiguo",
+        "sob_demanda":   "Sob demanda",
+        "already_filled":"Ja preenchido",
     }
     _COLS = ["Nome Passageiro", "Origem", "Destino",
              "Embarcacao", "Horario", "Nº Viagem", "Tipo", "Status"]
@@ -4054,13 +4056,17 @@ class ManifestosDistribuicaoTab(QWidget):
         self._btn_trocar.setEnabled(True)
         self._btn_comparar.setEnabled(True)
 
-        new_rows = [fr for fr in self._filled_rows if fr.status != "already_filled"]
-        auto = sum(1 for fr in new_rows if fr.status == "auto")
-        amb = sum(1 for fr in new_rows if fr.status == "ambiguous")
-        sob = sum(1 for fr in new_rows if fr.status == "sob_demanda")
-        self._lbl_status.setText(
-            f"{len(new_rows)} linhas | Auto: {auto}  Ambiguo: {amb}  Sob demanda: {sob}"
-        )
+        self._lbl_status.setText(self._status_text())
+
+    def _status_text(self) -> str:
+        auto = sum(1 for fr in self._filled_rows if fr.status == "auto")
+        amb = sum(1 for fr in self._filled_rows if fr.status == "ambiguous")
+        sob = sum(1 for fr in self._filled_rows if fr.status == "sob_demanda")
+        ja = sum(1 for fr in self._filled_rows if fr.status == "already_filled")
+        # "Ja preenchido" so aparece quando existe: numa rodada do zero nao ha nenhuma.
+        ja_txt = f"  Ja preenchido: {ja}" if ja else ""
+        return (f"{len(self._filled_rows)} linhas | Auto: {auto}  Ambiguo: {amb}  "
+                f"Sob demanda: {sob}{ja_txt}")
 
     @staticmethod
     def _apply_selection_group(group, selected_frs: list) -> None:
@@ -4101,7 +4107,10 @@ class ManifestosDistribuicaoTab(QWidget):
         # Any still unselected remain sob_demanda (already set above)
 
     def _populate_table(self) -> None:
-        new_rows = [fr for fr in self._filled_rows if fr.status != "already_filled"]
+        # A tabela mostra a programação do dia inteira, inclusive o que a planilha já trouxe
+        # preenchido. Antes escondia essas linhas, e como a troca trabalha em cima da linha
+        # selecionada, depois de salvar e reprocessar não havia mais o que trocar.
+        new_rows = list(self._filled_rows)
         # O Qt.UserRole da coluna 0 guarda o índice nesta lista, e o índice sobrevive à
         # ordenação da tabela — é assim que a troca acha o passageiro selecionado.
         self._visible_rows = new_rows
@@ -4208,7 +4217,9 @@ class ManifestosDistribuicaoTab(QWidget):
         from datetime import time as dt_time
 
         dados_path = self._dados_path.text().strip()
-        new_rows = [fr for fr in self._filled_rows if fr.status != "already_filled"]
+        # A MESMA lista que o `_populate_table` usou, senão o índice guardado no UserRole
+        # aponta para outra pessoa.
+        new_rows = self._visible_rows
 
         # Sync table edits back — use UserRole to map visual rows to original indices
         # (table may be sorted, so visual row != insertion order)
@@ -4217,13 +4228,15 @@ class ManifestosDistribuicaoTab(QWidget):
             if not item0:
                 continue
             orig_idx = item0.data(Qt.UserRole)
-            if orig_idx is None:
+            if orig_idx is None or orig_idx >= len(new_rows):
                 continue
             fr = new_rows[orig_idx]
 
             def cell(col: int, _row: int = table_row) -> str:
                 item = self._table.item(_row, col)
                 return item.text().strip() if item else ""
+
+            antes = (fr.embarcacao, fr.horario, fr.n_viagem, fr.tipo_viagem)
 
             fr.embarcacao = cell(3) or None
             horario_text = cell(4)
@@ -4235,6 +4248,14 @@ class ManifestosDistribuicaoTab(QWidget):
             n_text = cell(5)
             fr.n_viagem = int(n_text) if n_text.isdigit() else None
             fr.tipo_viagem = cell(6) or None
+
+            # O `write_dados` pula as linhas `already_filled`, porque elas vieram prontas da
+            # planilha e reescrevê-las seria à toa. Agora que essas linhas aparecem na tabela,
+            # elas podem ser trocadas ou editadas à mão — e aí precisam ser gravadas, senão a
+            # alteração se perde em silêncio no Salvar.
+            if fr.status == "already_filled" and (
+                fr.embarcacao, fr.horario, fr.n_viagem, fr.tipo_viagem) != antes:
+                fr.status = "auto"
 
         try:
             write_dados(dados_path, self._filled_rows)

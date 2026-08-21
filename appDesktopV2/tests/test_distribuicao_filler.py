@@ -20,6 +20,7 @@ from roteirizador_desktop.distribuicao import (
     suggest_origins,
 )
 from roteirizador_desktop.distribuicao.filler import (
+    _round_horario,
     current_slot,
     rebuild_n_viagem,
     row_movement,
@@ -405,6 +406,203 @@ _CONFIG = (Path(__file__).resolve().parents[1]
     _DADOS_16.exists() and _OPERACAO_16.exists(),
     "arquivos de referência de 16/08 não disponíveis nesta máquina",
 )
+class TabelaCompletaTests(unittest.TestCase):
+    """A tabela mostra a programação do dia inteira, inclusive o que veio pronto.
+
+    Antes ela escondia as linhas `already_filled`. Como a troca trabalha em cima da linha
+    selecionada, depois de salvar e reprocessar não sobrava nada para trocar: os pax voltavam
+    da planilha preenchidos e sumiam da tela.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        try:
+            from PySide6.QtWidgets import QApplication
+            from roteirizador_desktop import ui as ui_mod
+        except Exception as exc:                        # pragma: no cover
+            raise unittest.SkipTest(f"PySide6 indisponível: {exc}")
+        cls.app = QApplication.instance() or QApplication([])
+        cls.ui = ui_mod
+
+    def _aba(self, filled):
+        aba = self.ui.ManifestosDistribuicaoTab(None)
+        aba._filled_rows = filled
+        aba._populate_table()
+        return aba
+
+    @staticmethod
+    def _linhas():
+        from roteirizador_desktop.distribuicao.models import FilledRow
+        feitas = []
+        for i, (emb, status) in enumerate(
+                [("SURFER 1930", "already_filled"), ("SURFER 1905", "auto"),
+                 (None, "sob_demanda")], start=1):
+            dr = row(i, f"PAX{i}", "PCM-9", "PCM-9", "TMIB")
+            feitas.append(FilledRow(
+                dados_row=dr, embarcacao=emb,
+                horario=time(6, 20) if emb else None,
+                n_viagem=1 if emb else None,
+                tipo_viagem="DESEMBARQUE", status=status))
+        return feitas
+
+    def test_already_filled_rows_are_shown(self):
+        filled = self._linhas()
+        aba = self._aba(filled)
+        self.assertEqual(aba._table.rowCount(), 3)
+        self.assertEqual(aba._visible_rows, filled)
+
+    def test_the_status_column_names_them(self):
+        aba = self._aba(self._linhas())
+        rotulos = {aba._table.item(r, 7).text() for r in range(aba._table.rowCount())}
+        self.assertIn("Ja preenchido", rotulos)
+
+    def test_the_counter_reports_them_separately(self):
+        aba = self._aba(self._linhas())
+        self.assertEqual(
+            aba._status_text(),
+            "3 linhas | Auto: 1  Ambiguo: 0  Sob demanda: 1  Ja preenchido: 1")
+
+    def test_the_counter_omits_the_prefilled_label_when_there_is_none(self):
+        """Numa rodada do zero não há nenhuma, e o rótulo não deve poluir o rodapé."""
+        filled = [fr for fr in self._linhas() if fr.status != "already_filled"]
+        aba = self._aba(filled)
+        self.assertEqual(aba._status_text(),
+                         "2 linhas | Auto: 1  Ambiguo: 0  Sob demanda: 1")
+
+    def test_the_userrole_index_points_into_the_same_list(self):
+        """Se `_populate_table` e `_salvar` usarem listas diferentes, o índice guardado na
+        tabela aponta para outra pessoa — e o Salvar grava o dado no pax errado."""
+        filled = self._linhas()
+        aba = self._aba(filled)
+        for r in range(aba._table.rowCount()):
+            idx = aba._table.item(r, 0).data(self.ui.Qt.UserRole)
+            self.assertEqual(aba._visible_rows[idx].dados_row.name,
+                             aba._table.item(r, 0).text())
+
+    def test_editing_a_prefilled_row_marks_it_to_be_written(self):
+        """O `write_dados` pula `already_filled`; sem virar `auto`, a edição se perderia."""
+        import tempfile, openpyxl
+        from roteirizador_desktop.distribuicao.dados_io import _C_EMBARCACAO
+
+        filled = self._linhas()
+        aba = self._aba(filled)
+        with tempfile.TemporaryDirectory() as d:
+            caminho = str(Path(d) / "dados.xlsx")
+            wb = openpyxl.Workbook()
+            for r in range(2, 6):
+                wb.active.cell(row=r, column=1).value = "R3"
+            wb.save(caminho)
+            wb.close()
+            aba._dados_path.setText(caminho)
+
+            # O operador troca a embarcação da linha que veio pronta.
+            linha = next(r for r in range(aba._table.rowCount())
+                         if aba._table.item(r, 0).text() == "PAX1")
+            aba._table.item(linha, 3).setText("AQUA HELIX")
+
+            msgs = []
+            original = self.ui.QMessageBox
+            class Fake:
+                @staticmethod
+                def information(*a): msgs.append(a)
+                @staticmethod
+                def critical(*a): msgs.append(a)
+            self.ui.QMessageBox = Fake
+            try:
+                aba._salvar()
+            finally:
+                self.ui.QMessageBox = original
+
+            self.assertEqual(filled[0].embarcacao, "AQUA HELIX")
+            self.assertEqual(filled[0].status, "auto")   # deixou de ser pulada
+            wb = openpyxl.load_workbook(caminho)
+            gravado = wb.active.cell(row=filled[0].dados_row.excel_row,
+                                     column=_C_EMBARCACAO).value
+            wb.close()
+            self.assertEqual(gravado, "AQUA HELIX")
+
+    def test_an_untouched_prefilled_row_keeps_its_status(self):
+        import tempfile, openpyxl
+        filled = self._linhas()
+        aba = self._aba(filled)
+        with tempfile.TemporaryDirectory() as d:
+            caminho = str(Path(d) / "dados.xlsx")
+            wb = openpyxl.Workbook()
+            for r in range(2, 6):
+                wb.active.cell(row=r, column=1).value = "R3"
+            wb.save(caminho)
+            wb.close()
+            aba._dados_path.setText(caminho)
+            original = self.ui.QMessageBox
+            class Fake:
+                @staticmethod
+                def information(*a): pass
+                @staticmethod
+                def critical(*a): pass
+            self.ui.QMessageBox = Fake
+            try:
+                aba._salvar()
+            finally:
+                self.ui.QMessageBox = original
+        self.assertEqual(filled[0].status, "already_filled")
+
+
+class ArredondamentoHorarioTests(unittest.TestCase):
+    """O horário sai em múltiplos de 10 minutos, como o operador escreve.
+
+    Em 16/08 o colega usou 12 horários no dia inteiro e 11 eram múltiplos de 10. As 13
+    divergências contra o sistema eram exatamente os três horários quebrados da operação.
+    """
+
+    def test_rounds_to_the_nearest_ten(self):
+        self.assertEqual(_round_horario(time(7, 12)), time(7, 10))   # 1 linha em 16/08
+        self.assertEqual(_round_horario(time(7, 29)), time(7, 30))   # 9 linhas em 16/08
+
+    def test_a_tie_is_left_alone(self):
+        """07:25 o colega desceu, 16:45 ele manteve — os dois são empate.
+
+        Nenhuma regra que dependa só do horário explica os dois. Mexer no empate consertaria
+        3 linhas e quebraria as 12 das 16:45, então o empate fica intacto.
+        """
+        self.assertEqual(_round_horario(time(7, 25)), time(7, 25))
+        self.assertEqual(_round_horario(time(16, 45)), time(16, 45))
+
+    def test_an_exact_multiple_is_untouched(self):
+        for t in (time(4, 50), time(5, 30), time(6, 20), time(10, 0), time(17, 30)):
+            self.assertEqual(_round_horario(t), t)
+
+    def test_none_survives(self):
+        self.assertIsNone(_round_horario(None))
+
+    def test_it_rolls_over_the_hour_and_the_day(self):
+        self.assertEqual(_round_horario(time(7, 57)), time(8, 0))
+        self.assertEqual(_round_horario(time(23, 58)), time(0, 0))
+
+    def test_the_voyage_horario_is_rounded_end_to_end(self):
+        """A viagem inteira sai arredondada, não só a exibição."""
+        rows = [row(1, "PAX1", "PCM-9", "PCM-9", "PCM-8")]
+        trips = [VesselTrip("SURFER 1931", [
+            leg("SURFER 1931", "PCM-09", "PCM-08", time(7, 29), pax_origin="PCM-09", pax=1)])]
+        filled, _, _ = run(rows, trips)
+        self.assertEqual(filled[0].horario, time(7, 30))
+        self.assertEqual(voyage_slots(trips)[0].horario, time(7, 30))
+
+    def test_rounding_does_not_reorder_the_voyage_numbering(self):
+        """Duas viagens que arredondam para o mesmo horário mantêm a ordem da operação."""
+        rows = [row(i, f"PAX{i}", "PCM-9", "PCM-9", "PCM-8") for i in (1, 2)]
+        trips = [
+            VesselTrip("SURFER 1931", [
+                leg("SURFER 1931", "PCM-09", "PCM-08", time(7, 29), pax_origin="PCM-09", pax=1)]),
+            VesselTrip("SURFER 1905", [
+                leg("SURFER 1905", "PCM-09", "PCM-08", time(7, 31), pax_origin="PCM-09", pax=1)]),
+        ]
+        got = by_excel(run(rows, trips)[0])
+        self.assertEqual(got[1].horario, got[2].horario)             # ambas 07:30
+        self.assertEqual((got[1].n_viagem, got[2].n_viagem), (1, 2))  # ordem da operacao
+
+
 class ReprocessTests(unittest.TestCase):
     """Reprocessar não pode gastar de novo as vagas que a planilha já trouxe ocupadas.
 
@@ -869,10 +1067,11 @@ class TrocaViagemTests(unittest.TestCase):
 class GabaritoIntegrationTests(unittest.TestCase):
     """Confronto com a planilha preenchida à mão pelo operador (o gabarito de 16/08).
 
-    Das 263 linhas, 244 têm de bater — 144 preenchidas e 100 corretamente em branco. As 19
-    restantes são conhecidas e justificadas: 13 de arredondamento manual de horário, 5 do tipo
-    EMBARQUE que não existia quando a planilha foi feita, e 1 inconsistência do próprio
-    gabarito.
+    Das 263 linhas, 254 têm de bater — 154 preenchidas e 100 corretamente em branco. As 9
+    restantes são conhecidas e justificadas: 3 do empate de arredondamento (07:25, que o
+    colega desceu para 07:20 mas que o `_round_horario` deixa intacto porque o 16:45 do mesmo
+    dia ele manteve), 5 do tipo EMBARQUE que não existia quando a planilha foi feita, e 1
+    inconsistência do próprio gabarito.
     """
 
     @classmethod
@@ -919,13 +1118,13 @@ class GabaritoIntegrationTests(unittest.TestCase):
         for er in em_branco:
             self.assertNotIn(er, self.mine)
 
-    def test_agrees_with_the_operator_on_244_of_263_rows(self):
+    def test_agrees_with_the_operator_on_254_of_263_rows(self):
         iguais = sum(1 for er, esperado in self.gabarito.items()
                      if self.mine.get(er) == esperado
                      or (esperado[3] is None and er not in self.mine))
-        self.assertEqual(iguais, 244)
+        self.assertEqual(iguais, 254)
 
-    def test_the_nineteen_differences_are_the_known_ones(self):
+    def test_the_nine_differences_are_the_known_ones(self):
         horario, embarque, viagem, outros = 0, 0, 0, []
         for er, esperado in self.gabarito.items():
             meu = self.mine.get(er)
@@ -937,12 +1136,15 @@ class GabaritoIntegrationTests(unittest.TestCase):
                 self.assertEqual((esperado[3], meu[3]), ("BATE VOLTA", "EMBARQUE"))
                 embarque += 1
             elif meu[1] != esperado[1]:
+                # So sobra o empate: 07:25 esta a 5 minutos de 07:20 e de 07:30, e o
+                # `_round_horario` deixa empate intacto de proposito.
+                self.assertEqual((esperado[1], meu[1]), (time(7, 20), time(7, 25)))
                 horario += 1
             elif meu[2] != esperado[2]:
                 viagem += 1
             else:
                 outros.append(er)
-        self.assertEqual((horario, embarque, viagem), (13, 5, 1))
+        self.assertEqual((horario, embarque, viagem), (3, 5, 1))
         self.assertEqual(outros, [])
 
 

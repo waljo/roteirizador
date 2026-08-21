@@ -336,7 +336,8 @@ def voyage_slots(
                 leg=leg,
                 section=index,
                 vessel=dep_leg.vessel,
-                horario=voyage_horarios.get((index, grupo), dep_leg.departure_time),
+                horario=voyage_horarios.get(
+                    (index, grupo), _round_horario(dep_leg.departure_time)),
                 tipo_viagem=tipo,
                 limit=leg.pax_disembark,
             ))
@@ -371,7 +372,12 @@ def slot_occupants(
     for fr in filled:
         if not fr.embarcacao or not _same_vessel(fr.embarcacao, slot.vessel):
             continue
-        if fr.horario != slot.horario:
+        # Mesma tolerancia que o `fill_rows` usa para descontar as vagas ja ocupadas: a
+        # planilha pode trazer o horario arredondado a mao (07:20 contra 07:25 da operacao)
+        # e as duas contas TEM de concordar, senao o dialogo mostra uma lotacao que nao e a
+        # que o processamento usou. Conferido em 15, 16 e 17/08: nenhuma viagem da mesma
+        # lancha fica a menos de 20 minutos de outra, entao a tolerancia nao funde viagens.
+        if not _same_horario(fr.horario, slot.horario):
             continue
         movement = _row_platforms(fr.dados_row, resolver)
         if movement is not None and _matches(slot.leg, *movement):
@@ -386,7 +392,8 @@ def current_slot(
     if not fr.embarcacao:
         return None
     for slot in slots:
-        if (_same_vessel(fr.embarcacao, slot.vessel) and fr.horario == slot.horario
+        if (_same_vessel(fr.embarcacao, slot.vessel)
+                and _same_horario(fr.horario, slot.horario)
                 and _matches(slot.leg, *movement)):
             return slot
     return None
@@ -478,7 +485,7 @@ def rebuild_n_viagem(
         for slot in slots:
             if not _same_vessel(fr.embarcacao, slot.vessel):
                 continue
-            if fr.horario != slot.horario:
+            if not _same_horario(fr.horario, slot.horario):
                 continue
             if not _matches(slot.leg, *movement):
                 continue
@@ -603,7 +610,8 @@ def fill_rows(
             tipo = _numbering_group(
                 _classify(leg.pax_origin, leg.destination_canonical, True)
             )
-            horario = voyage_horarios.get((index, tipo), dep_leg.departure_time)
+            horario = voyage_horarios.get(
+                (index, tipo), _round_horario(dep_leg.departure_time))
 
             # Cada linha ja preenchida consome no maximo uma vaga, e de uma perna so — por
             # isso sai de `preassigned_free` assim que e contada.
@@ -717,6 +725,33 @@ def fill_rows(
     return filled, sel_groups, n_viagem_map
 
 
+# O operador escreve os horarios em multiplos de 10 minutos. Em 16/08, dos 12 horarios que
+# ele usou no dia, 11 sao multiplos de 10 — e as 13 divergencias contra o sistema eram
+# exatamente os tres horarios "quebrados" da operacao: 07:12 -> 07:10, 07:29 -> 07:30 e
+# 07:25 -> 07:20.
+#
+# **Empates ficam como estao.** O 07:25 ele desceu para 07:20, mas o 16:45 do mesmo dia ele
+# manteve — e os dois estao a 5 minutos dos dois vizinhos. Nenhuma regra que dependa so do
+# horario explica os dois, entao arredondar o empate quebraria as 12 linhas das 16:45 para
+# consertar as 3 das 07:25. Com o empate intacto o ganho e limpo: 10 das 13 divergencias
+# somem e nenhuma nova aparece.
+_HORARIO_STEP_MIN = 10
+
+
+def _round_horario(t: time | None) -> time | None:
+    """Arredonda para o multiplo de 10 minutos mais proximo, deixando empates intactos."""
+    if t is None:
+        return None
+    resto = t.minute % _HORARIO_STEP_MIN
+    if resto == 0 or resto * 2 == _HORARIO_STEP_MIN:
+        return t
+    total = t.hour * 60 + t.minute - resto
+    if resto * 2 > _HORARIO_STEP_MIN:
+        total += _HORARIO_STEP_MIN
+    total %= 24 * 60
+    return time(total // 60, total % 60)
+
+
 def _voyage_horarios(trips: list[VesselTrip]) -> dict[tuple[int, str], time | None]:
     """The boarding time that represents each (voyage, trip type) pair.
 
@@ -747,7 +782,8 @@ def _voyage_horarios(trips: list[VesselTrip]) -> dict[tuple[int, str], time | No
                 dep_leg.departure_time is not None and dep_leg.departure_time < current
             ):
                 horarios[key] = dep_leg.departure_time
-    return horarios
+    # Arredonda depois do minimo: o que interessa e o horario da viagem, nao o de cada leg.
+    return {key: _round_horario(valor) for key, valor in horarios.items()}
 
 
 def _build_n_viagem_map(
