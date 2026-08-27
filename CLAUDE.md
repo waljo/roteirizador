@@ -1470,7 +1470,7 @@ comportamento para a correção não tê-lo mudado sem querer.
 
 ### Testes
 
-`NotaSemPrefixoTests` (4), `GadPdfTests` (11) e `GadIntegrationTests` (4) — 226 no total.
+`NotaSemPrefixoTests` (4), `GadPdfTests` (11) e `GadIntegrationTests` (4) — 229 no total.
 Mutações que a suíte pega:
 
 | Mutação | Falhas |
@@ -1621,9 +1621,9 @@ Duas outras proteções, ambas descobertas apontando o seletor para `Downloads`,
 
 ### Testes
 
-226 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
+229 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
 `pip install` falha no certificado TLS do Netskope). Os do módulo de distribuição estão em
-`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (146).
+`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (149).
 
 ```bash
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
@@ -1648,7 +1648,7 @@ respectivamente). Um teste que não falha quando o bug volta não protege nada.
 
 ### Testes da classificação (`tests/test_distribuicao_filler.py`)
 
-146 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
+149 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
 para ligar a regra ao caso que a originou.
 
 | Grupo | O que protege |
@@ -1672,6 +1672,7 @@ para ligar a regra ao caso que a originou.
 | `TabelaCompletaTests` | as linhas já preenchidas aparecem, o índice do UserRole aponta para a lista certa, e editar uma delas marca para gravar |
 | `SelecaoDesmarcadaTests` | desmarcar no diálogo não deixar rastro de embarcação |
 | `PlanilhaEscritaTests` | linha sem embarcação sai com as quatro colunas em branco; lixo antigo é limpo; a regra é a embarcação, não o status |
+| `AbaDadosTests` | a leitura e a gravação acham a aba `Dados` mesmo com a dinâmica em foco |
 | `TrocaViagemTests` | a troca manual: só viagens programadas são oferecidas, ocupação por trecho, o par da permuta tem de caber na origem, numeração refeita, o cenário M9→M8 manhã/tarde |
 | `TrocaPareadaTests` | a troca por pessoa: o agregado de todas as lanchas, o par nos dois sentidos, quem já está na viagem fora da lista, o sob demanda como candidato, e o `apply_pairs` lendo antes de escrever |
 | `TrocaPareadaUiTests` | a janela das duas listas: clique sem linha ativa, par montado e ativo limpo, a ordenação por cabeçalho, candidato usado passando para a linha ativa, a busca não pareando errado, o par impossível recusado com o motivo, a linha única já ativa, o filtro de lanchas e o alinhamento das duas tabelas |
@@ -1682,6 +1683,52 @@ Os cenários de `FillRowsScenarioTests` acharam o bug da sobra oferecida em dois
 não aparecia em nenhum dos arquivos reais.
 
 ---
+
+### Fix — a planilha lida era a aba que estava em foco, não a `Dados`
+
+**Achado nesta sessão**, ao investigar por que a integração de 21/08 tinha passado a pular.
+
+A pasta de trabalho do operador tem três abas — `TD` (uma tabela dinâmica), `Dados` e
+`Planilha1` — e o `read_dados`/`write_dados` usavam `wb.active`, que é apenas **a aba que
+estava selecionada no último salvamento**. O arquivo de 21/08 foi salvo com a `TD` em foco, e
+aí:
+
+- a **leitura devolvia zero linhas em silêncio** — o operador processa e a tabela vem vazia,
+  sem nenhuma mensagem dizendo por quê;
+- a **gravação poria as quatro colunas dentro da dinâmica**, nas linhas de outra coisa.
+
+Os arquivos de 16/08 e 27/08 foram salvos com a `Dados` em foco, o que é por que o defeito
+nunca apareceu: ele depende de onde o cursor do operador estava quando ele fechou o Excel.
+
+**Solução** (`dados_io.py`): `_dados_sheet(wb)` procura a aba pelo nome (`Dados`, ignorando
+caixa e espaços) e só cai no `wb.active` quando ela não existe — o que preserva o
+comportamento antigo em pasta de trabalho de uma aba só. As duas funções usam o mesmo helper,
+senão a gravação iria para uma aba diferente da leitura.
+
+O `parse_operacao` continua no `wb.active` de propósito: conferido em nove arquivos de
+programação, todos têm uma aba só (`DISTRIBUICAO - CL`).
+
+**Verificado** com os arquivos de hoje (27/08): 286 linhas lidas, 165 com embarcação, 3
+diálogos de seleção, 20 sob demanda e **nenhuma linha com embarcação sem Nº Viagem**.
+
+**Testes**: `AbaDadosTests` (3). Mutação que a suíte pega: voltar ao `wb.active` (2 falhas).
+
+### Os arquivos de referência mudam de pasta, e o `skipUnless` calava
+
+Quatro testes de integração estavam pulando sem que ninguém notasse: o operador arquiva o dia
+quando ele passa (`1. Arquivos Manifestos/antigos/`) e juntou os PDFs de teste em
+`Downloads/ManifestosTeste/`. Um `skipUnless` que não acha o arquivo **não protege nada** — e
+pula em silêncio, que é a pior forma de não proteger.
+
+Os dois arquivos de teste passaram a procurar cada referência numa lista de pastas
+(`_achar_ref` / `_achar_pdf`). Isso trouxe de volta os 4 testes de `PdfIntegrationTests`.
+
+**O gabarito de 21/08, porém, não existe mais**: o operador reaproveitou
+`Cópia de Tabela roteiro dia 21.08.2026.xlsx` para os dados de 22/08. O `GadIntegrationTests`
+agora **confere o dia dentro da planilha** e pula com essa explicação, em vez de falhar como
+se a rotina tivesse quebrado. As 54 mudanças de 21/08 seguem documentadas aqui, mas a
+verificação automática contra aquele dia só volta se um dia houver uma cópia da planilha
+original. Para não perder a próxima, vale guardar uma cópia do dia que servir de gabarito.
 
 ## Pendências conhecidas (distribuição)
 
@@ -1744,7 +1791,7 @@ são erro do sistema:
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
 cd /mnt/c/Users/ka20/roteirizador/appDesktopV2
 
-# Suíte completa — 226 testes, em unittest (stdlib)
+# Suíte completa — 229 testes, em unittest (stdlib)
 $PY -m unittest discover -s tests -v
 
 # Um arquivo só

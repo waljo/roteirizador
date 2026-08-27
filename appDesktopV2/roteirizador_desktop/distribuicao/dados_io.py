@@ -21,9 +21,27 @@ _C_N_VIAGEM = 12
 _C_TIPO = 13
 
 
+def _dados_sheet(wb):
+    """A aba `Dados`, e nao a que estava selecionada quando o arquivo foi salvo.
+
+    A pasta de trabalho do operador tem tres abas (`TD`, `Dados`, `Planilha1`) e o `wb.active`
+    e so a que ficou em foco no ultimo salvamento. Achado no arquivo de 21/08, salvo com a
+    `TD` (uma tabela dinamica) em foco: o `read_dados` devolvia **zero linhas em silencio** —
+    o operador processa e nao aparece nada — e o `write_dados` gravaria as quatro colunas
+    dentro da dinamica, nas linhas de outra coisa.
+
+    As duas funcoes tem de usar a mesma aba, senao a gravacao vai para outro lugar que a
+    leitura.
+    """
+    for nome in wb.sheetnames:
+        if nome.strip().casefold() == "dados":
+            return wb[nome]
+    return wb.active
+
+
 def read_dados(path: str) -> list[DadosRow]:
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-    ws = wb.active
+    ws = _dados_sheet(wb)
     rows: list[DadosRow] = []
 
     for excel_row, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
@@ -65,7 +83,7 @@ def read_dados(path: str) -> list[DadosRow]:
 
 def write_dados(path: str, filled_rows: list[FilledRow]) -> None:
     wb = openpyxl.load_workbook(path)
-    ws = wb.active
+    ws = _dados_sheet(wb)
 
     for fr in filled_rows:
         if fr.status == "already_filled":

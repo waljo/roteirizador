@@ -404,6 +404,25 @@ class FillRowsScenarioTests(unittest.TestCase):
 
 
 _DOWNLOADS = Path.home() / "Downloads"
+_MANIFESTOS = (Path.home() / "PETROBRAS" / "LOEP LPM ONNE TMCP - Roteirizador"
+               / "1. Arquivos Manifestos")
+
+# Os arquivos de referencia mudam de pasta sozinhos: o operador arquiva o dia quando ele passa
+# (`antigos/`) e junta os PDFs de teste em `ManifestosTeste/`. Um `skipUnless` que nao os acha
+# nao protege nada — e pula em silencio, que e a pior forma de nao proteger.
+_PASTAS_REF = (_DOWNLOADS, _DOWNLOADS / "ManifestosTeste",
+               _MANIFESTOS, _MANIFESTOS / "antigos")
+
+
+def _achar_ref(nome: str) -> Path:
+    """O primeiro caminho existente entre as pastas de referencia."""
+    for pasta in _PASTAS_REF:
+        caminho = pasta / nome
+        if caminho.exists():
+            return caminho
+    return _PASTAS_REF[0] / nome
+
+
 _DADOS_16 = _DOWNLOADS / "Cópia de Tabela roteiro dia 16.08.2026 1.xlsx"
 _OPERACAO_16 = _DOWNLOADS / "2026_08_16_operacao_ 1.xlsx"
 _CONFIG = (Path(__file__).resolve().parents[1]
@@ -1149,6 +1168,81 @@ class PlanilhaEscritaTests(unittest.TestCase):
         ja = self._filled(2, "JA", "1930", time(6, 20), 1, "BATE VOLTA", "already_filled")
         write_dados(caminho, [ja])
         self.assertEqual(self._colunas(caminho, 2)[0], "1930")
+
+
+class AbaDadosTests(unittest.TestCase):
+    """A leitura e a gravacao tem de achar a aba `Dados`, nao a que estava em foco.
+
+    A pasta de trabalho do operador tem tres abas (`TD`, `Dados`, `Planilha1`). O arquivo de
+    21/08 foi salvo com a `TD` — uma tabela dinamica — em foco, e o `wb.active` apontava para
+    ela: a leitura devolvia **zero linhas em silencio** (o operador processa e nao aparece
+    nada) e a gravacao poria as quatro colunas dentro da dinamica.
+    """
+
+    def setUp(self):
+        import tempfile
+        self._dir = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def _planilha(self, ativa: str = "TD"):
+        """Tres abas como as do operador, com a `ativa` em foco e os pax na `Dados`."""
+        import openpyxl
+        from roteirizador_desktop.distribuicao.dados_io import (
+            _C_DESC, _C_DESTINO, _C_NAME, _C_ORIGEM, _C_TP)
+        wb = openpyxl.Workbook()
+        td = wb.active
+        td.title = "TD"
+        td.cell(row=1, column=1).value = "Contagem de Destino"
+        td.cell(row=2, column=1).value = "Rótulos de Linha"
+        ws = wb.create_sheet("Dados")
+        ws.cell(row=2, column=_C_TP).value = "R3"
+        ws.cell(row=2, column=_C_DESC).value = "PCM-9: PAX DA ABA CERTA"
+        ws.cell(row=2, column=_C_NAME).value = "PAX DA ABA CERTA"
+        ws.cell(row=2, column=_C_ORIGEM).value = "PCM-9"
+        ws.cell(row=2, column=_C_DESTINO).value = "TMIB"
+        wb.create_sheet("Planilha1")
+        wb.active = wb.sheetnames.index(ativa)
+        caminho = Path(self._dir.name) / "dados.xlsx"
+        wb.save(caminho)
+        wb.close()
+        return str(caminho)
+
+    def test_rows_are_read_even_with_the_pivot_tab_in_focus(self):
+        from roteirizador_desktop.distribuicao import read_dados
+        linhas = read_dados(self._planilha(ativa="TD"))
+        self.assertEqual([r.name for r in linhas], ["PAX DA ABA CERTA"])
+
+    def test_writing_lands_on_dados_and_not_on_the_pivot(self):
+        import openpyxl
+        from roteirizador_desktop.distribuicao import write_dados
+        from roteirizador_desktop.distribuicao.dados_io import _C_EMBARCACAO, _C_HORARIO
+        from roteirizador_desktop.distribuicao.models import FilledRow
+        caminho = self._planilha(ativa="TD")
+        fr = FilledRow(dados_row=row(2, "PAX DA ABA CERTA", "PCM-9", "PCM-9", "TMIB"),
+                       embarcacao="SURFER 1870", horario=time(10, 0), n_viagem=1,
+                       tipo_viagem="DESEMBARQUE", status="auto")
+        write_dados(caminho, [fr])
+        wb = openpyxl.load_workbook(caminho)
+        self.assertEqual(wb["Dados"].cell(row=2, column=_C_EMBARCACAO).value, "SURFER 1870")
+        self.assertEqual(wb["Dados"].cell(row=2, column=_C_HORARIO).value, time(10, 0))
+        self.assertIsNone(wb["TD"].cell(row=2, column=_C_EMBARCACAO).value)
+        wb.close()
+
+    def test_a_workbook_with_a_single_sheet_still_works(self):
+        """Sem aba `Dados` o comportamento antigo continua: a ativa."""
+        import openpyxl
+        from roteirizador_desktop.distribuicao import read_dados
+        from roteirizador_desktop.distribuicao.dados_io import _C_NAME, _C_TP
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.cell(row=2, column=_C_TP).value = "R3"
+        ws.cell(row=2, column=_C_NAME).value = "PAX UNICO"
+        caminho = Path(self._dir.name) / "unica.xlsx"
+        wb.save(caminho)
+        wb.close()
+        self.assertEqual([r.name for r in read_dados(str(caminho))], ["PAX UNICO"])
 
 
 class TrocaViagemTests(unittest.TestCase):
@@ -2184,11 +2278,9 @@ class GadPdfTests(unittest.TestCase):
         self.assertIn("PAX1: SURFER 1905 06:30  →  SURFER 1931 06:40", texto)
 
 
-_PDF_GAD = _DOWNLOADS / "LANCHAS_TMIB - 21_08_2026.pdf"
-_MANIFESTOS = (Path.home() / "PETROBRAS" / "LOEP LPM ONNE TMCP - Roteirizador"
-               / "1. Arquivos Manifestos")
-_DADOS_21 = _MANIFESTOS / "Cópia de Tabela roteiro dia 21.08.2026.xlsx"
-_OPERACAO_21 = _MANIFESTOS / "2026_08_21_PROGRAMAÇÃO.xlsx"
+_PDF_GAD = _achar_ref("LANCHAS_TMIB - 21_08_2026.pdf")
+_DADOS_21 = _achar_ref("Cópia de Tabela roteiro dia 21.08.2026.xlsx")
+_OPERACAO_21 = _achar_ref("2026_08_21_PROGRAMAÇÃO.xlsx")
 
 
 @unittest.skipUnless(
@@ -2211,6 +2303,15 @@ class GadIntegrationTests(unittest.TestCase):
 
         cls.trips = parse_operacao(str(_OPERACAO_21))
         salvo = read_dados(str(_DADOS_21))
+
+        # O gabarito e a propria planilha do operador, e ele reaproveita o arquivo: a de
+        # 21/08 foi salva de novo com os dados de 22/08. Sem esta guarda o teste falharia
+        # como se a rotina tivesse quebrado, quando o que faltou foi o dia de referencia.
+        if not any((r.date_str or "").startswith("21.08.2026") for r in salvo):
+            raise unittest.SkipTest(
+                "a planilha de 21/08 foi reaproveitada para outro dia — "
+                "o gabarito não existe mais nesta máquina")
+
         cls.gabarito = {r.excel_row: (r.embarcacao, r.horario) for r in salvo}
         cls.zerado = [replace(r, embarcacao=None, horario=None, n_viagem=None,
                               tipo_viagem=None) for r in salvo]

@@ -436,10 +436,25 @@ class ComparacaoTests(unittest.TestCase):
 
 
 _PDF_DIR = Path.home() / "Downloads"
+
+# O operador junta os PDFs de teste numa subpasta quando o dia passa. Procurar nas duas evita
+# que a integracao pule em silencio so porque o arquivo mudou de lugar.
+_PASTAS_PDF = (_PDF_DIR, _PDF_DIR / "ManifestosTeste")
+
+
+def _achar_pdf(nome: str) -> Path:
+    """O primeiro caminho existente entre as pastas de referencia."""
+    for pasta in _PASTAS_PDF:
+        caminho = pasta / nome
+        if caminho.exists():
+            return caminho
+    return _PASTAS_PDF[0] / nome
+
+
 _REAL_PDFS = {
-    "TMIB": _PDF_DIR / "LANCHAS_TMIB - 16_08_2026.pdf",
-    "PCM-09": _PDF_DIR / "LANCHAS_PCM-09 - 16_08_2026.pdf",
-    "internos": _PDF_DIR / "Lista de Transbordos Internos - 16.08.2026.pdf",
+    "TMIB": _achar_pdf("LANCHAS_TMIB - 16_08_2026.pdf"),
+    "PCM-09": _achar_pdf("LANCHAS_PCM-09 - 16_08_2026.pdf"),
+    "internos": _achar_pdf("Lista de Transbordos Internos - 16.08.2026.pdf"),
 }
 
 
