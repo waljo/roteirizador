@@ -1170,6 +1170,80 @@ class PlanilhaEscritaTests(unittest.TestCase):
         self.assertEqual(self._colunas(caminho, 2)[0], "1930")
 
 
+class ContinuacaoNaMesmaViagemTests(unittest.TestCase):
+    """Uma pessoa desembarca uma vez por viagem.
+
+    27/08: dez notas do TMIB traziam item 1 `TMIB→M6` e item 2 `M6→M9`, e a SURFER 1931
+    (`TMIB>M6>M9`, `TMIB:14` no M6 e `TMIB:10` no M9) ficou com as duas linhas de cada pax
+    preenchidas — dez pessoas contadas duas vezes na mesma viagem. As dez cotas do M9 foram
+    gastas com elas e os dez pax cuja movimentação é `TMIB→M9` de verdade, que são os que o
+    PDF da GAD nomeia, saíram sem viagem nenhuma.
+    """
+
+    @staticmethod
+    def _cenario():
+        """A viagem `TMIB>M6>M9` da 1931: 1 cota no M6 e 1 no M9, para 1 nota de dois itens
+        mais 1 pax direto."""
+        rows = [
+            row(2, "JOEL MIGUEL", "TMIB", "TMIB", "PCM-6", item="1", nota="900"),
+            row(3, "JOEL MIGUEL", "TMIB", "PCM-6", "PCM-9", item="2", nota="900"),
+            row(4, "JOSE CARLOS", "TMIB", "TMIB", "PCM-9", item="1", nota="901"),
+        ]
+        trips = [VesselTrip("SURFER 1931", [
+            leg("SURFER 1931", "TMIB", "PCM-06", time(10, 30), pax_origin="TMIB", pax=1),
+            leg("SURFER 1931", "PCM-06", "PCM-09", time(11, 30), pax_origin="TMIB", pax=1),
+        ])]
+        return rows, trips
+
+    def test_the_direct_row_gets_the_seat_and_not_the_continuation(self):
+        rows, trips = self._cenario()
+        filled, _, _ = run(rows, trips)
+        por = by_excel(filled)
+        self.assertEqual(por[2].embarcacao, "SURFER 1931")   # item 1: TMIB -> M6
+        self.assertEqual(por[4].embarcacao, "SURFER 1931")   # o pax direto TMIB -> M9
+        self.assertEqual(por[4].horario, time(10, 30))
+        # A continuação de nota não pode consumir a cota do M9. Sem leg, ela é uma sobra de
+        # continuação e sai da tabela em branco.
+        self.assertNotIn(3, por)
+
+    def test_nobody_is_counted_twice_on_one_voyage(self):
+        rows, trips = self._cenario()
+        filled, _, _ = run(rows, trips)
+        viagens = Counter((fr.dados_row.name, fr.embarcacao, fr.horario)
+                          for fr in filled if fr.embarcacao)
+        self.assertEqual([k for k, n in viagens.items() if n > 1], [])
+
+    def test_a_row_already_in_the_sheet_also_blocks_the_continuation(self):
+        """O bloqueio não pode depender de esta rodada ter feito a primeira atribuição."""
+        rows, trips = self._cenario()
+        rows[0].embarcacao, rows[0].horario = "1931", time(10, 30)
+        rows[0].n_viagem, rows[0].tipo_viagem = 1, "BATE VOLTA"
+        filled, _, _ = run(rows, trips)
+        por = by_excel(filled)
+        self.assertEqual(por[2].status, "already_filled")
+        self.assertEqual(por[4].embarcacao, "SURFER 1931")
+        self.assertNotIn(3, por)
+
+    def test_the_same_pax_still_rides_two_different_voyages(self):
+        """A guarda é por viagem: duas pernas em viagens distintas continuam valendo."""
+        rows = [
+            row(2, "JAMERSON", "PCM-09", "PCM-09", "PCB-01", item="1", nota="910"),
+            row(3, "JAMERSON", "PCM-09", "PCB-01", "PCB-02", item="2", nota="910"),
+        ]
+        trips = [
+            VesselTrip("SURFER 1930", [
+                leg("SURFER 1930", "PCM-09", "PCB-01", time(12, 0),
+                    pax_origin="PCM-09", pax=1)]),
+            VesselTrip("SURFER 1905", [
+                leg("SURFER 1905", "PCB-01", "PCB-02", time(15, 0),
+                    pax_origin="PCB-01", pax=1)]),
+        ]
+        filled, _, _ = run(rows, trips)
+        por = by_excel(filled)
+        self.assertEqual(por[2].embarcacao, "SURFER 1930")
+        self.assertEqual(por[3].embarcacao, "SURFER 1905")
+
+
 class AbaDadosTests(unittest.TestCase):
     """A leitura e a gravacao tem de achar a aba `Dados`, nao a que estava em foco.
 

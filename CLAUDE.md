@@ -1470,7 +1470,7 @@ comportamento para a correção não tê-lo mudado sem querer.
 
 ### Testes
 
-`NotaSemPrefixoTests` (4), `GadPdfTests` (11) e `GadIntegrationTests` (4) — 229 no total.
+`NotaSemPrefixoTests` (4), `GadPdfTests` (11) e `GadIntegrationTests` (4) — 233 no total.
 Mutações que a suíte pega:
 
 | Mutação | Falhas |
@@ -1621,9 +1621,9 @@ Duas outras proteções, ambas descobertas apontando o seletor para `Downloads`,
 
 ### Testes
 
-229 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
+233 testes em `unittest` — **não requerem pytest**, que não é instalável nesta máquina (o
 `pip install` falha no certificado TLS do Netskope). Os do módulo de distribuição estão em
-`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (149).
+`tests/test_distribuicao_pdf.py` (40) e `tests/test_distribuicao_filler.py` (153).
 
 ```bash
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
@@ -1648,7 +1648,7 @@ respectivamente). Um teste que não falha quando o bug volta não protege nada.
 
 ### Testes da classificação (`tests/test_distribuicao_filler.py`)
 
-149 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
+153 testes, um por regra que custou uma rodada de correção. Usam os nomes reais dos passageiros
 para ligar a regra ao caso que a originou.
 
 | Grupo | O que protege |
@@ -1673,6 +1673,7 @@ para ligar a regra ao caso que a originou.
 | `SelecaoDesmarcadaTests` | desmarcar no diálogo não deixar rastro de embarcação |
 | `PlanilhaEscritaTests` | linha sem embarcação sai com as quatro colunas em branco; lixo antigo é limpo; a regra é a embarcação, não o status |
 | `AbaDadosTests` | a leitura e a gravação acham a aba `Dados` mesmo com a dinâmica em foco |
+| `ContinuacaoNaMesmaViagemTests` | ninguém ocupa duas cotas de desembarque da mesma viagem; a linha direta fica com a cota |
 | `TrocaViagemTests` | a troca manual: só viagens programadas são oferecidas, ocupação por trecho, o par da permuta tem de caber na origem, numeração refeita, o cenário M9→M8 manhã/tarde |
 | `TrocaPareadaTests` | a troca por pessoa: o agregado de todas as lanchas, o par nos dois sentidos, quem já está na viagem fora da lista, o sob demanda como candidato, e o `apply_pairs` lendo antes de escrever |
 | `TrocaPareadaUiTests` | a janela das duas listas: clique sem linha ativa, par montado e ativo limpo, a ordenação por cabeçalho, candidato usado passando para a linha ativa, a busca não pareando errado, o par impossível recusado com o motivo, a linha única já ativa, o filtro de lanchas e o alinhamento das duas tabelas |
@@ -1729,6 +1730,83 @@ agora **confere o dia dentro da planilha** e pula com essa explicação, em vez 
 se a rotina tivesse quebrado. As 54 mudanças de 21/08 seguem documentadas aqui, mas a
 verificação automática contra aquele dia só volta se um dia houver uma cópia da planilha
 original. Para não perder a próxima, vale guardar uma cópia do dia que servir de gabarito.
+
+### Fix — a continuação de nota roubava a cota da própria viagem
+
+**Relatado em 27/08**: discrepância grande nos DESEMBARQUE e, no transbordo interno de 10 pax
+`M6 → M9`, "a lista de pax apresentada para seleção não continha todos os pax que deveriam
+estar nesse trajeto".
+
+**Causa.** Dez notas do TMIB traziam **dois itens**:
+
+```
+nota 326999188   item 1   TMIB  -> PCM-6      <- a movimentação real: o pax embarca no TMIB
+nota 326999188   item 2   PCM-6 -> PCM-9      <- continuação, para mais tarde
+```
+
+A viagem da SURFER 1931 é `TMIB > M6 > M9`, com `TMIB:14` no M6 e `TMIB:10` no M9 — **24
+pessoas distintas**, as 24 que embarcaram no TMIB. Só que o item 2 casa com a perna
+`M6 → M9` pelo segundo termo do primeiro ramo do `_matches` (`origem == leg.origin_canonical`:
+a movimentação começa exatamente onde a perna parte). Resultado: as duas linhas de cada um dos
+dez pax foram preenchidas com **SURFER 1931 10:30**, dez pessoas contadas duas vezes na mesma
+viagem, as dez cotas do M9 gastas com elas — e os dez pax cuja movimentação é `TMIB → M9` de
+verdade, que são justamente os que o PDF da GAD nomeia, saíram **sem viagem nenhuma**.
+
+O efeito em cascata explica os dois sintomas relatados: o pool do grupo `(M9, TMIB)` virou 30
+candidatos para 20 cotas, o diálogo de seleção passou a misturar as continuações com as linhas
+diretas, e a perna `M6 → M9` das 17:28 (13 cotas) ficou com 9 lugares vazios porque as
+continuações que a alimentariam já tinham sido consumidas de manhã.
+
+**Solução** (`filler.py`): **uma pessoa ocupa no máximo uma cota de desembarque por viagem.**
+`_pax_na_viagem` responde se o pax já está naquela viagem, com a mesma tolerância de nome de
+lancha e horário do resto do módulo, e `fill_rows` mantém `pax_voyages` — alimentado também
+pelas linhas que a planilha já trouxe preenchidas, senão o bloqueio dependeria de a primeira
+atribuição ter sido feita nesta rodada.
+
+A guarda é **por viagem**, não por pax: duas pernas em viagens diferentes continuam valendo
+(JAMERSON, `M9→B1` na 1930 e `B1→B2` na 1905).
+
+**Verificado com 27/08**, contra a operação e os quatro PDFs da GAD:
+
+| | antes | depois |
+|---|---|---|
+| linhas programadas | 165 | **174** |
+| pax repetidos na mesma viagem | 9 | **0** |
+| pernas com a lotação exata da operação | — | **todas as 34** |
+| nomes da GAD não encontrados | — | **0** |
+| mudanças que o botão da GAD ainda pede | — | 17 |
+
+Em 16/08 o resultado é **idêntico** ao de antes (163 linhas, 0 repetidos) — o dia de
+referência não tinha notas de dois itens dentro de uma mesma viagem.
+
+As 17 mudanças que sobram não são defeito: 16 são o rateio dos 20 pax `TMIB → M9` entre a 1931
+e a 1905, que **nada nos dados determina** (os totais fecham, 10 e 10) e só a GAD decide, e 1 é
+o IVANILDO na cota `M9:1` da 1905 11:26 — a única cota com 2 candidatos, que o sistema oferece
+em diálogo.
+
+**Sobre os DESEMBARQUE de 27/08**: depois do fix os 10 que o sistema programa na AQUA HELIX
+05:20 são **exatamente os 10 que a GAD nomeia**. Os outros 4 candidatos `M9 → TMIB` e as duas
+linhas `M5 → TMIB` / `M10 → TMIB` não estão em PDF nenhum da GAD — a operação programa 10
+cotas e a GAD nomeia 10; aqueles 6 pax não estão no dia.
+
+**Testes**: `ContinuacaoNaMesmaViagemTests` (4). Mutações que a suíte pega: remover a guarda
+(3 falhas) e não registrar as linhas já preenchidas (1).
+
+### Observação — a cota que nomeia uma origem operacional aceita candidato de outra jornada
+
+Achado ao conferir 27/08, e **não corrigido**. A perna `M9 → M5` da 1905 11:26 declara duas
+cotas, `TMIB:3` e `M9:1`. A cota `M9:1` é de um pax cuja jornada começou no M9 (o IVANILDO,
+nota `PCM-9:`), mas o segundo ramo do `_matches` ignora o prefixo da nota, então o LUIZ CLAUDIO
+(nota `PCM-5:`, para quem `M9 → M5` é **recolhimento**) também entra como candidato — 2 para 1
+cota, e o sistema pergunta.
+
+O ramo é nota-agnóstico de propósito: é ele que atende a AQUA HELIX 17:30 `M6 → M9` com `M6:15`
+para linhas cujas notas dizem `PCM-9:`, onde a plataforma declarada é o **ponto de embarque** e
+não a origem da jornada. O que distinguiria os dois casos é se a plataforma declarada é uma
+**origem operacional** (aí é origem de jornada e deveria casar com o prefixo da nota) ou não
+(aí é ponto de embarque). Levar isso ao `_matches` exige passar a lista de origens até lá e
+mexe no casamento de todos os dias já validados, então fica registrado: hoje o caso aparece
+como um diálogo de seleção legítimo, visível, e a GAD resolve.
 
 ## Pendências conhecidas (distribuição)
 
@@ -1791,7 +1869,7 @@ são erro do sistema:
 PY="/mnt/c/Users/ka20/AppData/Local/Programs/Python/Python312/python.exe"
 cd /mnt/c/Users/ka20/roteirizador/appDesktopV2
 
-# Suíte completa — 229 testes, em unittest (stdlib)
+# Suíte completa — 233 testes, em unittest (stdlib)
 $PY -m unittest discover -s tests -v
 
 # Um arquivo só

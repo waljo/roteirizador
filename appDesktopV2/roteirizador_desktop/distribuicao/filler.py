@@ -254,6 +254,24 @@ def _matches(
     return False
 
 
+def _pax_na_viagem(
+    viagens: list[tuple[str | None, time | None]],
+    vessel: str | None,
+    horario: time | None,
+) -> bool:
+    """A pessoa ja ocupa uma cota de desembarque desta viagem?
+
+    Uma pessoa desembarca **uma vez** por viagem. Quando a operacao escreve
+    `TMIB:14` no M6 e `TMIB:10` no M9 da mesma viagem da SURFER 1931, sao 24 pessoas
+    distintas — as 24 que embarcaram no TMIB —, e nao 14 mais 10 movimentacoes que possam
+    pertencer as mesmas pessoas.
+
+    A comparacao usa a mesma tolerancia do resto do modulo, porque a viagem pode ter vindo
+    da planilha com o nome curto da lancha e o horario arredondado a mao.
+    """
+    return any(_same_vessel(v, vessel) and _same_horario(h, horario) for v, h in viagens)
+
+
 def _platforms_only(
     row: DadosRow, resolver: AliasResolver
 ) -> tuple[str, str] | None:
@@ -796,6 +814,15 @@ def fill_rows(
     pre_key: dict[int, tuple[str, str, str]] = {}
     preassigned_free: set[int] = set()
 
+    # Em que viagens cada pessoa ja esta. Uma nota pode ter varios itens, e a segunda
+    # movimentacao de um pax que continua a bordo casa com a perna seguinte da MESMA viagem:
+    # em 27/08, dez notas do TMIB traziam item 1 `TMIB->M6` e item 2 `M6->M9`, e as duas
+    # linhas foram preenchidas com a SURFER 1931 10:30. Os dez pax ficaram contados duas
+    # vezes na viagem, roubaram as dez cotas de `TMIB:10` no M9 e deixaram sem viagem os dez
+    # pax cuja movimentacao e `TMIB->M9` de verdade — os que o PDF da GAD nomeia.
+    pax_voyages: dict[str, list[tuple[str | None, time | None]]] = {}
+    name_key_of: dict[int, str] = {}
+
     for row in dados_rows:
         keys = _row_platforms(row, resolver)
 
@@ -812,6 +839,9 @@ def fill_rows(
             if keys is not None:
                 pre_key[idx] = keys
                 preassigned_free.add(idx)
+            if row.embarcacao:
+                pax_voyages.setdefault(_normalize_name(row.name), []).append(
+                    (row.embarcacao, row.horario))
             continue
 
         if keys is None:
@@ -842,6 +872,7 @@ def fill_rows(
         tipo = _classify(origem_c, destino_c, name_key in returning)
 
         idx = len(filled)
+        name_key_of[idx] = name_key
         leftover_returns[idx] = _is_leftover_return(
             origem_c, destino_c, nota_origin, day_origins.get(name_key)
         )
@@ -965,6 +996,14 @@ def fill_rows(
                     != (position == night_leg_position)
                 ):
                     continue
+                # Ja esta nesta viagem por outra movimentacao da jornada dele: esta linha e
+                # continuacao de nota e nao acrescenta um pax a bordo.
+                if _pax_na_viagem(
+                    pax_voyages.get(name_key_of[idx], []), dep_leg.vessel, horario
+                ):
+                    continue
+                pax_voyages.setdefault(name_key_of[idx], []).append(
+                    (dep_leg.vessel, horario))
                 taken.append(idx)
 
             for idx in taken:
